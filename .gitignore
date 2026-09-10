@@ -1,0 +1,43 @@
+# Virtual environments
+.venv/
+venv/
+__pypackages__/
+
+# Python artifacts
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+dist/
+build/
+*.egg-info/
+
+# Test / quality caches
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+htmlcov/
+.coverage
+coverage.xml
+
+# Secrets and local env
+.env
+.env.*
+!.env.example
+
+# Databases and reports (local data only)
+*.db
+*.db-wal
+*.db-shm
+data/*.db
+data/reports/*
+!data/reports/.gitkeep
+
+# Provider credentials and operational data
+*.pem
+*.key
+
+# Editor files
+.vscode/
+.idea/
+*.swp

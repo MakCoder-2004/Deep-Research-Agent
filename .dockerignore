@@ -1,0 +1,29 @@
+# Secrets and local environment
+.env
+.env.*
+
+# Local data (mounted at runtime, never baked into image)
+data/
+
+# Tests and caches
+tests/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+__pycache__/
+*.pyc
+htmlcov/
+.coverage
+
+# Build artifacts
+dist/
+build/
+*.egg-info/
+
+# Editor files
+.vscode/
+.idea/
+*.swp
+
+# Git metadata
+.git/
