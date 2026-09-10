@@ -9,6 +9,8 @@ from aiogram import BaseMiddleware
 from aiogram.dispatcher.flags import get_flag
 from aiogram.types import TelegramObject
 
+from research_agent.telegram.texts import pick_unauthorized
+
 
 def is_allowed(user_id: int | None, allowed: set[int]) -> bool:
     """Return True when user_id is present in the numeric allowlist."""
@@ -36,5 +38,11 @@ class AllowlistMiddleware(BaseMiddleware):
         from_user: Any = getattr(event, "from_user", None)
         user_id: int | None = from_user.id if from_user is not None else None
         if not is_allowed(user_id, self.allowed_user_ids):
+            lang_code: str | None = (
+                getattr(from_user, "language_code", None) if from_user is not None else None
+            )
+            answer: Any = getattr(event, "answer", None)
+            if callable(answer):
+                await answer(pick_unauthorized(lang_code))
             return None
         return await handler(event, data)
