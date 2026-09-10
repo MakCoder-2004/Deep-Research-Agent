@@ -4,13 +4,13 @@ from __future__ import annotations
 
 from typing import Protocol
 
-from research_agent.llm.base import ErrorCategory
+from research_agent.errors import AgentError, ErrorCategory
 from research_agent.models.research import SearchHit, SearchTask
 
-__all__ = ["ErrorCategory", "ResearchTool", "ToolError"]
+__all__ = ["ResearchTool", "ToolError"]
 
 
-class ToolError(Exception):
+class ToolError(AgentError):
     """Normalized tool failure for routing, budgets, and metrics."""
 
     def __init__(
@@ -20,8 +20,7 @@ class ToolError(Exception):
         category: ErrorCategory = ErrorCategory.UNKNOWN,
         tool_name: str = "",
     ) -> None:
-        super().__init__(message)
-        self.category = category
+        super().__init__(message, category=category, source=tool_name)
         self.tool_name = tool_name
 
 

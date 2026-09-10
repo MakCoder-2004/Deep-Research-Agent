@@ -8,6 +8,16 @@ from typing import Protocol, TypeVar
 
 from pydantic import BaseModel
 
+from research_agent.errors import AgentError, ErrorCategory
+
+__all__ = [
+    "ErrorCategory",
+    "LLMProvider",
+    "ProviderCapability",
+    "ProviderError",
+    "ProviderMetadata",
+]
+
 
 class ProviderCapability(StrEnum):
     FAST_MULTILINGUAL = "fast_multilingual"
@@ -18,18 +28,7 @@ class ProviderCapability(StrEnum):
     TOOL_CALLING = "tool_calling"
 
 
-class ErrorCategory(StrEnum):
-    TRANSIENT = "transient"
-    RATE_LIMITED = "rate_limited"
-    AUTH = "auth"
-    INVALID_REQUEST = "invalid_request"
-    TIMEOUT = "timeout"
-    UNAVAILABLE = "unavailable"
-    CONTENT_FILTERED = "content_filtered"
-    UNKNOWN = "unknown"
-
-
-class ProviderError(Exception):
+class ProviderError(AgentError):
     """Normalized provider failure for routing, budgets, and metrics."""
 
     def __init__(
@@ -39,8 +38,7 @@ class ProviderError(Exception):
         category: ErrorCategory = ErrorCategory.UNKNOWN,
         provider: str = "",
     ) -> None:
-        super().__init__(message)
-        self.category = category
+        super().__init__(message, category=category, source=provider)
         self.provider = provider
 
 

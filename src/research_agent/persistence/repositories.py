@@ -3,9 +3,14 @@
 from __future__ import annotations
 
 import json
+from collections.abc import Mapping
 from datetime import UTC, datetime, timedelta
+from typing import Any
 
 import aiosqlite
+
+from research_agent.models import Depth, Domain, JobState, Language, RiskLevel
+from research_agent.models.reports import Source
 
 
 def _now_iso() -> str:
@@ -113,11 +118,11 @@ class JobRepository:
         job_id: str,
         user_id: int,
         query: str,
-        language: str = "mixed",
-        domain: str = "general",
-        depth: str = "standard",
-        risk_level: str = "normal",
-        state: str = "queued",
+        language: Language | str = Language.MIXED,
+        domain: Domain | str = Domain.GENERAL,
+        depth: Depth | str = Depth.STANDARD,
+        risk_level: RiskLevel | str = RiskLevel.NORMAL,
+        state: JobState | str = JobState.QUEUED,
     ) -> None:
         now = _now_iso()
         await conn.execute(
@@ -126,21 +131,32 @@ class JobRepository:
                               risk_level, state, repair_count, created_at, updated_at)
             VALUES (?, ?, ?, ?, ?, ?, ?, ?, 0, ?, ?)
             """,
-            (job_id, user_id, query, language, domain, depth, risk_level, state, now, now),
+            (
+                job_id,
+                user_id,
+                query,
+                Language(language).value,
+                Domain(domain).value,
+                Depth(depth).value,
+                RiskLevel(risk_level).value,
+                JobState(state).value,
+                now,
+                now,
+            ),
         )
 
     async def update_state(
         self,
         conn: aiosqlite.Connection,
         job_id: str,
-        state: str,
+        state: JobState | str,
         *,
         error: str | None = None,
         trace_id: str | None = None,
     ) -> None:
         await conn.execute(
             "UPDATE jobs SET state = ?, error = ?, trace_id = ?, updated_at = ? WHERE job_id = ?",
-            (state, error, trace_id, _now_iso(), job_id),
+            (JobState(state).value, error, trace_id, _now_iso(), job_id),
         )
 
     async def get(self, conn: aiosqlite.Connection, job_id: str) -> aiosqlite.Row | None:
@@ -212,11 +228,30 @@ class ReportRepository:
         return len(expired)
 
 
+def _normalize_source(source: Source | Mapping[str, Any]) -> dict[str, Any]:
+    """Normalize a Source model or plain mapping into a storable record."""
+    if isinstance(source, Source):
+        return {
+            "source_ref": source.id,
+            "title": source.title,
+            "url": str(source.url),
+            "publisher": source.publisher,
+            "published_at": source.published_at.isoformat() if source.published_at else None,
+            "accessed_at": source.accessed_at.isoformat(),
+            "source_type": source.source_type.value,
+        }
+    return dict(source)
+
+
 class SourceRepository:
     async def save_many(
-        self, conn: aiosqlite.Connection, report_id: str, sources: list[dict[str, str | int | None]]
+        self,
+        conn: aiosqlite.Connection,
+        report_id: str,
+        sources: list[Source | Mapping[str, Any]],
     ) -> None:
         for source in sources:
+            record = _normalize_source(source)
             await conn.execute(
                 """
                 INSERT INTO sources (report_id, source_ref, title, url, publisher,
@@ -225,13 +260,13 @@ class SourceRepository:
                 """,
                 (
                     report_id,
-                    source.get("source_ref"),
-                    source.get("title", ""),
-                    source.get("url", ""),
-                    source.get("publisher"),
-                    source.get("published_at"),
-                    source.get("accessed_at", _now_iso()),
-                    source.get("source_type", "web"),
+                    record.get("source_ref"),
+                    record.get("title", ""),
+                    record.get("url", ""),
+                    record.get("publisher"),
+                    record.get("published_at"),
+                    record.get("accessed_at", _now_iso()),
+                    record.get("source_type", "web"),
                 ),
             )
 
