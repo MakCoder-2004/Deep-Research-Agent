@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from collections.abc import AsyncIterator
+from contextlib import asynccontextmanager
 from pathlib import Path
 from uuid import uuid4
 
@@ -58,6 +60,30 @@ from research_agent.telegram.texts import (
 from research_agent.telegram.validators import classify_input, is_accepted_url
 
 router = Router()
+
+
+@asynccontextmanager
+async def with_db(
+    conn: aiosqlite.Connection | None,
+    db_path: Path | str | None,
+) -> AsyncIterator[aiosqlite.Connection | None]:
+    """Yield a usable DB connection, opening ``db_path`` when needed.
+
+    When ``conn`` is provided it is yielded directly (caller owns its
+    lifecycle). Otherwise ``db_path`` is opened via :func:`open_db`.
+    Yields ``None`` when neither is available so callers can reply with
+    a service-unavailable message instead of inventing fake records.
+    """
+    if conn is not None:
+        yield conn
+        return
+    if db_path is not None:
+        from research_agent.persistence.database import open_db
+
+        async with open_db(db_path) as db_conn:
+            yield db_conn
+        return
+    yield None
 
 
 def extract_research_arg(text: str | None, command: str) -> str:
@@ -129,9 +155,15 @@ async def handle_research_request(
         else:
             await message.answer(render_research_usage(lang_code))
         return None
-    if conn is not None:
+    async with with_db(conn, db_path) as db_conn:
+        if db_conn is None:
+            # No DB available (e.g. unit test without persistence): validate and
+            # acknowledge without persistence so the reply path stays testable.
+            fake_id = str(uuid4())
+            await message.answer(render_research_accepted(request.query, fake_id, lang_code))
+            return JobRef(job_id=fake_id, user_id=request.user_id, query=request.query)
         try:
-            job = await enqueue_request(conn, request.user_id, request.query)
+            job = await enqueue_request(db_conn, request.user_id, request.query)
         except UserBusyError as busy:
             await message.answer(render_busy(busy.job_id or None, lang_code))
             return None
@@ -145,30 +177,6 @@ async def handle_research_request(
         except Exception:  # noqa: BLE001, S110 - progress failure must not fail enqueue
             pass
         return job
-    if db_path is not None:
-        from research_agent.persistence.database import open_db
-
-        try:
-            async with open_db(db_path) as db_conn:
-                job = await enqueue_request(db_conn, request.user_id, request.query)
-        except UserBusyError as busy:
-            await message.answer(render_busy(busy.job_id or None, lang_code))
-            return None
-        await message.answer(render_research_accepted(request.query, job.job_id, lang_code))
-        try:
-            from research_agent.telegram.progress import ProgressStage, publish_progress
-
-            await publish_progress(
-                message, job.job_id, ProgressStage.ANALYZING, position=job.position
-            )
-        except Exception:  # noqa: BLE001, S110 - progress failure must not fail enqueue
-            pass
-        return job
-    # No DB available (e.g. unit test without persistence): validate and
-    # acknowledge without persistence so the reply path stays testable.
-    fake_id = str(uuid4())
-    await message.answer(render_research_accepted(request.query, fake_id, lang_code))
-    return JobRef(job_id=fake_id, user_id=request.user_id, query=request.query)
 
 
 @router.message(Command("whoami"), flags={"allow_unauthorized": True})
@@ -191,12 +199,8 @@ async def start_handler(
     lang = pick_lang(lang_code)
     if from_user is not None:
         try:
-            if conn is not None:
-                await ensure_user(conn, from_user.id, lang)
-            elif db_path is not None:
-                from research_agent.persistence.database import open_db
-
-                async with open_db(db_path) as db_conn:
+            async with with_db(conn, db_path) as db_conn:
+                if db_conn is not None:
                     await ensure_user(db_conn, from_user.id, lang)
         except Exception:  # noqa: BLE001, S110 - start reply must not fail on DB issues
             pass
@@ -266,16 +270,11 @@ async def status_handler(
                 )
             )
 
-    if conn is not None:
-        await _reply_with_conn(conn)
-        return
-    if db_path is not None:
-        from research_agent.persistence.database import open_db
-
-        async with open_db(db_path) as db_conn:
-            await _reply_with_conn(db_conn)
-        return
-    await message.answer(format_status("none", lang_code=lang_code))
+    async with with_db(conn, db_path) as db_conn:
+        if db_conn is None:
+            await message.answer(format_status("none", lang_code=lang_code))
+            return
+        await _reply_with_conn(db_conn)
 
 
 @router.message(Command("cancel"))
@@ -301,16 +300,11 @@ async def cancel_handler(
         else:
             await message.answer(render_cancel_none(lang_code))
 
-    if conn is not None:
-        await _cancel_with_conn(conn)
-        return
-    if db_path is not None:
-        from research_agent.persistence.database import open_db
-
-        async with open_db(db_path) as db_conn:
-            await _cancel_with_conn(db_conn)
-        return
-    await message.answer(render_cancel_none(lang_code))
+    async with with_db(conn, db_path) as db_conn:
+        if db_conn is None:
+            await message.answer(render_cancel_none(lang_code))
+            return
+        await _cancel_with_conn(db_conn)
 
 
 @router.message(Command("history"))
@@ -329,16 +323,11 @@ async def history_handler(
         reports = await list_recent_reports(db_conn, from_user.id, limit=5)
         await message.answer(format_history(reports, lang_code))
 
-    if conn is not None:
-        await _reply_with_conn(conn)
-        return
-    if db_path is not None:
-        from research_agent.persistence.database import open_db
-
-        async with open_db(db_path) as db_conn:
-            await _reply_with_conn(db_conn)
-        return
-    await message.answer(format_history([], lang_code))
+    async with with_db(conn, db_path) as db_conn:
+        if db_conn is None:
+            await message.answer(format_history([], lang_code))
+            return
+        await _reply_with_conn(db_conn)
 
 
 @router.message(Command("report"))
@@ -418,16 +407,11 @@ async def report_handler(
         except Exception:  # noqa: BLE001 - fall back to plain bundle on render issues
             await message.answer(format_report_bundle(report, sources, lang_code))
 
-    if conn is not None:
-        await _reply_with_conn(conn)
-        return
-    if db_path is not None:
-        from research_agent.persistence.database import open_db
-
-        async with open_db(db_path) as db_conn:
-            await _reply_with_conn(db_conn)
-        return
-    await message.answer(render_report_not_found(lang_code))
+    async with with_db(conn, db_path) as db_conn:
+        if db_conn is None:
+            await message.answer(render_report_not_found(lang_code))
+            return
+        await _reply_with_conn(db_conn)
 
 
 @router.message(Command("forget"))
@@ -441,22 +425,19 @@ async def forget_handler(
     if from_user is None:
         return
     lang_code: str | None = from_user.language_code
-    if conn is not None:
+    async with with_db(conn, db_path) as db_conn:
+        if db_conn is None:
+            await message.answer(render_forget_done(lang_code))
+            return
         from research_agent.persistence.repositories import SessionRepository
 
-        await SessionRepository().delete(conn, from_user.id)
-        await conn.commit()
+        await SessionRepository().delete(db_conn, from_user.id)
+        # open_db commits on exit; commit explicitly for injected conns.
+        try:
+            await db_conn.commit()
+        except Exception:  # noqa: BLE001, S110 - forget reply must not fail
+            pass
         await message.answer(render_forget_done(lang_code))
-        return
-    if db_path is not None:
-        from research_agent.persistence.database import open_db
-        from research_agent.persistence.repositories import SessionRepository
-
-        async with open_db(db_path) as db_conn:
-            await SessionRepository().delete(db_conn, from_user.id)
-        await message.answer(render_forget_done(lang_code))
-        return
-    await message.answer(render_forget_done(lang_code))
 
 
 @router.message(Command("language"))
@@ -485,42 +466,27 @@ async def language_handler(
             return None
 
     if not raw_arg:
-        if conn is not None:
-            current = await _current_with_conn(conn)
+        async with with_db(conn, db_path) as db_conn:
+            if db_conn is None:
+                await message.answer(render_language_current(pick_lang(lang_code), lang_code))
+                return
+            current = await _current_with_conn(db_conn)
             await message.answer(render_language_current(current, current))
             return
-        if db_path is not None:
-            from research_agent.persistence.database import open_db
-
-            async with open_db(db_path) as db_conn:
-                current = await _current_with_conn(db_conn)
-            await message.answer(render_language_current(current, current))
-            return
-        await message.answer(render_language_current(pick_lang(lang_code), lang_code))
-        return
 
     normalized = normalize_language(raw_arg)
     if normalized is None:
         await message.answer(render_language_invalid(lang_code))
         return
-    if conn is not None:
-        new_code = await _set_with_conn(conn, raw_arg)
+    async with with_db(conn, db_path) as db_conn:
+        if db_conn is None:
+            await message.answer(render_language_set(normalized, normalized))
+            return
+        new_code = await _set_with_conn(db_conn, raw_arg)
         if new_code is None:
             await message.answer(render_language_invalid(lang_code))
         else:
             await message.answer(render_language_set(new_code, new_code))
-        return
-    if db_path is not None:
-        from research_agent.persistence.database import open_db
-
-        async with open_db(db_path) as db_conn:
-            new_code = await _set_with_conn(db_conn, raw_arg)
-        if new_code is None:
-            await message.answer(render_language_invalid(lang_code))
-        else:
-            await message.answer(render_language_set(new_code, new_code))
-        return
-    await message.answer(render_language_set(normalized, normalized))
 
 
 @router.message(F.text, ~F.text.startswith("/"))
