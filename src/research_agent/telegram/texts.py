@@ -256,6 +256,25 @@ def render_cancel_none(lang_code: str | None) -> str:
     return CANCEL_NONE_AR if pick_lang(lang_code) == "ar" else CANCEL_NONE_EN
 
 
+BUSY_EN_TEMPLATE = "You already have active job {job_id}. Use /status or /cancel."
+BUSY_NO_ID_EN = "You already have active job. Use /status or /cancel."
+BUSY_AR_TEMPLATE = (
+    "لديك بالفعل مهمة نشطة {job_id}. استخدم /status لمتابعة التقدم أو /cancel للإلغاء."
+)
+BUSY_NO_ID_AR = "لديك بالفعل مهمة نشطة. استخدم /status لمتابعة التقدم أو /cancel للإلغاء."
+
+
+def render_busy(job_id: str | None, lang_code: str | None) -> str:
+    """Render the fast-reject reply when the user already has an active job."""
+    if pick_lang(lang_code) == "ar":
+        if job_id:
+            return BUSY_AR_TEMPLATE.format(job_id=job_id)
+        return BUSY_NO_ID_AR
+    if job_id:
+        return BUSY_EN_TEMPLATE.format(job_id=job_id)
+    return BUSY_NO_ID_EN
+
+
 HISTORY_EMPTY_EN = "You have no saved reports yet. Send /research <query> to create one."
 HISTORY_EMPTY_AR = "لا توجد لديك تقارير محفوظة بعد. أرسل /research <استعلام> لإنشاء تقرير."
 HISTORY_HEADER_EN = "Your recent reports (last {n}):"

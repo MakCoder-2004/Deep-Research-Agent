@@ -20,6 +20,15 @@ from research_agent.persistence.repositories import JobRepository
 logger = logging.getLogger(__name__)
 
 
+class UserBusyError(Exception):
+    """Raised when a user already has an active (queued/active) job."""
+
+    def __init__(self, user_id: int, job_id: str = "") -> None:
+        super().__init__(f"user {user_id} already has an active job {job_id}".strip())
+        self.user_id = user_id
+        self.job_id = job_id
+
+
 @dataclass
 class JobRef:
     """Lightweight reference to an enqueued research job."""
@@ -36,7 +45,16 @@ async def enqueue_request(
     query: str,
     language: str = "mixed",
 ) -> JobRef:
-    """Persist a queued job and return its reference with FIFO position."""
+    """Persist a queued job and return its reference with FIFO position.
+
+    Enforces one active job per user (``max_active_per_user=1``); raises
+    :class:`UserBusyError` when the user already has a queued/active job.
+    NOTE: daily quotas are M9 scope (stub only); not enforced here.
+    """
+    if await has_active_for_user(conn, user_id):
+        existing = await get_user_active_job(conn, user_id)
+        existing_id = str(existing["job_id"]) if existing is not None else ""
+        raise UserBusyError(user_id, existing_id)
     job_id = str(uuid4())
     await JobRepository().create(
         conn,
@@ -62,6 +80,11 @@ async def get_user_active_job(conn: aiosqlite.Connection, user_id: int) -> aiosq
         (user_id,),
     )
     return await cursor.fetchone()
+
+
+async def has_active_for_user(conn: aiosqlite.Connection, user_id: int) -> bool:
+    """Return True when the user has a queued/active job (max 1 active)."""
+    return await get_user_active_job(conn, user_id) is not None
 
 
 async def queue_position(conn: aiosqlite.Connection, job_id: str) -> int:
@@ -195,9 +218,17 @@ class BoundedJobQueue:
         self._bot = bot
 
     async def enqueue(self, user_id: int, query: str, language: str = "mixed") -> JobRef:
-        """Persist a queued job and schedule it FIFO; return its reference."""
+        """Persist a queued job and schedule it FIFO; return its reference.
+
+        Enforces one active job per user; raises :class:`UserBusyError`
+        when the user already has a queued/active job.
+        """
         # NOTE: daily quotas are M9 scope (stub only); not enforced here.
         async with open_db(self._db_path) as conn:
+            if await has_active_for_user(conn, user_id):
+                existing = await get_user_active_job(conn, user_id)
+                existing_id = str(existing["job_id"]) if existing is not None else ""
+                raise UserBusyError(user_id, existing_id)
             job_id = str(uuid4())
             await JobRepository().create(
                 conn,

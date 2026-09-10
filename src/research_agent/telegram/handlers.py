@@ -14,6 +14,7 @@ from pydantic import ValidationError
 from research_agent.models.requests import ResearchRequest
 from research_agent.services.queue import (
     JobRef,
+    UserBusyError,
     cancel_user_job,
     enqueue_request,
     get_user_active_job,
@@ -31,6 +32,7 @@ from research_agent.telegram.texts import (
     format_report_bundle,
     format_status,
     pick_lang,
+    render_busy,
     render_cancel_none,
     render_cancelled,
     render_forget_done,
@@ -122,14 +124,22 @@ async def handle_research_request(
             await message.answer(render_research_usage(lang_code))
         return None
     if conn is not None:
-        job = await enqueue_request(conn, request.user_id, request.query)
+        try:
+            job = await enqueue_request(conn, request.user_id, request.query)
+        except UserBusyError as busy:
+            await message.answer(render_busy(busy.job_id or None, lang_code))
+            return None
         await message.answer(render_research_accepted(request.query, job.job_id, lang_code))
         return job
     if db_path is not None:
         from research_agent.persistence.database import open_db
 
-        async with open_db(db_path) as db_conn:
-            job = await enqueue_request(db_conn, request.user_id, request.query)
+        try:
+            async with open_db(db_path) as db_conn:
+                job = await enqueue_request(db_conn, request.user_id, request.query)
+        except UserBusyError as busy:
+            await message.answer(render_busy(busy.job_id or None, lang_code))
+            return None
         await message.answer(render_research_accepted(request.query, job.job_id, lang_code))
         return job
     # No DB available (e.g. unit test without persistence): validate and
