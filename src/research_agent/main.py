@@ -31,7 +31,7 @@ async def run_telegram(settings: Settings) -> None:
     async with open_db(settings.database_path):
         pass
     bot = create_bot(settings)
-    dp = create_dispatcher(settings.telegram_allowed_user_ids)
+    dp = create_dispatcher(settings.telegram_allowed_user_ids, settings.database_path)
     try:
         await start_polling(bot, dp)
     finally:

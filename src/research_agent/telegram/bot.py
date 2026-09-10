@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from pathlib import Path
+
 from aiogram import Bot, Dispatcher
 from aiogram.client.default import DefaultBotProperties
 
@@ -16,10 +18,15 @@ def create_bot(settings: Settings) -> Bot:
     return Bot(token=token, default=DefaultBotProperties(parse_mode=None))
 
 
-def create_dispatcher(allowed_user_ids: set[int] | None = None) -> Dispatcher:
+def create_dispatcher(
+    allowed_user_ids: set[int] | None = None,
+    db_path: Path | str | None = None,
+) -> Dispatcher:
     """Create a Dispatcher with allowlist middleware and app router."""
     dp = Dispatcher()
     dp.message.outer_middleware(AllowlistMiddleware(allowed_user_ids or set()))
+    if db_path is not None:
+        dp.workflow_data["db_path"] = db_path
     # Global router is a singleton; allow the factory to be called repeatedly
     # (e.g. across unit tests) by re-parenting it to the newest dispatcher.
     parent = router.parent_router
@@ -28,7 +35,7 @@ def create_dispatcher(allowed_user_ids: set[int] | None = None) -> Dispatcher:
             parent.sub_routers.remove(router)
         except ValueError:
             pass
-        router._parent_router = None
+        router._parent_router = None  # type: ignore[attr-defined]
     if router.parent_router is None:
         dp.include_router(router)
     return dp
