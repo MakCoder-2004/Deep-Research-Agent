@@ -12,6 +12,11 @@ _API_KEY_RE = re.compile(r"(?i)(api[_-]?key|secret|token)\s*[:=]\s*['\"]?([^'\"\
 _EMAIL_RE = re.compile(r"[\w.+-]+@[\w-]+\.[\w.]+")
 _PHONE_RE = re.compile(r"\+?\d[\d\s\-()]{7,}\d")
 _LONG_SECRET_RE = re.compile(r"sk-[A-Za-z0-9\-_]{8,}")
+_CARD_RE = re.compile(r"\b(?:\d[ -]?){13,19}\b")
+_ID_DOC_RE = re.compile(
+    r"(?i)(ssn|social.?security|national.?id|id.?number|passport(?:.?no)?|civil.?id)"
+    r"\s*[:=]\s*['\"]?([^'\"\s,}]+)"
+)
 
 
 def redact_text(text: str, secrets: Iterable[str] = ()) -> str:
@@ -24,6 +29,8 @@ def redact_text(text: str, secrets: Iterable[str] = ()) -> str:
     redacted = _BEARER_RE.sub("Bearer ***", redacted)
     redacted = _LONG_SECRET_RE.sub("***", redacted)
     redacted = _API_KEY_RE.sub(r"\1=***", redacted)
+    redacted = _ID_DOC_RE.sub(r"\1=***", redacted)
+    redacted = _CARD_RE.sub("***", redacted)
     redacted = _EMAIL_RE.sub("***@***", redacted)
     redacted = _PHONE_RE.sub("***", redacted)
     return redacted
@@ -33,7 +40,20 @@ def redact_mapping(data: dict[str, Any], secrets: Iterable[str] = ()) -> dict[st
     """Return a copy of a mapping with secret values redacted."""
     secret_list = [secret for secret in secrets if secret]
     redacted: dict[str, Any] = {}
-    sensitive_keys = {"authorization", "api_key", "apikey", "token", "secret", "cookie", "password"}
+    sensitive_keys = {
+        "authorization",
+        "api_key",
+        "apikey",
+        "token",
+        "secret",
+        "cookie",
+        "password",
+        "card",
+        "card_number",
+        "ssn",
+        "passport",
+        "national_id",
+    }
     for key, value in data.items():
         if key.lower() in sensitive_keys:
             redacted[key] = "***"

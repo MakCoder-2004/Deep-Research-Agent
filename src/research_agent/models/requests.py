@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from datetime import UTC, datetime
+from typing import Any
 from uuid import UUID, uuid4
 
 from pydantic import BaseModel, ConfigDict, Field, HttpUrl
@@ -10,6 +11,17 @@ from pydantic import BaseModel, ConfigDict, Field, HttpUrl
 from research_agent.models import Depth, Domain, JobState, Language, RiskLevel
 
 FORBIDDEN_REPORT_FIELDS = frozenset({"prompt", "hidden_prompt", "chain_of_thought", "cot"})
+
+
+def reject_forbidden_report_fields(data: Any) -> Any:
+    """Reject hidden-prompt / chain-of-thought keys in user-visible report data."""
+    if isinstance(data, dict):
+        forbidden = sorted(FORBIDDEN_REPORT_FIELDS.intersection(data))
+        if forbidden:
+            raise ValueError(
+                f"Forbidden report fields must not appear in delivery data: {forbidden}."
+            )
+    return data
 
 
 class ResearchRequest(BaseModel):

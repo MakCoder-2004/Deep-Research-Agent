@@ -178,6 +178,22 @@ class ReportRepository:
         cursor = await conn.execute("SELECT * FROM reports WHERE report_id = ?", (report_id,))
         return await cursor.fetchone()
 
+    async def search(
+        self, conn: aiosqlite.Connection, query: str, limit: int = 10
+    ) -> list[aiosqlite.Row]:
+        """Full-text search over report topics and summaries, best match first."""
+        cursor = await conn.execute(
+            """
+            SELECT r.* FROM report_fts
+            JOIN reports r ON r.report_id = report_fts.report_id
+            WHERE report_fts MATCH ?
+            ORDER BY bm25(report_fts)
+            LIMIT ?
+            """,
+            (query, limit),
+        )
+        return list(await cursor.fetchall())
+
     async def prune(
         self,
         conn: aiosqlite.Connection,
@@ -327,9 +343,8 @@ class CacheRepository:
 
     async def delete_expired(self, conn: aiosqlite.Connection) -> int:
         cursor = await conn.execute("SELECT cache_key, expires_at FROM cache")
-        expired = [
-            row["cache_key"] for row in await cursor.fetchall() if _is_expired(str(row["expires_at"]))
-        ]
+        rows = await cursor.fetchall()
+        expired = [row["cache_key"] for row in rows if _is_expired(str(row["expires_at"]))]
         for cache_key in expired:
             await conn.execute("DELETE FROM cache WHERE cache_key = ?", (cache_key,))
         return len(expired)

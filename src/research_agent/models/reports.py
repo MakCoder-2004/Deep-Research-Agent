@@ -3,11 +3,13 @@
 from __future__ import annotations
 
 from datetime import datetime
+from typing import Any
 from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
 
 from pydantic import BaseModel, ConfigDict, Field, HttpUrl, model_validator
 
 from research_agent.models import SourceType
+from research_agent.models.requests import reject_forbidden_report_fields
 
 TRACKING_PARAM_NAMES = frozenset(
     {
@@ -53,6 +55,11 @@ class Finding(BaseModel):
     statement: str = Field(min_length=1)
     citation_ids: list[int] = Field(min_length=1)
 
+    @model_validator(mode="before")
+    @classmethod
+    def _reject_forbidden_fields(cls, data: Any) -> Any:
+        return reject_forbidden_report_fields(data)
+
 
 class Source(BaseModel):
     """A cited source listed in the report."""
@@ -67,6 +74,11 @@ class Source(BaseModel):
     accessed_at: datetime
     source_type: SourceType = SourceType.WEB
 
+    @model_validator(mode="before")
+    @classmethod
+    def _reject_forbidden_fields(cls, data: Any) -> Any:
+        return reject_forbidden_report_fields(data)
+
 
 class ResearchReport(BaseModel):
     """Validated user-visible report. Never contains prompts or chain-of-thought."""
@@ -78,6 +90,11 @@ class ResearchReport(BaseModel):
     summary: str = Field(min_length=1)
     sources: list[Source] = Field(min_length=1)
     tools_used: list[str] = Field(default_factory=list)
+
+    @model_validator(mode="before")
+    @classmethod
+    def _reject_forbidden_fields(cls, data: Any) -> Any:
+        return reject_forbidden_report_fields(data)
 
     @model_validator(mode="after")
     def _validate_citations_and_sources(self) -> ResearchReport:

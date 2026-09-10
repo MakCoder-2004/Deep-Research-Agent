@@ -102,6 +102,13 @@ CREATE TABLE IF NOT EXISTS cache (
 );
 
 CREATE VIRTUAL TABLE IF NOT EXISTS report_fts USING fts5(report_id, topic, summary);
+
+-- Keep the FTS index in sync when reports disappear through paths that bypass
+-- ReportRepository.prune (e.g. ON DELETE CASCADE from jobs).
+CREATE TRIGGER IF NOT EXISTS trg_reports_fts_delete AFTER DELETE ON reports
+BEGIN
+    DELETE FROM report_fts WHERE report_id = OLD.report_id;
+END;
 """
 
 

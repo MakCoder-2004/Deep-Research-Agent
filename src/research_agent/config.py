@@ -12,7 +12,6 @@ from typing import Annotated, Any, Literal
 from pydantic import BeforeValidator, Field, SecretStr, field_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
-
 KNOWN_LLM_PROVIDERS = frozenset({"groq", "openrouter", "cloudflare"})
 
 
@@ -43,8 +42,7 @@ def _parse_allowed_user_ids(value: Any) -> set[int]:
         # signed, zero, or otherwise non-numeric values.
         if not text.isdigit() or int(text) <= 0:
             raise ValueError(
-                f"Invalid Telegram user ID {text!r}: must be a positive numeric ID, "
-                "not a username."
+                f"Invalid Telegram user ID {text!r}: must be a positive numeric ID, not a username."
             )
         parsed.add(int(text))
     return parsed
