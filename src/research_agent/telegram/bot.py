@@ -35,7 +35,7 @@ def create_dispatcher(
             parent.sub_routers.remove(router)
         except ValueError:
             pass
-        router._parent_router = None  # type: ignore[attr-defined]
+        router._parent_router = None
     if router.parent_router is None:
         dp.include_router(router)
     return dp

@@ -2,6 +2,9 @@
 
 from __future__ import annotations
 
+from collections.abc import Sequence
+from typing import Any
+
 WHOAMI_TEMPLATE = "Your Telegram user ID is: {user_id}"
 
 START_EN = (
@@ -263,9 +266,9 @@ REPORT_NOT_FOUND_EN = "Report not found. Use /history to list your recent report
 REPORT_NOT_FOUND_AR = "التقرير غير موجود. استخدم /history لعرض تقاريرك الأخيرة."
 
 
-def format_history(reports: object, lang_code: str | None) -> str:
+def format_history(reports: Sequence[Any] | None, lang_code: str | None) -> str:
     """Format the /history reply for the last reports (owner-scoped)."""
-    items = list(reports or [])  # type: ignore[arg-type]
+    items = list(reports) if reports else []
     if not items:
         return HISTORY_EMPTY_AR if pick_lang(lang_code) == "ar" else HISTORY_EMPTY_EN
     lang = pick_lang(lang_code)
@@ -277,8 +280,8 @@ def format_history(reports: object, lang_code: str | None) -> str:
     lines = [header]
     for row in items:
         try:
-            report_id = row["report_id"]  # type: ignore[index]
-            topic = row["topic"]  # type: ignore[index]
+            report_id = row["report_id"]
+            topic = row["topic"]
         except Exception:  # noqa: BLE001, S112 - tolerate dict/Row shapes
             continue
         lines.append(f"- {report_id}: {topic}")
@@ -300,24 +303,24 @@ def render_report_not_found(lang_code: str | None) -> str:
     return REPORT_NOT_FOUND_AR if pick_lang(lang_code) == "ar" else REPORT_NOT_FOUND_EN
 
 
-def format_report_bundle(report: object, sources: object, lang_code: str | None) -> str:
+def format_report_bundle(report: Any, sources: Sequence[Any] | None, lang_code: str | None) -> str:
     """Format a retrieved report with readable [1] citation markers."""
     lang = pick_lang(lang_code)
     try:
-        topic = report["topic"]  # type: ignore[index]
-        summary = report["summary"]  # type: ignore[index]
-        report_id = report["report_id"]  # type: ignore[index]
+        topic = report["topic"]
+        summary = report["summary"]
+        report_id = report["report_id"]
     except Exception:  # noqa: BLE001 - caller guarantees a valid report row
         return render_report_not_found(lang_code)
-    src_list = list(sources or [])  # type: ignore[arg-type]
+    src_list = list(sources) if sources else []
     if lang == "ar":
         lines = [f"التقرير: {topic}", f"المعرّف: {report_id}", "", str(summary), "", "المصادر:"]
     else:
         lines = [f"Report: {topic}", f"ID: {report_id}", "", str(summary), "", "Sources:"]
     for idx, src in enumerate(src_list, start=1):
         try:
-            title = src["title"]  # type: ignore[index]
-            url = src["url"]  # type: ignore[index]
+            title = src["title"]
+            url = src["url"]
         except Exception:  # noqa: BLE001, S112 - skip malformed source rows
             continue
         lines.append(f"[{idx}] {title} - {url}")

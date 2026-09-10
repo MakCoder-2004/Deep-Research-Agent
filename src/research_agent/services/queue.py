@@ -35,7 +35,7 @@ async def enqueue_request(
         job_id=job_id,
         user_id=user_id,
         query=query,
-        language=language,  # type: ignore[arg-type]
+        language=language,
     )
     await conn.commit()
     return JobRef(job_id=job_id, user_id=user_id, query=query, position=1)
