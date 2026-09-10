@@ -27,6 +27,7 @@ from research_agent.services.sessions import (
     normalize_language,
     set_language,
 )
+from research_agent.telegram.renderer import render_concise_report, split_message
 from research_agent.telegram.texts import (
     format_history,
     format_report_bundle,
@@ -356,7 +357,43 @@ async def report_handler(
         if report is None:
             await message.answer(render_report_not_found(lang_code))
             return
-        await message.answer(format_report_bundle(report, sources, lang_code))
+        try:
+            import json as _json
+
+            topic = str(report["topic"])
+            summary = str(report["summary"])
+            try:
+                raw_tools = report["tools_used"]
+                tools: list[str] = list(_json.loads(str(raw_tools))) if raw_tools else []
+                tools = [str(tool) for tool in tools]
+            except Exception:  # noqa: BLE001, S110 - tools line is optional
+                tools = []
+            source_ids: list[int] = []
+            for idx, src in enumerate(list(sources), start=1):
+                sid = idx
+                try:
+                    sid = int(src["source_ref"])
+                except Exception:  # noqa: BLE001, S110 - fall back to position
+                    try:
+                        sid = int(src["id"])
+                    except Exception:  # noqa: BLE001, S110 - keep position
+                        sid = idx
+                if sid >= 1 and sid not in source_ids:
+                    source_ids.append(sid)
+            findings = [{"statement": summary, "citation_ids": source_ids or []}] if summary else []
+            concise = render_concise_report(
+                topic,
+                findings,
+                list(sources),
+                pick_lang(lang_code),
+                partial=False,
+                disclaimer=None,
+                tools_used=tools,
+            )
+            for chunk in split_message(concise):
+                await message.answer(chunk, parse_mode="MarkdownV2")
+        except Exception:  # noqa: BLE001 - fall back to plain bundle on render issues
+            await message.answer(format_report_bundle(report, sources, lang_code))
 
     if conn is not None:
         await _reply_with_conn(conn)
