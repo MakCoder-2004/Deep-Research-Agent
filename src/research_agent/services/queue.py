@@ -1,15 +1,23 @@
-"""Bounded research-job queue stub for the Telegram gateway (M2.7+)."""
+"""Bounded async research-job queue for the Telegram gateway (M2.15+)."""
 
 from __future__ import annotations
 
 import asyncio
+import logging
+from collections.abc import Callable
 from dataclasses import dataclass
+from pathlib import Path
+from typing import Any
 from uuid import uuid4
 
 import aiosqlite
 
 from research_agent.models import JobState
+from research_agent.observability.redaction import redact_text
+from research_agent.persistence.database import open_db
 from research_agent.persistence.repositories import JobRepository
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass
@@ -107,3 +115,170 @@ async def cancel_user_job(conn: aiosqlite.Connection, user_id: int) -> bool:
     await conn.commit()
     get_cancel_event(job_id).set()
     return True
+
+
+class BoundedJobQueue:
+    """FIFO bounded queue limiting globally concurrent research jobs.
+
+    Uses an ``asyncio.Semaphore`` for global concurrency, an
+    ``asyncio.Queue`` for FIFO ordering, and dicts tracking live job
+    tasks plus cooperative cancel events.
+
+    NOTE (M9 scope): daily quotas (10 requests/user/day, 3 deep/day)
+    are intentionally not enforced here; see BudgetManager in M9.
+    """
+
+    def __init__(
+        self,
+        db_path: Path | str,
+        *,
+        max_concurrent_jobs: int = 3,
+        job_timeout_seconds: int = 300,
+    ) -> None:
+        self._db_path = Path(db_path)
+        self._max_concurrent_jobs = max_concurrent_jobs
+        self._job_timeout_seconds = job_timeout_seconds
+        self._semaphore = asyncio.Semaphore(max_concurrent_jobs)
+        self._queue: asyncio.Queue[JobRef] = asyncio.Queue()
+        self._tasks: dict[str, asyncio.Task[None]] = {}
+        self._worker_task: asyncio.Task[None] | None = None
+        self._running = False
+        self._bot: Any | None = None
+
+    @property
+    def db_path(self) -> Path:
+        """Return the SQLite path backing job persistence."""
+        return self._db_path
+
+    @property
+    def max_concurrent_jobs(self) -> int:
+        """Return the global concurrency limit."""
+        return self._max_concurrent_jobs
+
+    @property
+    def pending(self) -> int:
+        """Return the number of jobs waiting in the FIFO queue."""
+        return self._queue.qsize()
+
+    def set_bot(self, bot: Any) -> None:
+        """Attach the aiogram Bot used for progress edits (optional)."""
+        self._bot = bot
+
+    async def enqueue(self, user_id: int, query: str, language: str = "mixed") -> JobRef:
+        """Persist a queued job and schedule it FIFO; return its reference."""
+        # NOTE: daily quotas are M9 scope (stub only); not enforced here.
+        async with open_db(self._db_path) as conn:
+            job_id = str(uuid4())
+            await JobRepository().create(
+                conn,
+                job_id=job_id,
+                user_id=user_id,
+                query=query,
+                language=language,
+            )
+            position = await queue_position(conn, job_id)
+            await conn.commit()
+        ref = JobRef(job_id=job_id, user_id=user_id, query=query, position=position)
+        get_cancel_event(job_id)
+        await self._queue.put(ref)
+        logger.info("job enqueued job_id=%s user_id=%d position=%d", job_id, user_id, position)
+        return ref
+
+    async def start(self) -> None:
+        """Start the background FIFO worker loop (idempotent)."""
+        if self._worker_task is not None and not self._worker_task.done():
+            return
+        self._running = True
+        self._worker_task = asyncio.create_task(self.worker_loop())
+
+    async def stop(self) -> None:
+        """Stop the worker loop and cancel tracked job tasks."""
+        self._running = False
+        if self._worker_task is not None:
+            self._worker_task.cancel()
+            try:
+                await self._worker_task
+            except asyncio.CancelledError:
+                pass
+            self._worker_task = None
+        for task in list(self._tasks.values()):
+            task.cancel()
+        if self._tasks:
+            await asyncio.gather(*self._tasks.values(), return_exceptions=True)
+        self._tasks.clear()
+
+    async def worker_loop(self) -> None:
+        """Consume FIFO jobs; each runs bounded by the global semaphore."""
+        self._running = True
+        while self._running:
+            try:
+                job = await self._queue.get()
+            except asyncio.CancelledError:
+                break
+            task = asyncio.create_task(self._run_with_semaphore(job))
+            self._tasks[job.job_id] = task
+            task.add_done_callback(self._make_done_callback(job.job_id))
+            # Avoid unbounded task growth: yield control each dispatch.
+            await asyncio.sleep(0)
+
+    def _make_done_callback(self, job_id: str) -> Callable[[asyncio.Task[None]], None]:
+        """Return a done-callback removing a finished job task."""
+
+        def _done(_task: asyncio.Task[None]) -> None:
+            self._tasks.pop(job_id, None)
+
+        return _done
+
+    async def _run_with_semaphore(self, job: JobRef) -> None:
+        """Run one placeholder job while holding the global semaphore slot."""
+        async with self._semaphore:
+            try:
+                await asyncio.wait_for(
+                    self.run_placeholder(job), timeout=float(self._job_timeout_seconds)
+                )
+            except TimeoutError:
+                logger.warning("job timed out job_id=%s", redact_text(job.job_id))
+                async with open_db(self._db_path) as conn:
+                    await JobRepository().update_state(
+                        conn, job.job_id, JobState.FAILED, error="job timeout"
+                    )
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:  # noqa: BLE001 - placeholder must not crash worker
+                sanitized = redact_text(f"{type(exc).__name__}: {exc}")
+                logger.warning("job failed job_id=%s error=%s", job.job_id, sanitized)
+                try:
+                    async with open_db(self._db_path) as conn:
+                        await JobRepository().update_state(
+                            conn, job.job_id, JobState.FAILED, error=sanitized
+                        )
+                except Exception:  # noqa: BLE001, S110 - persistence best effort
+                    pass
+            finally:
+                self._queue.task_done()
+                clear_cancel_event(job.job_id)
+
+    async def run_placeholder(self, job: JobRef) -> None:
+        """Minimal placeholder execution: queued -> active -> completed.
+
+        Later milestones cycle Telegram progress stages here. Honors
+        cooperative cancellation via the per-job cancel event.
+        """
+        cancel_event = get_cancel_event(job.job_id)
+        async with open_db(self._db_path) as conn:
+            await JobRepository().update_state(conn, job.job_id, JobState.ACTIVE)
+        if cancel_event.is_set():
+            async with open_db(self._db_path) as conn:
+                await JobRepository().update_state(conn, job.job_id, JobState.CANCELLED)
+            return
+        # Simulate bounded pipeline work without external I/O.
+        try:
+            await asyncio.wait_for(cancel_event.wait(), timeout=0.05)
+            cancelled = True
+        except TimeoutError:
+            cancelled = False
+        async with open_db(self._db_path) as conn:
+            if cancelled or cancel_event.is_set():
+                await JobRepository().update_state(conn, job.job_id, JobState.CANCELLED)
+            else:
+                await JobRepository().update_state(conn, job.job_id, JobState.COMPLETED)

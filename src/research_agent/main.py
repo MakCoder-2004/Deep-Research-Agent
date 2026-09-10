@@ -8,7 +8,14 @@ import sys
 from research_agent.config import Settings, validate_at_startup
 from research_agent.observability.logging import configure_logging
 from research_agent.persistence.database import open_db
-from research_agent.telegram.bot import create_bot, create_dispatcher, start_polling
+from research_agent.services.queue import BoundedJobQueue
+from research_agent.telegram.bot import (
+    create_bot,
+    create_dispatcher,
+    start_polling,
+    start_queue_worker,
+    stop_queue_worker,
+)
 
 
 def _collect_secrets(settings: Settings) -> list[str]:
@@ -31,10 +38,20 @@ async def run_telegram(settings: Settings) -> None:
     async with open_db(settings.database_path):
         pass
     bot = create_bot(settings)
-    dp = create_dispatcher(settings.telegram_allowed_user_ids, settings.database_path)
+    queue = BoundedJobQueue(
+        settings.database_path,
+        max_concurrent_jobs=settings.max_concurrent_jobs,
+        job_timeout_seconds=settings.job_timeout_seconds,
+    )
+    queue.set_bot(bot)
+    dp = create_dispatcher(
+        settings.telegram_allowed_user_ids, settings.database_path, job_queue=queue
+    )
     try:
+        await start_queue_worker(dp, queue)
         await start_polling(bot, dp)
     finally:
+        await stop_queue_worker(dp)
         await bot.session.close()
 
 
