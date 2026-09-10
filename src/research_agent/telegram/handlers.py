@@ -17,12 +17,14 @@ from research_agent.services.sessions import ensure_user
 from research_agent.telegram.texts import (
     pick_lang,
     render_help,
+    render_invalid_url,
     render_non_text,
     render_research_accepted,
     render_research_usage,
     render_start,
     render_whoami,
 )
+from research_agent.telegram.validators import classify_input, is_accepted_url
 
 router = Router()
 
@@ -53,7 +55,12 @@ async def handle_research_request(
     conn: aiosqlite.Connection | None = None,
     db_path: Path | str | None = None,
 ) -> JobRef | None:
-    """Validate a research query and enqueue it; reply with usage on empty."""
+    """Validate a research query and enqueue it; reply with usage on empty.
+
+    Accepts English, Arabic, and mixed-language text plus http(s) URLs.
+    Inner content (including Arabic RTL) is preserved verbatim; only
+    surrounding whitespace is stripped.
+    """
     from_user = message.from_user
     if from_user is None:
         return None
@@ -62,10 +69,34 @@ async def handle_research_request(
     if not clean:
         await message.answer(render_research_usage(lang_code))
         return None
+    kind = classify_input(clean)
+    if kind == "url" and not is_accepted_url(clean):
+        await message.answer(render_invalid_url(lang_code))
+        return None
+    # URL-looking inputs that claim another scheme (javascript:/file:/ftp:)
+    # but were classified as text should still be rejected when they contain
+    # a scheme-like prefix.
+    lowered = clean.lower().lstrip()
+    if kind == "text" and lowered.startswith(
+        ("javascript:", "file:", "ftp:", "data:", "vbscript:")
+    ):
+        await message.answer(render_invalid_url(lang_code))
+        return None
     try:
-        request = ResearchRequest(user_id=from_user.id, query=clean)
+        if kind == "url":
+            request = ResearchRequest(
+                user_id=from_user.id,
+                query=clean,
+                source_url=clean,  # type: ignore[arg-type]
+            )
+        else:
+            request = ResearchRequest(user_id=from_user.id, query=clean)
     except ValidationError:
-        await message.answer(render_research_usage(lang_code))
+        # Distinguish overlong/invalid URLs from generic usage errors.
+        if kind == "url":
+            await message.answer(render_invalid_url(lang_code))
+        else:
+            await message.answer(render_research_usage(lang_code))
         return None
     if conn is not None:
         job = await enqueue_request(conn, request.user_id, request.query)

@@ -166,3 +166,19 @@ NON_TEXT_AR = (
 def render_non_text(lang_code: str | None) -> str:
     """Render the gentle reply for non-text messages (no job created)."""
     return NON_TEXT_AR if pick_lang(lang_code) == "ar" else NON_TEXT_EN
+
+
+INVALID_URL_EN = (
+    "That link looks invalid. Please send an http(s) URL without credentials "
+    "(e.g. https://example.com/article) or send a text question instead."
+)
+
+INVALID_URL_AR = (
+    "يبدو أن هذا الرابط غير صالح. يرجى إرسال رابط http(s) بدون بيانات اعتماد "
+    "(مثال: https://example.com/article) أو إرسال سؤال نصي بدلًا من ذلك."
+)
+
+
+def render_invalid_url(lang_code: str | None) -> str:
+    """Render the invalid-URL reply (no job created)."""
+    return INVALID_URL_AR if pick_lang(lang_code) == "ar" else INVALID_URL_EN
