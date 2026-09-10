@@ -29,6 +29,12 @@ def test_allowlist_rejects_usernames() -> None:
         _make_settings(TELEGRAM_ALLOWED_USER_IDS="123,@someuser")
 
 
+def test_allowlist_rejects_signed_zero_and_non_positive_ids() -> None:
+    for bad in ("+123", "-5", "0", "12a", "1.5"):
+        with pytest.raises(ValidationError):
+            _make_settings(TELEGRAM_ALLOWED_USER_IDS=bad)
+
+
 def test_plan_defaults() -> None:
     settings = _make_settings()
     assert settings.max_concurrent_jobs == 3
@@ -72,3 +78,28 @@ def test_startup_validation_does_not_leak_secret() -> None:
     except ValueError as exc:
         assert secret not in str(exc)
     assert secret not in repr(settings)
+
+
+def test_startup_validation_rejects_unknown_providers() -> None:
+    settings = _make_settings(LLM_PROVIDER_PRIORITY="groq,nope")
+    with pytest.raises(ValueError, match="Unknown LLM providers"):
+        validate_at_startup(settings)
+
+
+def test_startup_validation_production_requires_a_configured_provider_key() -> None:
+    settings = _make_settings(
+        ENVIRONMENT="production",
+        TELEGRAM_BOT_TOKEN="x" * 10,
+        TELEGRAM_ALLOWED_USER_IDS="123",
+        LLM_PROVIDER_PRIORITY="groq",
+    )
+    with pytest.raises(ValueError, match="API key"):
+        validate_at_startup(settings)
+    settings = _make_settings(
+        ENVIRONMENT="production",
+        TELEGRAM_BOT_TOKEN="x" * 10,
+        TELEGRAM_ALLOWED_USER_IDS="123",
+        LLM_PROVIDER_PRIORITY="groq",
+        GROQ_API_KEY="gsk-test-key",  # noqa: S105
+    )
+    assert validate_at_startup(settings) is settings

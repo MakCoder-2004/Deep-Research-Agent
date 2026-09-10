@@ -8,6 +8,7 @@ import logging
 from research_agent.observability.logging import (
     JsonFormatter,
     clear_context,
+    configure_logging,
     set_job_id,
     set_secrets,
 )
@@ -26,6 +27,15 @@ def test_redact_text_removes_explicit_and_pattern_secrets() -> None:
 def test_redact_text_removes_telegram_token() -> None:
     token = "123456789:AAHdqTcvCH1vGWJxfSeofSAs0K5PALDsaw"  # noqa: S105
     assert token not in redact_text(f"bot {token}")
+
+
+def test_redact_text_removes_payment_and_government_ids() -> None:
+    card = "4111 1111 1111 1111"  # noqa: S105
+    text = f"charge {card} ssn: 123-45-6789 passport=AB123456"
+    redacted = redact_text(text)
+    assert card not in redacted
+    assert "123-45-6789" not in redacted
+    assert "AB123456" not in redacted
 
 
 def test_redact_mapping_hides_sensitive_keys() -> None:
@@ -56,3 +66,15 @@ def test_json_formatter_redacts_log_output() -> None:
         clear_context()
     assert secret not in output
     assert "job-1" in output
+
+
+def test_configure_logging_preserves_host_handlers() -> None:
+    root = logging.getLogger()
+    probe = logging.StreamHandler(io.StringIO())
+    root.addHandler(probe)
+    try:
+        configure_logging()
+        assert probe in root.handlers
+        assert any(isinstance(handler.formatter, JsonFormatter) for handler in root.handlers)
+    finally:
+        root.removeHandler(probe)

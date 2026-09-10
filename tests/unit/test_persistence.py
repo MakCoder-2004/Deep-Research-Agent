@@ -3,11 +3,13 @@
 from __future__ import annotations
 
 import json
-from datetime import UTC, datetime, timedelta
+from datetime import UTC, datetime, timedelta, timezone
 from pathlib import Path
 
 import aiosqlite
 
+from research_agent.models import Depth, Domain, JobState, Language, RiskLevel
+from research_agent.models.reports import Source
 from research_agent.persistence.database import connect, init_schema
 from research_agent.persistence.repositories import (
     CacheRepository,
@@ -185,5 +187,99 @@ async def test_tool_provider_cache_repositories() -> None:
         await cache.set(conn, "k2", "v2", past)
         assert await cache.get(conn, "k2") is None
         assert await cache.delete_expired(conn) >= 1
+    finally:
+        await conn.close()
+
+
+async def test_cache_expiry_parses_offset_formats() -> None:
+    conn = await _memory_db()
+    try:
+        cache = CacheRepository()
+        # Future instant written with a -05:00 offset sorts *before* the current
+        # UTC time as a raw string; only parsed comparison gets it right.
+        future_utc = datetime.now(UTC) + timedelta(hours=1)
+        minus_five = timezone(timedelta(hours=-5))
+        offset_format = future_utc.astimezone(minus_five).strftime("%Y-%m-%dT%H:%M:%S%z")
+        assert offset_format < datetime.now(UTC).isoformat()  # guard: discriminating case
+        await cache.set(conn, "offset", "v", offset_format)
+        assert await cache.get(conn, "offset") == "v"
+        await cache.set(conn, "garbage", "v", "not-a-timestamp")
+        assert await cache.get(conn, "garbage") is None
+    finally:
+        await conn.close()
+
+
+async def test_report_fts_search_and_delete_trigger() -> None:
+    conn = await _memory_db()
+    try:
+        jobs = JobRepository()
+        reports = ReportRepository()
+        await jobs.create(conn, job_id="j-fts", user_id=1, query="q")
+        await reports.save(
+            conn,
+            report_id="r-fts",
+            job_id="j-fts",
+            topic="Quantum batteries",
+            summary="Solid-state energy storage review",
+            markdown_path="data/reports/r-fts.md",
+            tools_used=["tavily"],
+        )
+        await conn.commit()
+        hits = await reports.search(conn, "batteries")
+        assert [row["report_id"] for row in hits] == ["r-fts"]
+        assert await reports.search(conn, "unrelatedzebra") == []
+        # Direct deletes (e.g. ON DELETE CASCADE from jobs) must not orphan FTS rows.
+        await conn.execute("DELETE FROM reports WHERE report_id = 'r-fts'")
+        await conn.commit()
+        cursor = await conn.execute("SELECT * FROM report_fts WHERE report_id = 'r-fts'")
+        assert await cursor.fetchall() == []
+    finally:
+        await conn.close()
+
+
+async def test_job_create_accepts_enums_and_source_models() -> None:
+    conn = await _memory_db()
+    try:
+        jobs = JobRepository()
+        reports = ReportRepository()
+        sources = SourceRepository()
+        await jobs.create(
+            conn,
+            job_id="j-enum",
+            user_id=1,
+            query="q",
+            language=Language.ARABIC,
+            domain=Domain.ACADEMIC,
+            depth=Depth.DEEP,
+            risk_level=RiskLevel.HIGH_STAKES,
+            state=JobState.ACTIVE,
+        )
+        row = await jobs.get(conn, "j-enum")
+        assert row is not None
+        assert (row["language"], row["domain"], row["depth"]) == ("ar", "academic", "deep")
+        assert (row["risk_level"], row["state"]) == ("high_stakes", "active")
+        await reports.save(
+            conn,
+            report_id="r-enum",
+            job_id="j-enum",
+            topic="T",
+            summary="S",
+            markdown_path="p",
+            tools_used=[],
+        )
+        await sources.save_many(
+            conn,
+            "r-enum",
+            [
+                Source(
+                    id=1,
+                    title="A",
+                    url="https://example.com/a",  # type: ignore[arg-type]
+                    accessed_at=datetime.now(UTC),
+                )
+            ],
+        )
+        rows = await sources.list_by_report(conn, "r-enum")
+        assert len(rows) == 1 and rows[0]["url"] == "https://example.com/a"
     finally:
         await conn.close()
