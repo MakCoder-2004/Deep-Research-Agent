@@ -28,6 +28,7 @@ from research_agent.telegram.texts import (
     pick_lang,
     render_cancel_none,
     render_cancelled,
+    render_forget_done,
     render_help,
     render_invalid_url,
     render_non_text,
@@ -333,6 +334,35 @@ async def report_handler(
             await _reply_with_conn(db_conn)
         return
     await message.answer(render_report_not_found(lang_code))
+
+
+@router.message(Command("forget"))
+async def forget_handler(
+    message: Message,
+    conn: aiosqlite.Connection | None = None,
+    db_path: Path | str | None = None,
+) -> None:
+    """Clear the temporary session; keep jobs and reports."""
+    from_user = message.from_user
+    if from_user is None:
+        return
+    lang_code: str | None = from_user.language_code
+    if conn is not None:
+        from research_agent.persistence.repositories import SessionRepository
+
+        await SessionRepository().delete(conn, from_user.id)
+        await conn.commit()
+        await message.answer(render_forget_done(lang_code))
+        return
+    if db_path is not None:
+        from research_agent.persistence.database import open_db
+        from research_agent.persistence.repositories import SessionRepository
+
+        async with open_db(db_path) as db_conn:
+            await SessionRepository().delete(db_conn, from_user.id)
+        await message.answer(render_forget_done(lang_code))
+        return
+    await message.answer(render_forget_done(lang_code))
 
 
 @router.message(F.text, ~F.text.startswith("/"))

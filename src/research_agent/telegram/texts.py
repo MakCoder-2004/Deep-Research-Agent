@@ -322,3 +322,12 @@ def format_report_bundle(report: object, sources: object, lang_code: str | None)
             continue
         lines.append(f"[{idx}] {title} - {url}")
     return "\n".join(lines)
+
+
+FORGET_DONE_EN = "Your temporary session has been cleared. Your jobs and reports are kept."
+FORGET_DONE_AR = "تم مسح جلستك المؤقتة. تم الاحتفاظ بمهامك وتقاريرك."
+
+
+def render_forget_done(lang_code: str | None) -> str:
+    """Render the /forget confirmation (jobs and reports are kept)."""
+    return FORGET_DONE_AR if pick_lang(lang_code) == "ar" else FORGET_DONE_EN
