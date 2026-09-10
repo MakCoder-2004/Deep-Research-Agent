@@ -143,14 +143,53 @@ def clear_cancel_event(job_id: str) -> None:
     _CANCEL_EVENTS.pop(job_id, None)
 
 
+_ALLOWED_TRANSITIONS: dict[JobState, set[JobState]] = {
+    JobState.QUEUED: {JobState.ACTIVE, JobState.CANCELLED},
+    JobState.ACTIVE: {JobState.COMPLETED, JobState.FAILED, JobState.CANCELLED},
+}
+
+
+async def set_state(
+    conn: aiosqlite.Connection,
+    job_id: str,
+    state: JobState | str,
+    *,
+    error: str | None = None,
+    trace_id: str | None = None,
+) -> None:
+    """Persist a job lifecycle transition via JobRepository.
+
+    Allows ``queued -> active -> completed|failed|cancelled`` plus
+    ``queued -> cancelled``; same-state is a no-op. Sanitizes ``error``
+    with redaction, refreshes ``updated_at`` via the repository, and
+    commits. Raises ``ValueError`` for unknown jobs or illegal moves.
+    """
+    target = JobState(state)
+    current_row = await JobRepository().get(conn, job_id)
+    if current_row is None:
+        raise ValueError(f"unknown job {job_id}")
+    try:
+        current = JobState(str(current_row["state"]))
+    except ValueError as exc:
+        raise ValueError(f"unknown current state for job {job_id}") from exc
+    if target != current:
+        allowed = _ALLOWED_TRANSITIONS.get(current, set())
+        if target not in allowed:
+            raise ValueError(f"illegal job transition {current.value} -> {target.value}")
+    sanitized_error = redact_text(error) if error else None
+    await JobRepository().update_state(
+        conn, job_id, target, error=sanitized_error, trace_id=trace_id
+    )
+    await conn.commit()
+
+
 async def cancel_user_job(conn: aiosqlite.Connection, user_id: int) -> bool:
     """Cooperatively cancel the user's active job; persist cancelled state."""
     job = await get_user_active_job(conn, user_id)
     if job is None:
         return False
     job_id = str(job["job_id"])
-    await JobRepository().update_state(conn, job_id, JobState.CANCELLED)
-    await conn.commit()
+    await set_state(conn, job_id, JobState.CANCELLED)
     get_cancel_event(job_id).set()
     return True
 
@@ -299,10 +338,12 @@ class BoundedJobQueue:
                 )
             except TimeoutError:
                 logger.warning("job timed out job_id=%s", redact_text(job.job_id))
-                async with open_db(self._db_path) as conn:
-                    await JobRepository().update_state(
-                        conn, job.job_id, JobState.FAILED, error="job timeout"
-                    )
+                try:
+                    async with open_db(self._db_path) as conn:
+                        await set_state(conn, job.job_id, JobState.FAILED, error="job timeout")
+                except ValueError:
+                    # Already terminal (e.g. cancelled during timeout); keep it.
+                    pass
             except asyncio.CancelledError:
                 raise
             except Exception as exc:  # noqa: BLE001 - placeholder must not crash worker
@@ -310,9 +351,7 @@ class BoundedJobQueue:
                 logger.warning("job failed job_id=%s error=%s", job.job_id, sanitized)
                 try:
                     async with open_db(self._db_path) as conn:
-                        await JobRepository().update_state(
-                            conn, job.job_id, JobState.FAILED, error=sanitized
-                        )
+                        await set_state(conn, job.job_id, JobState.FAILED, error=sanitized)
                 except Exception:  # noqa: BLE001, S110 - persistence best effort
                     pass
             finally:
@@ -327,10 +366,13 @@ class BoundedJobQueue:
         """
         cancel_event = get_cancel_event(job.job_id)
         async with open_db(self._db_path) as conn:
-            await JobRepository().update_state(conn, job.job_id, JobState.ACTIVE)
+            await set_state(conn, job.job_id, JobState.ACTIVE)
         if cancel_event.is_set():
             async with open_db(self._db_path) as conn:
-                await JobRepository().update_state(conn, job.job_id, JobState.CANCELLED)
+                try:
+                    await set_state(conn, job.job_id, JobState.CANCELLED)
+                except ValueError:
+                    pass
             return
         # Simulate bounded pipeline work without external I/O.
         try:
@@ -339,7 +381,11 @@ class BoundedJobQueue:
         except TimeoutError:
             cancelled = False
         async with open_db(self._db_path) as conn:
-            if cancelled or cancel_event.is_set():
-                await JobRepository().update_state(conn, job.job_id, JobState.CANCELLED)
-            else:
-                await JobRepository().update_state(conn, job.job_id, JobState.COMPLETED)
+            try:
+                if cancelled or cancel_event.is_set():
+                    await set_state(conn, job.job_id, JobState.CANCELLED)
+                else:
+                    await set_state(conn, job.job_id, JobState.COMPLETED)
+            except ValueError:
+                # Terminal already (e.g. concurrent cancel); keep first state.
+                pass
