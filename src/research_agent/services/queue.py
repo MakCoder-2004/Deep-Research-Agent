@@ -2,11 +2,13 @@
 
 from __future__ import annotations
 
+import asyncio
 from dataclasses import dataclass
 from uuid import uuid4
 
 import aiosqlite
 
+from research_agent.models import JobState
 from research_agent.persistence.repositories import JobRepository
 
 
@@ -76,3 +78,32 @@ async def queue_position(conn: aiosqlite.Connection, job_id: str) -> int:
         return max(1, int(count_row["n"]))
     except (TypeError, ValueError):
         return 1
+
+
+_CANCEL_EVENTS: dict[str, asyncio.Event] = {}
+
+
+def get_cancel_event(job_id: str) -> asyncio.Event:
+    """Return (creating if needed) the cooperative cancellation event."""
+    event = _CANCEL_EVENTS.get(job_id)
+    if event is None:
+        event = asyncio.Event()
+        _CANCEL_EVENTS[job_id] = event
+    return event
+
+
+def clear_cancel_event(job_id: str) -> None:
+    """Remove a cancellation event from the registry."""
+    _CANCEL_EVENTS.pop(job_id, None)
+
+
+async def cancel_user_job(conn: aiosqlite.Connection, user_id: int) -> bool:
+    """Cooperatively cancel the user's active job; persist cancelled state."""
+    job = await get_user_active_job(conn, user_id)
+    if job is None:
+        return False
+    job_id = str(job["job_id"])
+    await JobRepository().update_state(conn, job_id, JobState.CANCELLED)
+    await conn.commit()
+    get_cancel_event(job_id).set()
+    return True

@@ -14,6 +14,7 @@ from pydantic import ValidationError
 from research_agent.models.requests import ResearchRequest
 from research_agent.services.queue import (
     JobRef,
+    cancel_user_job,
     enqueue_request,
     get_user_active_job,
     queue_position,
@@ -22,6 +23,8 @@ from research_agent.services.sessions import ensure_user
 from research_agent.telegram.texts import (
     format_status,
     pick_lang,
+    render_cancel_none,
+    render_cancelled,
     render_help,
     render_invalid_url,
     render_non_text,
@@ -227,6 +230,41 @@ async def status_handler(
             await _reply_with_conn(db_conn)
         return
     await message.answer(format_status("none", lang_code=lang_code))
+
+
+@router.message(Command("cancel"))
+async def cancel_handler(
+    message: Message,
+    conn: aiosqlite.Connection | None = None,
+    db_path: Path | str | None = None,
+) -> None:
+    """Cooperatively cancel the user's active job."""
+    from_user = message.from_user
+    if from_user is None:
+        return
+    lang_code: str | None = from_user.language_code
+
+    async def _cancel_with_conn(db_conn: aiosqlite.Connection) -> None:
+        existing = await get_user_active_job(db_conn, from_user.id)
+        job_id = str(existing["job_id"]) if existing is not None else ""
+        cancelled = await cancel_user_job(db_conn, from_user.id)
+        if cancelled and job_id:
+            await message.answer(render_cancelled(job_id, lang_code))
+        elif cancelled:
+            await message.answer(render_cancelled("unknown", lang_code))
+        else:
+            await message.answer(render_cancel_none(lang_code))
+
+    if conn is not None:
+        await _cancel_with_conn(conn)
+        return
+    if db_path is not None:
+        from research_agent.persistence.database import open_db
+
+        async with open_db(db_path) as db_conn:
+            await _cancel_with_conn(db_conn)
+        return
+    await message.answer(render_cancel_none(lang_code))
 
 
 @router.message(F.text, ~F.text.startswith("/"))

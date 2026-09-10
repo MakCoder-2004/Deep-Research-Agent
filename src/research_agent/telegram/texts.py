@@ -233,3 +233,21 @@ def format_status(
             base += f"\nQuery: {query}"
         return base
     return STATUS_NONE_AR if lang == "ar" else STATUS_NONE_EN
+
+
+CANCELLED_EN_TEMPLATE = "Your active research job {job_id} has been cancelled."
+CANCELLED_AR_TEMPLATE = "تم إلغاء مهمة البحث النشطة {job_id}."
+CANCEL_NONE_EN = "You have no active research job to cancel."
+CANCEL_NONE_AR = "ليس لديك مهمة بحث نشطة لإلغائها."
+
+
+def render_cancelled(job_id: str, lang_code: str | None) -> str:
+    """Render the cancellation confirmation, preserving the job ID verbatim."""
+    if pick_lang(lang_code) == "ar":
+        return CANCELLED_AR_TEMPLATE.format(job_id=job_id)
+    return CANCELLED_EN_TEMPLATE.format(job_id=job_id)
+
+
+def render_cancel_none(lang_code: str | None) -> str:
+    """Render the no-active-job reply for /cancel."""
+    return CANCEL_NONE_AR if pick_lang(lang_code) == "ar" else CANCEL_NONE_EN
