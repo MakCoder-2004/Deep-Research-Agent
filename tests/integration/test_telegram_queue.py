@@ -16,12 +16,15 @@ from research_agent.services.queue import (
     JobRef,
     UserBusyError,
     cancel_user_job,
+    clear_all_cancel_events,
     enqueue_request,
+    get_cancel_event,
+    get_default_queue,
     get_user_active_job,
     queue_position,
+    set_default_queue,
     set_state,
 )
-from research_agent.telegram.handlers import status_handler
 
 
 def _msg(user_id: int, text: str, lang: str = "en") -> MagicMock:
@@ -148,6 +151,8 @@ async def test_cancel_queued_and_active(tmp_path: Path) -> None:
 
 
 async def test_status_positions_queued_and_active(tmp_path: Path) -> None:
+    from research_agent.telegram.handlers import status_handler
+
     db_path = tmp_path / "status.db"
     async with open_db(db_path) as conn:
         first = await enqueue_request(conn, 30, "first")
@@ -254,3 +259,58 @@ async def test_concurrent_enqueue_one_active_per_user(tmp_path: Path) -> None:
         )
         row = await cursor.fetchone()
         assert row is not None and int(row["n"]) == 1
+
+
+async def test_cancel_events_cleanup_on_terminal_and_stop(tmp_path: Path) -> None:
+    """Terminal transitions pop events; stop() clears the registry."""
+    from research_agent.services.queue import _CANCEL_EVENTS
+
+    clear_all_cancel_events()
+    db_path = tmp_path / "cancel-clean.db"
+    async with open_db(db_path) as conn:
+        job = await enqueue_request(conn, 60, "cleanup query")
+        # enqueue creates no event for DB-only path; create one explicitly.
+        get_cancel_event(job.job_id)
+        assert job.job_id in _CANCEL_EVENTS
+        await set_state(conn, job.job_id, JobState.ACTIVE)
+        # Active is non-terminal: event must survive.
+        assert job.job_id in _CANCEL_EVENTS
+        await set_state(conn, job.job_id, JobState.COMPLETED)
+        assert job.job_id not in _CANCEL_EVENTS
+    queue = BoundedJobQueue(db_path)
+    ref = await queue.enqueue(61, "live query")
+    assert ref.job_id in _CANCEL_EVENTS
+    await queue.stop()
+    assert ref.job_id not in _CANCEL_EVENTS
+    assert len(_CANCEL_EVENTS) == 0
+
+
+async def test_cancel_registry_bounded() -> None:
+    """Unbounded job churn must not leak unlimited cancel events."""
+    from research_agent.services.queue import _CANCEL_EVENTS, _MAX_CANCEL_EVENTS
+
+    clear_all_cancel_events()
+    try:
+        for i in range(_MAX_CANCEL_EVENTS + 50):
+            get_cancel_event(f"job-{i}")
+        assert len(_CANCEL_EVENTS) <= _MAX_CANCEL_EVENTS
+    finally:
+        clear_all_cancel_events()
+
+
+async def test_default_queue_helper(tmp_path: Path) -> None:
+    """Handlers can retrieve the live queue via the default registry."""
+    db_path = tmp_path / "default-q.db"
+    async with open_db(db_path):
+        pass
+    queue = BoundedJobQueue(db_path)
+    try:
+        assert get_default_queue() is None or isinstance(
+            get_default_queue(), BoundedJobQueue
+        )
+        set_default_queue(queue)
+        assert get_default_queue() is queue
+    finally:
+        set_default_queue(None)
+        clear_all_cancel_events()
+        await queue.stop()

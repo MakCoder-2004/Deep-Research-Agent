@@ -184,12 +184,26 @@ async def queue_position(conn: aiosqlite.Connection, job_id: str) -> int:
 
 
 _CANCEL_EVENTS: dict[str, asyncio.Event] = {}
+_MAX_CANCEL_EVENTS = 1024
+
+_DEFAULT_QUEUE: BoundedJobQueue | None = None
 
 
 def get_cancel_event(job_id: str) -> asyncio.Event:
-    """Return (creating if needed) the cooperative cancellation event."""
+    """Return (creating if needed) the cooperative cancellation event.
+
+    The registry is bounded to ``_MAX_CANCEL_EVENTS`` entries; when full the
+    oldest entry is evicted to avoid unbounded growth from many jobs.
+    """
     event = _CANCEL_EVENTS.get(job_id)
     if event is None:
+        if len(_CANCEL_EVENTS) >= _MAX_CANCEL_EVENTS:
+            try:
+                oldest = next(iter(_CANCEL_EVENTS))
+            except StopIteration:
+                oldest = None
+            if oldest is not None:
+                _CANCEL_EVENTS.pop(oldest, None)
         event = asyncio.Event()
         _CANCEL_EVENTS[job_id] = event
     return event
@@ -198,6 +212,48 @@ def get_cancel_event(job_id: str) -> asyncio.Event:
 def clear_cancel_event(job_id: str) -> None:
     """Remove a cancellation event from the registry."""
     _CANCEL_EVENTS.pop(job_id, None)
+
+
+def clear_all_cancel_events() -> None:
+    """Remove all cancellation events (used on queue stop)."""
+    _CANCEL_EVENTS.clear()
+
+
+def cancel_event_count() -> int:
+    """Return the number of tracked cancellation events (for tests)."""
+    return len(_CANCEL_EVENTS)
+
+
+def set_default_queue(queue: BoundedJobQueue | None) -> None:
+    """Register the live queue instance for handler wiring."""
+    global _DEFAULT_QUEUE
+    _DEFAULT_QUEUE = queue
+
+
+def get_default_queue() -> BoundedJobQueue | None:
+    """Return the registered live queue instance, if any."""
+    return _DEFAULT_QUEUE
+
+
+# Aliases for handler wiring compatibility.
+def set_queue(queue: BoundedJobQueue | None) -> None:
+    """Alias of :func:`set_default_queue` for handler wiring."""
+    set_default_queue(queue)
+
+
+def get_queue() -> BoundedJobQueue | None:
+    """Alias of :func:`get_default_queue` for handler wiring."""
+    return get_default_queue()
+
+
+def set_job_queue(queue: BoundedJobQueue | None) -> None:
+    """Alias of :func:`set_default_queue` for handler wiring."""
+    set_default_queue(queue)
+
+
+def get_job_queue() -> BoundedJobQueue | None:
+    """Alias of :func:`get_default_queue` for handler wiring."""
+    return get_default_queue()
 
 
 _ALLOWED_TRANSITIONS: dict[JobState, set[JobState]] = {
@@ -239,6 +295,9 @@ async def set_state(
         conn, job_id, target, error=sanitized_error, trace_id=trace_id
     )
     await conn.commit()
+    if target in (JobState.COMPLETED, JobState.FAILED, JobState.CANCELLED):
+        # Terminal states no longer need cooperative cancellation state.
+        clear_cancel_event(job_id)
 
 
 async def cancel_user_job(conn: aiosqlite.Connection, user_id: int) -> bool:
@@ -357,6 +416,8 @@ class BoundedJobQueue:
         if self._tasks:
             await asyncio.gather(*self._tasks.values(), return_exceptions=True)
         self._tasks.clear()
+        # Avoid leaking cooperative cancellation state across restarts.
+        clear_all_cancel_events()
 
     async def worker_loop(self) -> None:
         """Consume FIFO jobs; each runs bounded by the global semaphore."""
