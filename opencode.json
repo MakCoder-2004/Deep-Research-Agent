@@ -1,0 +1,21 @@
+{
+  "$schema": "https://opencode.ai/config.json",
+  "skills": {
+    "paths": [
+      ".agents/skills",
+      "D:/Programming/Projects/Web Development/Geekers/.opencode/skills"
+    ]
+  },
+  "mcp": {
+    "docs-langchain": {
+      "type": "remote",
+      "url": "https://docs.langchain.com/mcp",
+      "enabled": true
+    },
+    "reference-langchain": {
+      "type": "remote",
+      "url": "https://reference.langchain.com/mcp",
+      "enabled": true
+    }
+  }
+}
