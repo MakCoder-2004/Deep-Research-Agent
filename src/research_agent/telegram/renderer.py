@@ -3,6 +3,11 @@
 PLAN section 15 delivery: concise reports must escape Telegram MarkdownV2
 correctly while keeping ASCII ``[1]`` citation markers readable in both
 English (LTR) and Arabic (RTL) text.
+
+PLAN section 14/25: no report is delivered before Pydantic validation.
+Every finding must carry at least one citation that maps to a listed
+source. Use :func:`validate_before_render` (called automatically by
+:func:`render_concise_report`) and never render unvalidated payloads.
 """
 
 from __future__ import annotations
@@ -10,11 +15,14 @@ from __future__ import annotations
 import asyncio
 import logging
 import re
-from collections.abc import Sequence
+from collections.abc import Mapping, Sequence
+from datetime import UTC, datetime
 from pathlib import Path
-from typing import Any
+from typing import Any, TypedDict, cast
 
 from aiogram.types import BufferedInputFile, Message
+
+from research_agent.models.reports import Finding, ResearchReport, Source
 
 logger = logging.getLogger(__name__)
 
@@ -29,6 +37,28 @@ _SENTENCE_RE = re.compile(r"(?<=[.!?؟…])\s+")
 _MARKDOWN_V2_SPECIALS: frozenset[str] = frozenset(
     {"_", "*", "[", "]", "(", ")", "~", "`", ">", "#", "+", "-", "=", "|", "{", "}", ".", "!"}
 )
+
+
+class FindingDict(TypedDict, total=False):
+    """Typed shape for plain finding payloads (dict/JSON rows)."""
+
+    statement: str
+    citation_ids: list[int]
+
+
+class SourceDict(TypedDict, total=False):
+    """Typed shape for plain source payloads (dict/JSON/DB rows)."""
+
+    id: int
+    source_ref: int
+    source_id: int
+    ref: int
+    title: str
+    url: str
+    publisher: str | None
+    published_at: str | None
+    accessed_at: str | None
+    source_type: str
 
 
 def escape_markdown_v2(text: str) -> str:
@@ -187,40 +217,45 @@ def _normalize_report_lang(lang: str | None) -> str:
     return "en"
 
 
-def _finding_statement(item: Any) -> str:
-    """Extract a finding statement from a model, mapping, or row."""
-    try:
-        val = getattr(item, "statement", None)
-        if val is not None:
-            return str(val)
-    except Exception:  # noqa: BLE001, S110 - fall back to mapping access
-        pass
-    try:
-        return str(item["statement"])
-    except Exception:  # noqa: BLE001, S110 - last resort stringifies the item
-        return str(item)
+def _get_field(item: object, key: str) -> Any | None:
+    """Read one field from a model, mapping, or DB row without chaining.
 
-
-def _finding_citations(item: Any) -> list[int]:
-    """Extract citation ids preserving order and dropping invalid entries."""
-    raw: Any = None
-    try:
-        raw = getattr(item, "citation_ids", None)
-        if raw is None:
-            raise AttributeError("no citation_ids attr")
-    except Exception:  # noqa: BLE001, S110 - try mapping access next
+    Centralizes all dynamic access so rendering code works off validated
+    Pydantic models instead of ``Any`` attribute/mapping chains. Returns
+    ``None`` when the field is absent.
+    """
+    if isinstance(item, Mapping):
         try:
-            raw = item["citation_ids"]
-        except Exception:  # noqa: BLE001, S110 - no citations available
-            return []
-    ids: list[int] = []
+            return cast(Mapping[str, Any], item).get(key)
+        except Exception:  # noqa: BLE001, S110 - fall through to other shapes
+            pass
     try:
-        candidates = list(raw)
+        subscript = cast(Any, item).__getitem__
+    except AttributeError:
+        pass
+    else:
+        try:
+            return cast(Any, subscript(key))
+        except Exception:  # noqa: BLE001, S110 - not a mapping-like row
+            pass
+    try:
+        return cast(Any, getattr(item, key, None))
+    except Exception:  # noqa: BLE001, S110 - unreadable attribute
+        return None
+
+
+def _coerce_citation_ids(raw: Any | None) -> list[int]:
+    """Normalize raw citation ids preserving order, dropping invalid ones."""
+    if raw is None:
+        return []
+    try:
+        candidates = list(cast(Any, raw))
     except TypeError:
         return []
+    ids: list[int] = []
     for cand in candidates:
         try:
-            num = int(cand)
+            num = int(cast(Any, cand))
         except (TypeError, ValueError):
             continue
         if num >= 1 and num not in ids:
@@ -228,45 +263,127 @@ def _finding_citations(item: Any) -> list[int]:
     return ids
 
 
-def _source_field(item: Any, *names: str, default: str = "") -> str:
-    """Extract a string field trying attributes then mapping keys."""
-    for name in names:
-        try:
-            val = getattr(item, name, None)
-            if val is not None and str(val) != "":
-                return str(val)
-        except Exception:  # noqa: BLE001, S112 - try next source
-            continue
-    for name in names:
-        try:
-            val = item[name]
-            if val is not None and str(val) != "":
-                return str(val)
-        except Exception:  # noqa: BLE001, S112 - try next key
-            continue
-    return default
+def coerce_finding(item: object) -> Finding:
+    """Coerce a plain payload into a validated :class:`Finding`.
+
+    Accepts a :class:`Finding`, a mapping with ``statement`` /
+    ``citation_ids``, or an attribute object. Raises :class:`ValueError`
+    when the statement is empty or when no citation is present, enforcing
+    "every finding needs citations" before any delivery.
+    """
+    if isinstance(item, Finding):
+        if not item.citation_ids:
+            raise ValueError("Every finding must have at least one citation.")
+        return item
+    statement_raw = _get_field(item, "statement")
+    statement = str(statement_raw).strip() if statement_raw is not None else ""
+    if not statement:
+        # Last resort mirrors legacy behavior for raw strings, but empty
+        # statements are never deliverable.
+        if isinstance(item, str) and item.strip():
+            statement = item.strip()
+        else:
+            raise ValueError("Finding statement must be non-empty.")
+    citation_ids = _coerce_citation_ids(_get_field(item, "citation_ids"))
+    if not citation_ids:
+        raise ValueError("Every finding must have at least one citation.")
+    return Finding(statement=statement, citation_ids=citation_ids)
 
 
-def _source_id(item: Any, fallback: int) -> int:
-    """Extract a numeric source id, falling back to sequential position."""
-    for name in ("id", "source_ref", "source_id", "ref"):
-        try:
-            val = getattr(item, name, None)
-            if val is not None:
-                num = int(val)
-                if num >= 1:
-                    return num
-        except (TypeError, ValueError, AttributeError):
+def coerce_source(item: object, fallback_id: int) -> Source:
+    """Coerce a plain payload into a validated :class:`Source`.
+
+    Accepts a :class:`Source`, a mapping, an ``aiosqlite.Row``-like object,
+    or an attribute object. ``fallback_id`` supplies the sequential position
+    when no explicit ``id`` / ``source_ref`` / ``source_id`` / ``ref`` is
+    present. Missing ``accessed_at`` defaults to now (UTC). Raises
+    :class:`ValueError` when ``url`` is absent so unvalidated sources are
+    never delivered.
+    """
+    if isinstance(item, Source):
+        return item
+    source_id = fallback_id
+    for key in ("id", "source_ref", "source_id", "ref"):
+        raw_id = _get_field(item, key)
+        if raw_id is None:
             continue
         try:
-            val = item[name]
-            if val is not None:
-                num = int(val)
-                if num >= 1:
-                    return num
-        except Exception:  # noqa: BLE001, S112 - try next key
+            num = int(cast(Any, raw_id))
+        except (TypeError, ValueError):
             continue
-    return fallback
+        if num >= 1:
+            source_id = num
+            break
+    title_raw = _get_field(item, "title")
+    url_raw = _get_field(item, "url")
+    url_text = str(url_raw).strip() if url_raw is not None else ""
+    if not url_text:
+        raise ValueError(f"Source {source_id} must include a URL.")
+    title_text = str(title_raw).strip() if title_raw is not None and str(title_raw).strip() else ""
+    if not title_text:
+        title_text = url_text
+    accessed_raw = _get_field(item, "accessed_at")
+    if accessed_raw is None:
+        accessed_at: datetime | str = datetime.now(UTC)
+    elif isinstance(accessed_raw, datetime):
+        accessed_at = accessed_raw
+    else:
+        accessed_at = str(accessed_raw)
+    publisher_raw = _get_field(item, "publisher")
+    publisher = str(publisher_raw) if publisher_raw is not None else None
+    published_raw = _get_field(item, "published_at")
+    published_at: datetime | str | None = None
+    if published_raw is not None:
+        published_at = published_raw if isinstance(published_raw, datetime) else str(published_raw)
+    source_type_raw = _get_field(item, "source_type")
+    source_type = str(source_type_raw) if source_type_raw is not None else "web"
+    return Source(
+        id=source_id,
+        title=title_text,
+        url=cast(Any, url_text),
+        publisher=publisher,
+        published_at=cast(Any, published_at),
+        accessed_at=cast(Any, accessed_at),
+        source_type=cast(Any, source_type),
+    )
+
+
+def validate_before_render(
+    topic: str,
+    findings: Sequence[object],
+    sources: Sequence[object],
+    tools_used: Sequence[str] | None = None,
+) -> ResearchReport:
+    """Validate report payloads and return a :class:`ResearchReport`.
+
+    Coerces plain findings/sources via :func:`coerce_finding` /
+    :func:`coerce_source`, then constructs :class:`ResearchReport` so
+    citation mapping, source ordering, URL uniqueness, and schema rules are
+    enforced. Raises on any validation failure; callers must never deliver
+    when this raises.
+    """
+    clean_topic = topic.strip()
+    if not clean_topic:
+        raise ValueError("Report topic must be non-empty.")
+    finding_list = list(findings)
+    source_list = list(sources)
+    if not finding_list:
+        raise ValueError("Report must include at least one finding.")
+    if not source_list:
+        raise ValueError("Report must include at least one source.")
+    finding_models = [coerce_finding(item) for item in finding_list]
+    source_models = [coerce_source(item, idx) for idx, item in enumerate(source_list, start=1)]
+    summary = "\n".join(finding.statement for finding in finding_models).strip()
+    if not summary:
+        raise ValueError("Report summary must be non-empty.")
+    tools = [str(tool) for tool in list(tools_used)] if tools_used else []
+    return ResearchReport(
+        topic=clean_topic,
+        key_findings=finding_models,
+        summary=summary,
+        sources=source_models,
+        tools_used=tools,
+    )
 
 
 def _escape_url_for_link(url: str) -> str:
@@ -276,23 +393,35 @@ def _escape_url_for_link(url: str) -> str:
 
 def render_concise_report(
     topic: str,
-    findings: Sequence[Any],
-    sources: Sequence[Any],
+    findings: Sequence[object],
+    sources: Sequence[object],
     lang: str = "en",
     partial: bool = False,
     disclaimer: str | None = None,
     tools_used: Sequence[str] | None = None,
+    tools_failed: Sequence[str] | None = None,
 ) -> str:
     """Render a concise in-chat report for Telegram MarkdownV2.
+
+    Validates via :func:`validate_before_render` first so unvalidated
+    payloads raise instead of being delivered. Every finding must carry at
+    least one citation marker mapping to a listed source; otherwise
+    :class:`ValueError` is raised.
 
     All user/model text (topic, statements, titles, tools, disclaimer) is
     escaped with :func:`escape_markdown_v2`. ASCII ``[n]`` citation markers
     are inserted after escaping so they stay plain and readable in both LTR
     English and RTL Arabic. Formatting asterisks for the bold topic are the
     only unescaped MarkdownV2 controls added by this function.
+
+    ``partial`` adds a partial-coverage banner. ``tools_failed`` lists only
+    failed tools that affected coverage (callers must filter to
+    coverage-affecting failures); it renders as a separate escaped line.
     """
+    validated = validate_before_render(topic, findings, sources, tools_used)
+    failed = [str(tool) for tool in list(tools_failed)] if tools_failed else []
     normalized = _normalize_report_lang(lang)
-    esc_topic = escape_markdown_v2(topic)
+    esc_topic = escape_markdown_v2(validated.topic)
     lines: list[str] = []
     if partial:
         if normalized == "ar":
@@ -303,37 +432,91 @@ def render_concise_report(
     lines.append(f"*{esc_topic}*")
     lines.append("")
     lines.append("أبرز النتائج:" if normalized == "ar" else "Key findings:")
-    for item in list(findings):
-        stmt = escape_markdown_v2(_finding_statement(item))
-        cids = _finding_citations(item)
-        markers = " ".join(render_citation_marker(c) for c in cids)
-        if markers:
-            lines.append(f"• {stmt} {markers}")
-        else:
-            lines.append(f"• {stmt}")
+    for finding in validated.key_findings:
+        stmt = escape_markdown_v2(finding.statement)
+        markers = " ".join(render_citation_marker(c) for c in finding.citation_ids)
+        lines.append(f"• {stmt} {markers}")
     lines.append("")
     lines.append("المصادر:" if normalized == "ar" else "Sources:")
-    for idx, src in enumerate(list(sources), start=1):
-        marker = _source_id(src, idx)
-        title_raw = _source_field(src, "title", default="")
-        url_raw = _source_field(src, "url", default="")
-        if title_raw:
-            esc_title = escape_markdown_v2(title_raw)
-        else:
-            esc_title = escape_markdown_v2(url_raw or f"source {marker}")
-        if url_raw:
-            safe_url = _escape_url_for_link(url_raw)
-            lines.append(f"[{marker}] [{esc_title}]({safe_url})")
-        else:
-            lines.append(f"[{marker}] {esc_title}")
-    if tools_used:
-        esc_tools = ", ".join(escape_markdown_v2(str(tool)) for tool in list(tools_used))
+    for src in validated.sources:
+        marker = src.id
+        title_raw = src.title
+        url_raw = str(src.url)
+        esc_title = escape_markdown_v2(title_raw) if title_raw else escape_markdown_v2(url_raw)
+        safe_url = _escape_url_for_link(url_raw)
+        lines.append(f"[{marker}] [{esc_title}]({safe_url})")
+    if validated.tools_used:
+        esc_tools = ", ".join(escape_markdown_v2(str(tool)) for tool in validated.tools_used)
         lines.append("")
         lines.append(f"الأدوات: {esc_tools}" if normalized == "ar" else f"Tools: {esc_tools}")
+    if failed:
+        esc_failed = ", ".join(escape_markdown_v2(tool) for tool in failed)
+        lines.append("")
+        if normalized == "ar":
+            lines.append(f"الأدوات الفاشلة (أثّرت على التغطية): {esc_failed}")
+        else:
+            lines.append(f"Failed tools (coverage affected): {esc_failed}")
     if disclaimer:
         lines.append("")
         lines.append(escape_markdown_v2(disclaimer))
     return "\n".join(lines)
+
+
+def build_concise_from_report(
+    report: ResearchReport,
+    lang: str = "en",
+    partial: bool = False,
+    disclaimer: str | None = None,
+    tools_failed: Sequence[str] | None = None,
+) -> str:
+    """Render concise MarkdownV2 text from a validated :class:`ResearchReport`.
+
+    The report is already Pydantic-validated; rendering reuses
+    :func:`render_concise_report` so escaping, partial banners, disclaimers,
+    and coverage-affecting failed-tool lines stay consistent.
+    """
+    return render_concise_report(
+        report.topic,
+        list(report.key_findings),
+        list(report.sources),
+        lang,
+        partial=partial,
+        disclaimer=disclaimer,
+        tools_used=list(report.tools_used),
+        tools_failed=tools_failed,
+    )
+
+
+def render_safe_fallback(topic: str, summary: str, lang: str = "en") -> str:
+    """Render an escaped MarkdownV2 fallback when validation fails.
+
+    Never returns raw unescaped content and never raises: all text is passed
+    through :func:`escape_markdown_v2`. Use this instead of sending a raw
+    plain-text bundle on render exceptions so Telegram parsing stays safe.
+    """
+    try:
+        normalized = _normalize_report_lang(lang)
+        esc_topic = escape_markdown_v2(topic.strip() or "report")
+        esc_summary = escape_markdown_v2(summary.strip() or "")
+        if normalized == "ar":
+            lines = [
+                f"*{esc_topic}*",
+                "",
+                "تعذّر عرض التقرير المفصّل، إليك الملخص الآمن:",
+                "",
+                esc_summary or "لا يتوفر ملخص.",
+            ]
+        else:
+            lines = [
+                f"*{esc_topic}*",
+                "",
+                "Detailed report unavailable, safe summary:",
+                "",
+                esc_summary or "No summary available.",
+            ]
+        return "\n".join(lines)
+    except Exception:  # noqa: BLE001 - fallback must never raise
+        return "Report unavailable\\."
 
 
 def report_filename(report_id: str) -> str:
