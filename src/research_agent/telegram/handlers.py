@@ -19,8 +19,11 @@ from research_agent.services.queue import (
     get_user_active_job,
     queue_position,
 )
+from research_agent.services.reports import get_report_bundle, list_recent_reports
 from research_agent.services.sessions import ensure_user
 from research_agent.telegram.texts import (
+    format_history,
+    format_report_bundle,
     format_status,
     pick_lang,
     render_cancel_none,
@@ -28,6 +31,8 @@ from research_agent.telegram.texts import (
     render_help,
     render_invalid_url,
     render_non_text,
+    render_report_not_found,
+    render_report_usage,
     render_research_accepted,
     render_research_usage,
     render_start,
@@ -265,6 +270,69 @@ async def cancel_handler(
             await _cancel_with_conn(db_conn)
         return
     await message.answer(render_cancel_none(lang_code))
+
+
+@router.message(Command("history"))
+async def history_handler(
+    message: Message,
+    conn: aiosqlite.Connection | None = None,
+    db_path: Path | str | None = None,
+) -> None:
+    """Show the user's last 5 reports (owner-scoped)."""
+    from_user = message.from_user
+    if from_user is None:
+        return
+    lang_code: str | None = from_user.language_code
+
+    async def _reply_with_conn(db_conn: aiosqlite.Connection) -> None:
+        reports = await list_recent_reports(db_conn, from_user.id, limit=5)
+        await message.answer(format_history(reports, lang_code))
+
+    if conn is not None:
+        await _reply_with_conn(conn)
+        return
+    if db_path is not None:
+        from research_agent.persistence.database import open_db
+
+        async with open_db(db_path) as db_conn:
+            await _reply_with_conn(db_conn)
+        return
+    await message.answer(format_history([], lang_code))
+
+
+@router.message(Command("report"))
+async def report_handler(
+    message: Message,
+    conn: aiosqlite.Connection | None = None,
+    db_path: Path | str | None = None,
+) -> None:
+    """Retrieve a prior report by ID with ownership check."""
+    from_user = message.from_user
+    if from_user is None:
+        return
+    lang_code: str | None = from_user.language_code
+    report_id = extract_research_arg(message.text or "", "/report")
+    if not report_id:
+        await message.answer(render_report_usage(lang_code))
+        return
+
+    async def _reply_with_conn(db_conn: aiosqlite.Connection) -> None:
+        report, sources = await get_report_bundle(db_conn, from_user.id, report_id)
+        if report is None:
+            await message.answer(render_report_not_found(lang_code))
+            return
+        await message.answer(format_report_bundle(report, sources, lang_code))
+
+    if conn is not None:
+        await _reply_with_conn(conn)
+        return
+    if db_path is not None:
+        from research_agent.persistence.database import open_db
+
+        async with open_db(db_path) as db_conn:
+            await _reply_with_conn(db_conn)
+        return
+    await message.answer(render_report_not_found(lang_code))
 
 
 @router.message(F.text, ~F.text.startswith("/"))

@@ -251,3 +251,74 @@ def render_cancelled(job_id: str, lang_code: str | None) -> str:
 def render_cancel_none(lang_code: str | None) -> str:
     """Render the no-active-job reply for /cancel."""
     return CANCEL_NONE_AR if pick_lang(lang_code) == "ar" else CANCEL_NONE_EN
+
+
+HISTORY_EMPTY_EN = "You have no saved reports yet. Send /research <query> to create one."
+HISTORY_EMPTY_AR = "لا توجد لديك تقارير محفوظة بعد. أرسل /research <استعلام> لإنشاء تقرير."
+HISTORY_HEADER_EN = "Your recent reports (last {n}):"
+HISTORY_HEADER_AR = "تقاريرك الأخيرة (آخر {n}):"
+REPORT_USAGE_EN = "Usage: /report <id> - e.g. /report abc123. Use /history to list reports."
+REPORT_USAGE_AR = "الاستخدام: /report <id> - مثال: /report abc123. استخدم /history لعرض التقارير."
+REPORT_NOT_FOUND_EN = "Report not found. Use /history to list your recent reports."
+REPORT_NOT_FOUND_AR = "التقرير غير موجود. استخدم /history لعرض تقاريرك الأخيرة."
+
+
+def format_history(reports: object, lang_code: str | None) -> str:
+    """Format the /history reply for the last reports (owner-scoped)."""
+    items = list(reports or [])  # type: ignore[arg-type]
+    if not items:
+        return HISTORY_EMPTY_AR if pick_lang(lang_code) == "ar" else HISTORY_EMPTY_EN
+    lang = pick_lang(lang_code)
+    header = (
+        HISTORY_HEADER_AR.format(n=len(items))
+        if lang == "ar"
+        else HISTORY_HEADER_EN.format(n=len(items))
+    )
+    lines = [header]
+    for row in items:
+        try:
+            report_id = row["report_id"]  # type: ignore[index]
+            topic = row["topic"]  # type: ignore[index]
+        except Exception:  # noqa: BLE001, S112 - tolerate dict/Row shapes
+            continue
+        lines.append(f"- {report_id}: {topic}")
+    lines.append(
+        "استخدم /report <id> لاسترجاع تقرير."
+        if lang == "ar"
+        else "Use /report <id> to retrieve a report."
+    )
+    return "\n".join(lines)
+
+
+def render_report_usage(lang_code: str | None) -> str:
+    """Render the /report usage reply (no lookup performed)."""
+    return REPORT_USAGE_AR if pick_lang(lang_code) == "ar" else REPORT_USAGE_EN
+
+
+def render_report_not_found(lang_code: str | None) -> str:
+    """Render the unknown-or-unowned report reply."""
+    return REPORT_NOT_FOUND_AR if pick_lang(lang_code) == "ar" else REPORT_NOT_FOUND_EN
+
+
+def format_report_bundle(report: object, sources: object, lang_code: str | None) -> str:
+    """Format a retrieved report with readable [1] citation markers."""
+    lang = pick_lang(lang_code)
+    try:
+        topic = report["topic"]  # type: ignore[index]
+        summary = report["summary"]  # type: ignore[index]
+        report_id = report["report_id"]  # type: ignore[index]
+    except Exception:  # noqa: BLE001 - caller guarantees a valid report row
+        return render_report_not_found(lang_code)
+    src_list = list(sources or [])  # type: ignore[arg-type]
+    if lang == "ar":
+        lines = [f"التقرير: {topic}", f"المعرّف: {report_id}", "", str(summary), "", "المصادر:"]
+    else:
+        lines = [f"Report: {topic}", f"ID: {report_id}", "", str(summary), "", "Sources:"]
+    for idx, src in enumerate(src_list, start=1):
+        try:
+            title = src["title"]  # type: ignore[index]
+            url = src["url"]  # type: ignore[index]
+        except Exception:  # noqa: BLE001, S112 - skip malformed source rows
+            continue
+        lines.append(f"[{idx}] {title} - {url}")
+    return "\n".join(lines)
