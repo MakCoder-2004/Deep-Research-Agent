@@ -38,11 +38,8 @@ async def run_telegram(settings: Settings) -> None:
     async with open_db(settings.database_path):
         pass
     bot = create_bot(settings)
-    queue = BoundedJobQueue(
-        settings.database_path,
-        max_concurrent_jobs=settings.max_concurrent_jobs,
-        job_timeout_seconds=settings.job_timeout_seconds,
-    )
+    # Semaphore is sized from settings.max_concurrent_jobs (default 3 globally).
+    queue = BoundedJobQueue.from_settings(settings)
     queue.set_bot(bot)
     dp = create_dispatcher(
         settings.telegram_allowed_user_ids, settings.database_path, job_queue=queue

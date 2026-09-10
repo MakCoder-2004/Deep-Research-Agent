@@ -36,7 +36,7 @@ async def enqueue_request(
     query: str,
     language: str = "mixed",
 ) -> JobRef:
-    """Persist a queued job and return its reference (stub position 1)."""
+    """Persist a queued job and return its reference with FIFO position."""
     job_id = str(uuid4())
     await JobRepository().create(
         conn,
@@ -45,8 +45,9 @@ async def enqueue_request(
         query=query,
         language=language,
     )
+    position = await queue_position(conn, job_id)
     await conn.commit()
-    return JobRef(job_id=job_id, user_id=user_id, query=query, position=1)
+    return JobRef(job_id=job_id, user_id=user_id, query=query, position=position)
 
 
 async def get_user_active_job(conn: aiosqlite.Connection, user_id: int) -> aiosqlite.Row | None:
@@ -64,21 +65,35 @@ async def get_user_active_job(conn: aiosqlite.Connection, user_id: int) -> aiosq
 
 
 async def queue_position(conn: aiosqlite.Connection, job_id: str) -> int:
-    """Return 1-indexed queue position for a queued job (0 when not queued)."""
+    """Return 1-indexed FIFO position counting older queued jobs (0 if not queued)."""
     cursor = await conn.execute(
-        "SELECT job_id, state, created_at FROM jobs WHERE job_id = ?", (job_id,)
+        "SELECT job_id, state, created_at, rowid FROM jobs WHERE job_id = ?", (job_id,)
     )
     row = await cursor.fetchone()
     if row is None or row["state"] != "queued":
         return 0
     created_at = row["created_at"]
-    cursor = await conn.execute(
-        """
-        SELECT COUNT(*) AS n FROM jobs
-        WHERE state = 'queued' AND created_at <= ?
-        """,
-        (created_at,),
-    )
+    try:
+        rowid = int(row["rowid"])
+    except (KeyError, TypeError, ValueError):
+        rowid = 0
+    if rowid:
+        cursor = await conn.execute(
+            """
+            SELECT COUNT(*) AS n FROM jobs
+            WHERE state = 'queued'
+              AND (created_at < ? OR (created_at = ? AND rowid <= ?))
+            """,
+            (created_at, created_at, rowid),
+        )
+    else:
+        cursor = await conn.execute(
+            """
+            SELECT COUNT(*) AS n FROM jobs
+            WHERE state = 'queued' AND created_at <= ?
+            """,
+            (created_at,),
+        )
     count_row = await cursor.fetchone()
     if count_row is None:
         return 1
@@ -120,9 +135,10 @@ async def cancel_user_job(conn: aiosqlite.Connection, user_id: int) -> bool:
 class BoundedJobQueue:
     """FIFO bounded queue limiting globally concurrent research jobs.
 
-    Uses an ``asyncio.Semaphore`` for global concurrency, an
-    ``asyncio.Queue`` for FIFO ordering, and dicts tracking live job
-    tasks plus cooperative cancel events.
+    Global concurrency is bounded by an ``asyncio.Semaphore`` sized from
+    ``Settings.max_concurrent_jobs`` (default 3). FIFO order comes from an
+    ``asyncio.Queue`` plus ``queue_position`` counting older queued rows.
+    Live job tasks and cooperative cancel events are tracked in dicts.
 
     NOTE (M9 scope): daily quotas (10 requests/user/day, 3 deep/day)
     are intentionally not enforced here; see BudgetManager in M9.
@@ -135,6 +151,10 @@ class BoundedJobQueue:
         max_concurrent_jobs: int = 3,
         job_timeout_seconds: int = 300,
     ) -> None:
+        if max_concurrent_jobs < 1:
+            raise ValueError("max_concurrent_jobs must be >= 1.")
+        if job_timeout_seconds < 1:
+            raise ValueError("job_timeout_seconds must be >= 1.")
         self._db_path = Path(db_path)
         self._max_concurrent_jobs = max_concurrent_jobs
         self._job_timeout_seconds = job_timeout_seconds
@@ -144,6 +164,16 @@ class BoundedJobQueue:
         self._worker_task: asyncio.Task[None] | None = None
         self._running = False
         self._bot: Any | None = None
+
+    @classmethod
+    def from_settings(cls, settings: Any, db_path: Path | str | None = None) -> BoundedJobQueue:
+        """Build a queue with Semaphore sized from settings.max_concurrent_jobs."""
+        path = db_path if db_path is not None else settings.database_path
+        return cls(
+            path,
+            max_concurrent_jobs=int(settings.max_concurrent_jobs),
+            job_timeout_seconds=int(settings.job_timeout_seconds),
+        )
 
     @property
     def db_path(self) -> Path:
