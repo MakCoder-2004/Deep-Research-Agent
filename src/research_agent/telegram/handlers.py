@@ -130,6 +130,14 @@ async def handle_research_request(
             await message.answer(render_busy(busy.job_id or None, lang_code))
             return None
         await message.answer(render_research_accepted(request.query, job.job_id, lang_code))
+        try:
+            from research_agent.telegram.progress import ProgressStage, publish_progress
+
+            await publish_progress(
+                message, job.job_id, ProgressStage.ANALYZING, position=job.position
+            )
+        except Exception:  # noqa: BLE001, S110 - progress failure must not fail enqueue
+            pass
         return job
     if db_path is not None:
         from research_agent.persistence.database import open_db
@@ -141,6 +149,14 @@ async def handle_research_request(
             await message.answer(render_busy(busy.job_id or None, lang_code))
             return None
         await message.answer(render_research_accepted(request.query, job.job_id, lang_code))
+        try:
+            from research_agent.telegram.progress import ProgressStage, publish_progress
+
+            await publish_progress(
+                message, job.job_id, ProgressStage.ANALYZING, position=job.position
+            )
+        except Exception:  # noqa: BLE001, S110 - progress failure must not fail enqueue
+            pass
         return job
     # No DB available (e.g. unit test without persistence): validate and
     # acknowledge without persistence so the reply path stays testable.
