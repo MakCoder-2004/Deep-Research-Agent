@@ -152,3 +152,17 @@ def render_research_accepted(query: str, job_id: str, lang_code: str | None) -> 
             f"تم استلام طلب البحث: {query}\nمعرّف المهمة: {job_id}\nاستخدم /status لمتابعة التقدم."
         )
     return f"Research request received: {query}\nJob ID: {job_id}\nUse /status to check progress."
+
+
+NON_TEXT_EN = (
+    "I can only handle text questions or links. Please send text or use /research <query>."
+)
+
+NON_TEXT_AR = (
+    "يمكنني التعامل مع الأسئلة النصية أو الروابط فقط. يرجى إرسال نص أو استخدام /research <استعلام>."
+)
+
+
+def render_non_text(lang_code: str | None) -> str:
+    """Render the gentle reply for non-text messages (no job created)."""
+    return NON_TEXT_AR if pick_lang(lang_code) == "ar" else NON_TEXT_EN

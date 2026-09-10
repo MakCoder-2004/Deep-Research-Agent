@@ -6,7 +6,7 @@ from pathlib import Path
 from uuid import uuid4
 
 import aiosqlite
-from aiogram import Router
+from aiogram import F, Router
 from aiogram.filters import Command
 from aiogram.types import Message
 from pydantic import ValidationError
@@ -17,6 +17,7 @@ from research_agent.services.sessions import ensure_user
 from research_agent.telegram.texts import (
     pick_lang,
     render_help,
+    render_non_text,
     render_research_accepted,
     render_research_usage,
     render_start,
@@ -135,3 +136,23 @@ async def research_handler(
     text = message.text or ""
     query = extract_research_arg(text, "/research")
     await handle_research_request(message, query, conn=conn, db_path=db_path)
+
+
+@router.message(F.text, ~F.text.startswith("/"))
+async def plaintext_handler(
+    message: Message,
+    conn: aiosqlite.Connection | None = None,
+    db_path: Path | str | None = None,
+) -> None:
+    """Route plain text through the same path as /research."""
+    query = (message.text or "").strip()
+    await handle_research_request(message, query, conn=conn, db_path=db_path)
+
+
+@router.message(~F.text)
+async def non_text_handler(message: Message) -> None:
+    """Gently ignore non-text messages without creating jobs."""
+    lang_code: str | None = (
+        message.from_user.language_code if message.from_user is not None else None
+    )
+    await message.answer(render_non_text(lang_code))
