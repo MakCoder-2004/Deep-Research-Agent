@@ -4,7 +4,9 @@ from __future__ import annotations
 
 import logging
 from enum import StrEnum
+from typing import Any
 
+from aiogram import Bot
 from aiogram.types import Message
 
 from research_agent.telegram.texts import pick_lang
@@ -89,6 +91,46 @@ def format_initial_text(
     if lang == "ar":
         return f"{stage_line}\nالمهمة {short_id}."
     return f"{stage_line}\nJob {short_id}."
+
+
+def format_stage_text(
+    stage: ProgressStage | str,
+    job_id: str,
+    lang: str,
+    position: int | None = None,
+) -> str:
+    """Format an edit payload for a pipeline stage (same single message)."""
+    return format_initial_text(stage, job_id, position, lang)
+
+
+async def update_progress(
+    bot: Bot | Any,
+    chat_id: int,
+    message_id: int,
+    stage: ProgressStage | str,
+    lang: str = "en",
+    *,
+    job_id: str | None = None,
+    position: int | None = None,
+) -> None:
+    """Edit the single progress message to a new pipeline stage.
+
+    Always uses ``bot.edit_message_text``; never sends a new message.
+    """
+    try:
+        key = ProgressStage(stage)
+    except ValueError:
+        key = ProgressStage.ANALYZING
+    resolved = lang if lang in ("en", "ar") else "en"
+    short = job_id[:8] if job_id else ""
+    if short and position:
+        text = format_stage_text(key, job_id or "", resolved, position)
+    elif short:
+        text = format_stage_text(key, job_id or "", resolved, None)
+    else:
+        stage_line = STAGE_TEXT[key].get(resolved, STAGE_TEXT[key]["en"])
+        text = stage_line
+    await bot.edit_message_text(text, chat_id=chat_id, message_id=message_id)
 
 
 async def publish_progress(

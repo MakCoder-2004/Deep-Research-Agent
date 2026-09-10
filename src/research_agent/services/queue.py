@@ -359,11 +359,18 @@ class BoundedJobQueue:
                 clear_cancel_event(job.job_id)
 
     async def run_placeholder(self, job: JobRef) -> None:
-        """Minimal placeholder execution: queued -> active -> completed.
+        """Placeholder execution cycling the single progress message.
 
-        Later milestones cycle Telegram progress stages here. Honors
-        cooperative cancellation via the per-job cancel event.
+        Transitions queued -> active -> completed|cancelled, editing the
+        same Telegram message through Analyzing/Selecting/Searching/
+        Reading/Checking/Preparing. Honors cooperative cancellation.
         """
+        from research_agent.telegram.progress import (
+            ProgressStage,
+            get_progress,
+            update_progress,
+        )
+
         cancel_event = get_cancel_event(job.job_id)
         async with open_db(self._db_path) as conn:
             await set_state(conn, job.job_id, JobState.ACTIVE)
@@ -374,12 +381,36 @@ class BoundedJobQueue:
                 except ValueError:
                     pass
             return
-        # Simulate bounded pipeline work without external I/O.
-        try:
-            await asyncio.wait_for(cancel_event.wait(), timeout=0.05)
-            cancelled = True
-        except TimeoutError:
-            cancelled = False
+        cancelled = False
+        for stage in list(ProgressStage):
+            if cancel_event.is_set():
+                cancelled = True
+                break
+            if self._bot is not None:
+                entry = get_progress(job.job_id)
+                if entry is not None:
+                    chat_id, message_id = entry
+                    try:
+                        await update_progress(
+                            self._bot,
+                            chat_id,
+                            message_id,
+                            stage,
+                            "en",
+                            job_id=job.job_id,
+                        )
+                    except Exception as exc:  # noqa: BLE001 - never fail job on edit
+                        logger.warning(
+                            "progress edit failed job_id=%s error=%s",
+                            job.job_id,
+                            redact_text(f"{type(exc).__name__}: {exc}"),
+                        )
+            try:
+                await asyncio.wait_for(cancel_event.wait(), timeout=0.01)
+                cancelled = True
+                break
+            except TimeoutError:
+                continue
         async with open_db(self._db_path) as conn:
             try:
                 if cancelled or cancel_event.is_set():
