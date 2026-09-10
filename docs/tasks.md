@@ -12,65 +12,65 @@ Tasks are ordered by dependency inside each milestone. Task IDs are stable refer
 
 ### Project Bootstrap
 
-- [ ] **M1.1** Initialize the Git repository and create the planned top-level directories.
-- [ ] **M1.2** Add `.python-version` pinned to Python 3.12.
-- [ ] **M1.3** Create `pyproject.toml` with the planned runtime and development dependencies.
-- [ ] **M1.4** Configure Ruff formatting and linting, mypy, pytest, coverage, and package discovery in `pyproject.toml`.
-- [ ] **M1.5** Generate and commit `uv.lock`.
-- [ ] **M1.6** Create `src/research_agent/main.py` as the planned application entrypoint.
-- [ ] **M1.7** Add `.gitignore` entries for environments, secrets, databases, reports, caches, coverage, and build artifacts.
-- [ ] **M1.8** Add `.dockerignore` entries for secrets, local data, tests, caches, editor files, and build artifacts.
-- [ ] **M1.9** Add `.env.example` containing placeholder names only.
+- [x] **M1.1** Initialize the Git repository and create the planned top-level directories.
+- [x] **M1.2** Add `.python-version` pinned to Python 3.12.
+- [x] **M1.3** Create `pyproject.toml` with the planned runtime and development dependencies.
+- [x] **M1.4** Configure Ruff formatting and linting, mypy, pytest, coverage, and package discovery in `pyproject.toml`.
+- [x] **M1.5** Generate and commit `uv.lock`.
+- [x] **M1.6** Create `src/research_agent/main.py` as the planned application entrypoint.
+- [x] **M1.7** Add `.gitignore` entries for environments, secrets, databases, reports, caches, coverage, and build artifacts.
+- [x] **M1.8** Add `.dockerignore` entries for secrets, local data, tests, caches, editor files, and build artifacts.
+- [x] **M1.9** Add `.env.example` containing placeholder names only.
 
 ### Configuration
 
-- [ ] **M1.10** Implement Pydantic settings for Telegram, providers, storage, budgets, tracing, and runtime environment.
-- [ ] **M1.11** Parse the Telegram allowlist as numeric user IDs.
-- [ ] **M1.12** Validate required settings at startup without logging secret values.
-- [ ] **M1.13** Add configuration defaults from the plan for concurrency, quotas, timeouts, retention, and cache lifetimes.
+- [x] **M1.10** Implement Pydantic settings for Telegram, providers, storage, budgets, tracing, and runtime environment.
+- [x] **M1.11** Parse the Telegram allowlist as numeric user IDs.
+- [x] **M1.12** Validate required settings at startup without logging secret values.
+- [x] **M1.13** Add configuration defaults from the plan for concurrency, quotas, timeouts, retention, and cache lifetimes.
 
 ### Domain Models
 
-- [ ] **M1.14** Define `ResearchRequest` and `ResearchPlan` models.
-- [ ] **M1.15** Define `SearchTask`, `SearchHit`, and `SourceDocument` models.
-- [ ] **M1.16** Define `EvidenceClaim`, `EvidenceLedger`, and `CritiqueResult` models.
-- [ ] **M1.17** Define `Finding`, `Source`, and `ResearchReport` models.
-- [ ] **M1.18** Define `ProviderUsage`, `ResearchJob`, `SessionContext`, and `TraceContext` models.
-- [ ] **M1.19** Add enums or constrained values for language, domain, depth, risk, job state, source type, and critic outcome.
-- [ ] **M1.20** Validate that every finding has citations and every citation refers to an existing source.
-- [ ] **M1.21** Validate unique canonical source URLs and source order by first citation appearance.
-- [ ] **M1.22** Prevent report delivery data from containing hidden prompts or chain-of-thought fields.
+- [x] **M1.14** Define `ResearchRequest` and `ResearchPlan` models.
+- [x] **M1.15** Define `SearchTask`, `SearchHit`, and `SourceDocument` models.
+- [x] **M1.16** Define `EvidenceClaim`, `EvidenceLedger`, and `CritiqueResult` models.
+- [x] **M1.17** Define `Finding`, `Source`, and `ResearchReport` models.
+- [x] **M1.18** Define `ProviderUsage`, `ResearchJob`, `SessionContext`, and `TraceContext` models.
+- [x] **M1.19** Add enums or constrained values for language, domain, depth, risk, job state, source type, and critic outcome.
+- [x] **M1.20** Validate that every finding has citations and every citation refers to an existing source.
+- [x] **M1.21** Validate unique canonical source URLs and source order by first citation appearance.
+- [x] **M1.22** Prevent report delivery data from containing hidden prompts or chain-of-thought fields.
 
 ### Interfaces
 
-- [ ] **M1.23** Define a replaceable asynchronous LLM provider interface.
-- [ ] **M1.24** Define provider capability metadata for multilingual, long-context, reasoning, structured-output, Arabic, and tool-calling support.
-- [ ] **M1.25** Define a replaceable asynchronous research-tool interface.
-- [ ] **M1.26** Define normalized provider and tool error categories for routing and metrics.
+- [x] **M1.23** Define a replaceable asynchronous LLM provider interface.
+- [x] **M1.24** Define provider capability metadata for multilingual, long-context, reasoning, structured-output, Arabic, and tool-calling support.
+- [x] **M1.25** Define a replaceable asynchronous research-tool interface.
+- [x] **M1.26** Define normalized provider and tool error categories for routing and metrics.
 
 ### Persistence And Logging
 
-- [ ] **M1.27** Create asynchronous SQLite connection management with WAL mode.
-- [ ] **M1.28** Create schema initialization for users, sessions, jobs, reports, sources, tool runs, provider usage, and cache metadata.
-- [ ] **M1.29** Implement repositories for users and temporary sessions.
-- [ ] **M1.30** Implement repositories for jobs, reports, and sources.
-- [ ] **M1.31** Implement repositories for tool runs, provider usage, and cache metadata.
-- [ ] **M1.32** Enforce session retention of 24 hours or the last six interactions.
-- [ ] **M1.33** Make report retention configurable with an initial 90-day default.
-- [ ] **M1.34** Add structured JSON logging with correlation and job identifiers.
-- [ ] **M1.35** Redact secrets and sensitive values before writing logs.
+- [x] **M1.27** Create asynchronous SQLite connection management with WAL mode.
+- [x] **M1.28** Create schema initialization for users, sessions, jobs, reports, sources, tool runs, provider usage, and cache metadata.
+- [x] **M1.29** Implement repositories for users and temporary sessions.
+- [x] **M1.30** Implement repositories for jobs, reports, and sources.
+- [x] **M1.31** Implement repositories for tool runs, provider usage, and cache metadata.
+- [x] **M1.32** Enforce session retention of 24 hours or the last six interactions.
+- [x] **M1.33** Make report retention configurable with an initial 90-day default.
+- [x] **M1.34** Add structured JSON logging with correlation and job identifiers.
+- [x] **M1.35** Redact secrets and sensitive values before writing logs.
 
 ### Verification
 
-- [ ] **M1.36** Add unit tests for settings parsing and startup validation.
-- [ ] **M1.37** Add unit tests for every Pydantic report and citation rule.
-- [ ] **M1.38** Add persistence tests for schema creation, WAL mode, repository operations, and retention behavior.
-- [ ] **M1.39** Add redaction tests proving configured secrets do not appear in logs.
-- [ ] **M1.40** Run `uv sync --locked --dev`, Ruff, mypy, and the foundation tests from a clean checkout.
+- [x] **M1.36** Add unit tests for settings parsing and startup validation.
+- [x] **M1.37** Add unit tests for every Pydantic report and citation rule.
+- [x] **M1.38** Add persistence tests for schema creation, WAL mode, repository operations, and retention behavior.
+- [x] **M1.39** Add redaction tests proving configured secrets do not appear in logs.
+- [x] **M1.40** Run `uv sync --locked --dev`, Ruff, mypy, and the foundation tests from a clean checkout.
 
 ### Exit Gate
 
-- [ ] **M1.GATE** A clean clone installs reproducibly with `uv sync --locked --dev`, foundational checks pass, and no runtime secret is committed.
+- [x] **M1.GATE** A clean clone installs reproducibly with `uv sync --locked --dev`, foundational checks pass, and no runtime secret is committed.
 
 ## Milestone 2: Telegram Gateway
 
