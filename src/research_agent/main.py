@@ -37,12 +37,16 @@ async def run_telegram(settings: Settings) -> None:
     configure_logging(secrets=_collect_secrets(settings))
     async with open_db(settings.database_path):
         pass
+    settings.reports_dir.mkdir(parents=True, exist_ok=True)
     bot = create_bot(settings)
     # Semaphore is sized from settings.max_concurrent_jobs (default 3 globally).
     queue = BoundedJobQueue.from_settings(settings)
     queue.set_bot(bot)
     dp = create_dispatcher(
-        settings.telegram_allowed_user_ids, settings.database_path, job_queue=queue
+        settings.telegram_allowed_user_ids,
+        settings.database_path,
+        job_queue=queue,
+        reports_dir=settings.reports_dir,
     )
     try:
         await start_queue_worker(dp, queue)

@@ -27,7 +27,12 @@ from research_agent.services.sessions import (
     normalize_language,
     set_language,
 )
-from research_agent.telegram.renderer import render_concise_report, split_message
+from research_agent.telegram.renderer import (
+    deliver_report,
+    render_concise_report,
+    report_filename,
+    split_message,
+)
 from research_agent.telegram.texts import (
     format_history,
     format_report_bundle,
@@ -341,6 +346,7 @@ async def report_handler(
     message: Message,
     conn: aiosqlite.Connection | None = None,
     db_path: Path | str | None = None,
+    reports_dir: Path | str | None = None,
 ) -> None:
     """Retrieve a prior report by ID with ownership check."""
     from_user = message.from_user
@@ -390,6 +396,23 @@ async def report_handler(
                 disclaimer=None,
                 tools_used=tools,
             )
+            candidate: Path | None = None
+            try:
+                db_markdown = str(report["markdown_path"])
+            except Exception:  # noqa: BLE001, S110 - fall back to reports_dir
+                db_markdown = ""
+            if db_markdown:
+                candidate = Path(db_markdown)
+            elif reports_dir is not None:
+                try:
+                    candidate = Path(reports_dir) / report_filename(report_id)
+                except ValueError:  # noqa: BLE001, S110 - invalid id stays text-only
+                    candidate = None
+            if candidate is not None:
+                # deliver_report sends the document when present and falls
+                # back to concise MarkdownV2 text when missing/unsafe.
+                await deliver_report(message, candidate, concise, reports_dir)
+                return
             for chunk in split_message(concise):
                 await message.answer(chunk, parse_mode="MarkdownV2")
         except Exception:  # noqa: BLE001 - fall back to plain bundle on render issues

@@ -7,11 +7,22 @@ English (LTR) and Arabic (RTL) text.
 
 from __future__ import annotations
 
+import asyncio
+import logging
 import re
 from collections.abc import Sequence
+from pathlib import Path
 from typing import Any
 
+from aiogram.types import BufferedInputFile, Message
+
+logger = logging.getLogger(__name__)
+
 TELEGRAM_TEXT_LIMIT = 4096
+TELEGRAM_CAPTION_LIMIT = 1024
+
+_REPORT_ID_RE = re.compile(r"^[A-Za-z0-9-]+$")
+_RESEARCH_FILENAME_RE = re.compile(r"^research-[A-Za-z0-9-]+\.md$")
 
 _SENTENCE_RE = re.compile(r"(?<=[.!?؟…])\s+")
 
@@ -323,3 +334,104 @@ def render_concise_report(
         lines.append("")
         lines.append(escape_markdown_v2(disclaimer))
     return "\n".join(lines)
+
+
+def report_filename(report_id: str) -> str:
+    """Return the attachment filename ``research-<report-id>.md``.
+
+    Only ``[A-Za-z0-9-]`` is accepted so ``..``, ``/``, and ``\\\\`` traversal
+    payloads are rejected with :class:`ValueError` before any filesystem use.
+    """
+    if not _REPORT_ID_RE.fullmatch(report_id):
+        raise ValueError(f"Invalid report id {report_id!r}: must match [A-Za-z0-9-]+.")
+    return f"research-{report_id}.md"
+
+
+def _is_safe_markdown_path(path: Path) -> bool:
+    """Return True when a markdown path has a safe research filename."""
+    if ".." in path.parts:
+        return False
+    return _RESEARCH_FILENAME_RE.fullmatch(path.name) is not None
+
+
+async def _send_caption_as_text(message: Message, caption: str) -> None:
+    """Send a caption as MarkdownV2 text messages, splitting when oversized."""
+    if not caption:
+        return
+    if len(caption) <= TELEGRAM_TEXT_LIMIT:
+        await message.answer(caption, parse_mode="MarkdownV2")
+        return
+    for chunk in split_message(caption, TELEGRAM_TEXT_LIMIT):
+        await message.answer(chunk, parse_mode="MarkdownV2")
+
+
+async def deliver_report(
+    message: Message,
+    markdown_path: Path | str,
+    caption: str,
+    reports_dir: Path | str | None = None,
+) -> bool:
+    """Attach a full markdown report, falling back to text when unavailable.
+
+    The file is sent via :class:`BufferedInputFile` with its safe
+    ``research-<id>.md`` filename. ``report_id`` charset validation and
+    traversal prevention run before any filesystem access: unsafe names,
+    paths escaping ``reports_dir``, and missing files all fall back to
+    sending ``caption`` as MarkdownV2 text and return ``False``. Returns
+    ``True`` only when ``answer_document`` was called. Never raises.
+    """
+    try:
+        path = Path(markdown_path)
+    except Exception:  # noqa: BLE001 - graceful fallback to caption text
+        try:
+            await _send_caption_as_text(message, caption)
+        except Exception:  # noqa: BLE001, S110 - delivery must never raise
+            pass
+        return False
+    try:
+        if ".." in path.parts or not _is_safe_markdown_path(path):
+            await _send_caption_as_text(message, caption)
+            return False
+        if reports_dir is not None:
+            base = Path(reports_dir).resolve()  # noqa: ASYNC240 - tiny path resolve
+            try:
+                if path.is_absolute():
+                    resolved = path.resolve()  # noqa: ASYNC240 - tiny path resolve
+                else:
+                    resolved = (base / path.name).resolve()  # noqa: ASYNC240 - tiny resolve
+            except Exception:  # noqa: BLE001 - treat unresolvable as unsafe
+                await _send_caption_as_text(message, caption)
+                return False
+            try:
+                if not resolved.is_relative_to(base):
+                    await _send_caption_as_text(message, caption)
+                    return False
+            except AttributeError:
+                # Python < 3.9 fallback: compare parts manually.
+                if base.parts != resolved.parts[: len(base.parts)]:
+                    await _send_caption_as_text(message, caption)
+                    return False
+            path = resolved
+        if not path.is_file():
+            await _send_caption_as_text(message, caption)
+            return False
+        data = await asyncio.to_thread(path.read_bytes)
+        document = BufferedInputFile(data, filename=path.name)
+        if caption and len(caption) <= TELEGRAM_CAPTION_LIMIT:
+            await message.answer_document(
+                document=document, caption=caption, parse_mode="MarkdownV2"
+            )
+        elif caption:
+            for chunk in split_message(caption, TELEGRAM_TEXT_LIMIT):
+                await message.answer(chunk, parse_mode="MarkdownV2")
+            await message.answer_document(document=document)
+        else:
+            await message.answer_document(document=document)
+        return True
+    except Exception as exc:  # noqa: BLE001 - missing-file and edit failures stay graceful
+        logger.warning("report delivery failed: %s: %s", type(exc).__name__, path.name)
+        try:
+            await _send_caption_as_text(message, caption)
+        except Exception:  # noqa: BLE001, S110 - never raise from delivery
+            pass
+        return False

@@ -23,6 +23,7 @@ def create_dispatcher(
     allowed_user_ids: set[int] | None = None,
     db_path: Path | str | None = None,
     job_queue: BoundedJobQueue | None = None,
+    reports_dir: Path | str | None = None,
 ) -> Dispatcher:
     """Create a Dispatcher with allowlist middleware and app router."""
     dp = Dispatcher()
@@ -31,6 +32,8 @@ def create_dispatcher(
         dp.workflow_data["db_path"] = db_path
     if job_queue is not None:
         dp.workflow_data["job_queue"] = job_queue
+    if reports_dir is not None:
+        dp.workflow_data["reports_dir"] = reports_dir
     # Global router is a singleton; allow the factory to be called repeatedly
     # (e.g. across unit tests) by re-parenting it to the newest dispatcher.
     parent = router.parent_router
