@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import re
 import sqlite3
 from collections.abc import Callable
 from dataclasses import dataclass
@@ -46,6 +47,7 @@ async def _insert_job(
     user_id: int,
     query: str,
     language: str = "mixed",
+    request_id: str | None = None,
 ) -> JobRef:
     """Insert one queued job on an open connection (shared enqueue core).
 
@@ -55,13 +57,20 @@ async def _insert_job(
     check+insert so the two steps stay in one transaction scope; a UNIQUE
     partial index backs the check so concurrent writers on separate
     connections still serialize to one winner via ``IntegrityError``.
+
+    ``request_id``, when given, is used as the ``job_id`` for idempotent
+    handler wiring; otherwise a UUID is generated.
     """
-    await _ensure_one_active_index(conn)
+    language, request_id = _coerce_enqueue_args(language, request_id)
+    if request_id is not None:
+        existing_row = await JobRepository().get(conn, request_id)
+        if existing_row is not None:
+            return await _existing_request_ref(conn, existing_row, user_id, request_id)
     if await has_active_for_user(conn, user_id):
         existing = await get_user_active_job(conn, user_id)
         existing_id = str(existing["job_id"]) if existing is not None else ""
         raise UserBusyError(user_id, existing_id)
-    job_id = str(uuid4())
+    job_id = request_id if request_id else str(uuid4())
     try:
         await JobRepository().create(
             conn,
@@ -71,11 +80,14 @@ async def _insert_job(
             language=language,
         )
     except sqlite3.IntegrityError as exc:
+        # A concurrent idempotent retry may have committed this request ID.
+        dup = await JobRepository().get(conn, job_id)
+        if dup is not None:
+            if request_id is None:
+                raise
+            return await _existing_request_ref(conn, dup, user_id, request_id)
         # Concurrent winner committed first (partial unique index).
-        try:
-            existing = await get_user_active_job(conn, user_id)
-        except Exception:  # noqa: BLE001 - error path must still raise busy
-            existing = None
+        existing = await get_user_active_job(conn, user_id)
         if existing is not None:
             raise UserBusyError(user_id, str(existing["job_id"])) from exc
         raise UserBusyError(user_id, "") from exc
@@ -94,20 +106,43 @@ async def _insert_job(
     return JobRef(job_id=job_id, user_id=user_id, query=query, position=position)
 
 
-_ONE_ACTIVE_INDEX_SQL = (
-    "CREATE UNIQUE INDEX IF NOT EXISTS ux_jobs_one_active_per_user "
-    "ON jobs(user_id) WHERE state IN ('queued', 'active')"
-)
+_KNOWN_ENQUEUE_LANGUAGES = frozenset({"en", "ar", "mixed"})
+_REQUEST_ID_PATTERN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$")
 
 
-async def _ensure_one_active_index(conn: aiosqlite.Connection) -> None:
-    """Create the partial unique index backing atomic 1-per-user enqueue."""
+async def _existing_request_ref(
+    conn: aiosqlite.Connection,
+    row: aiosqlite.Row,
+    user_id: int,
+    request_id: str,
+) -> JobRef:
+    """Return an idempotent live request, rejecting collisions and requeues."""
+    owner_id = int(row["user_id"])
+    if owner_id != user_id:
+        raise ValueError(f"request_id {request_id!r} belongs to another user")
     try:
-        await conn.execute(_ONE_ACTIVE_INDEX_SQL)
-    except sqlite3.OperationalError:
-        # Concurrent CREATE INDEX or locked writer; the other connection
-        # creates it. Proceed - INSERT still enforces via existing index.
-        pass
+        state = JobState(str(row["state"]))
+    except ValueError as exc:
+        raise ValueError(f"unknown state for request_id {request_id!r}") from exc
+    if state not in {JobState.QUEUED, JobState.ACTIVE}:
+        raise ValueError(f"request_id {request_id!r} is already terminal")
+    return JobRef(
+        job_id=request_id,
+        user_id=owner_id,
+        query=str(row["query"]),
+        position=await queue_position(conn, request_id),
+    )
+
+
+def _coerce_enqueue_args(language: str, request_id: str | None) -> tuple[str, str | None]:
+    """Validate the language and explicit request ID arguments."""
+    if language not in _KNOWN_ENQUEUE_LANGUAGES:
+        raise ValueError(f"unsupported language {language!r}")
+    if request_id is not None and (
+        not isinstance(request_id, str) or _REQUEST_ID_PATTERN.fullmatch(request_id) is None
+    ):
+        raise ValueError("request_id must be 1-128 safe identifier characters")
+    return language, request_id
 
 
 async def enqueue_request(
@@ -115,14 +150,16 @@ async def enqueue_request(
     user_id: int,
     query: str,
     language: str = "mixed",
+    request_id: str | None = None,
 ) -> JobRef:
     """Persist a queued job and return its reference with FIFO position.
 
     Enforces one active job per user (``max_active_per_user=1``); raises
     :class:`UserBusyError` when the user already has a queued/active job.
+    ``request_id`` optionally fixes the ``job_id`` for idempotent retries.
     NOTE: daily quotas are M9 scope (stub only); not enforced here.
     """
-    return await _insert_job(conn, user_id, query, language)
+    return await _insert_job(conn, user_id, query, language, request_id)
 
 
 async def get_user_active_job(conn: aiosqlite.Connection, user_id: int) -> aiosqlite.Row | None:
@@ -184,6 +221,11 @@ async def queue_position(conn: aiosqlite.Connection, job_id: str) -> int:
 
 
 _CANCEL_EVENTS: dict[str, asyncio.Event] = {}
+# Jobs whose worker still holds the event. These entries must survive a
+# terminal state transition until the worker has observed cancellation.
+_CANCEL_EVENT_IN_USE: set[str] = set()
+# Kept as a diagnostic threshold for callers/tests; live entries are never
+# evicted. Workers remove their own entries when they finish.
 _MAX_CANCEL_EVENTS = 1024
 
 _DEFAULT_QUEUE: BoundedJobQueue | None = None
@@ -192,18 +234,12 @@ _DEFAULT_QUEUE: BoundedJobQueue | None = None
 def get_cancel_event(job_id: str) -> asyncio.Event:
     """Return (creating if needed) the cooperative cancellation event.
 
-    The registry is bounded to ``_MAX_CANCEL_EVENTS`` entries; when full the
-    oldest entry is evicted to avoid unbounded growth from many jobs.
+    Events are keyed by job and cleaned when a job reaches a terminal state or
+    its worker finishes. Live entries are never evicted, so cancellation keeps
+    working even during high job churn.
     """
     event = _CANCEL_EVENTS.get(job_id)
     if event is None:
-        if len(_CANCEL_EVENTS) >= _MAX_CANCEL_EVENTS:
-            try:
-                oldest = next(iter(_CANCEL_EVENTS))
-            except StopIteration:
-                oldest = None
-            if oldest is not None:
-                _CANCEL_EVENTS.pop(oldest, None)
         event = asyncio.Event()
         _CANCEL_EVENTS[job_id] = event
     return event
@@ -211,12 +247,20 @@ def get_cancel_event(job_id: str) -> asyncio.Event:
 
 def clear_cancel_event(job_id: str) -> None:
     """Remove a cancellation event from the registry."""
+    if job_id in _CANCEL_EVENT_IN_USE:
+        event = _CANCEL_EVENTS.get(job_id)
+        if event is not None:
+            event.set()
+        return
     _CANCEL_EVENTS.pop(job_id, None)
 
 
 def clear_all_cancel_events() -> None:
-    """Remove all cancellation events (used on queue stop)."""
-    _CANCEL_EVENTS.clear()
+    """Remove events that are not held by a running worker."""
+    for job_id, event in list(_CANCEL_EVENTS.items()):
+        event.set()
+        if job_id not in _CANCEL_EVENT_IN_USE:
+            _CANCEL_EVENTS.pop(job_id, None)
 
 
 def cancel_event_count() -> int:
@@ -296,8 +340,12 @@ async def set_state(
     )
     await conn.commit()
     if target in (JobState.COMPLETED, JobState.FAILED, JobState.CANCELLED):
-        # Terminal states no longer need cooperative cancellation state.
-        clear_cancel_event(job_id)
+        # Cancellation must wake the exact event already held by a worker.
+        event = _CANCEL_EVENTS.get(job_id)
+        if target == JobState.CANCELLED and event is not None:
+            event.set()
+        if job_id not in _CANCEL_EVENT_IN_USE:
+            clear_cancel_event(job_id)
 
 
 async def cancel_user_job(conn: aiosqlite.Connection, user_id: int) -> bool:
@@ -306,8 +354,9 @@ async def cancel_user_job(conn: aiosqlite.Connection, user_id: int) -> bool:
     if job is None:
         return False
     job_id = str(job["job_id"])
-    await set_state(conn, job_id, JobState.CANCELLED)
+    # Set the existing event before the state transition can clean it up.
     get_cancel_event(job_id).set()
+    await set_state(conn, job_id, JobState.CANCELLED)
     return True
 
 
@@ -339,6 +388,7 @@ class BoundedJobQueue:
         self._job_timeout_seconds = job_timeout_seconds
         self._semaphore = asyncio.Semaphore(max_concurrent_jobs)
         self._queue: asyncio.Queue[JobRef] = asyncio.Queue()
+        self._scheduled_job_ids: set[str] = set()
         self._tasks: dict[str, asyncio.Task[None]] = {}
         self._worker_task: asyncio.Task[None] | None = None
         self._running = False
@@ -375,17 +425,24 @@ class BoundedJobQueue:
         """Attach the aiogram Bot used for progress edits (optional)."""
         self._bot = bot
 
-    async def enqueue(self, user_id: int, query: str, language: str = "mixed") -> JobRef:
+    async def enqueue(
+        self,
+        user_id: int,
+        query: str,
+        language: str = "mixed",
+        request_id: str | None = None,
+    ) -> JobRef:
         """Persist a queued job and schedule it FIFO; return its reference.
 
         Enforces one active job per user; raises :class:`UserBusyError`
-        when the user already has a queued/active job.
+        when the user already has a queued/active job. ``request_id``
+        optionally fixes the ``job_id`` for idempotent handler wiring. The
+        third positional argument remains the language.
         """
         # NOTE: daily quotas are M9 scope (stub only); not enforced here.
         async with open_db(self._db_path) as conn:
-            ref = await _insert_job(conn, user_id, query, language)
-        get_cancel_event(ref.job_id)
-        await self._queue.put(ref)
+            ref = await _insert_job(conn, user_id, query, language, request_id)
+        await self.put(ref)
         logger.info(
             "job enqueued job_id=%s user_id=%d position=%d",
             ref.job_id,
@@ -393,6 +450,54 @@ class BoundedJobQueue:
             ref.position,
         )
         return ref
+
+    async def put(self, job: JobRef) -> None:
+        """Schedule a pre-persisted job reference FIFO (handler wiring compat)."""
+        async with open_db(self._db_path) as conn:
+            row = await JobRepository().get(conn, job.job_id)
+        if row is None:
+            raise ValueError(f"unknown job {job.job_id}")
+        if int(row["user_id"]) != job.user_id:
+            raise ValueError(f"job {job.job_id} belongs to another user")
+        state = JobState(str(row["state"]))
+        if state in {
+            JobState.CANCELLED,
+            JobState.COMPLETED,
+            JobState.FAILED,
+        }:
+            raise ValueError(f"job {job.job_id} is already terminal")
+        if state == JobState.ACTIVE or job.job_id in self._scheduled_job_ids:
+            return
+        self._scheduled_job_ids.add(job.job_id)
+        get_cancel_event(job.job_id)
+        try:
+            await self._queue.put(job)
+        except BaseException:
+            self._scheduled_job_ids.discard(job.job_id)
+            clear_cancel_event(job.job_id)
+            raise
+
+    def put_nowait(self, job: JobRef) -> None:
+        """Non-blocking variant of :meth:`put` for handler wiring."""
+        if job.job_id in self._scheduled_job_ids or job.job_id in self._tasks:
+            return
+        self._scheduled_job_ids.add(job.job_id)
+        get_cancel_event(job.job_id)
+        try:
+            self._queue.put_nowait(job)
+        except BaseException:
+            self._scheduled_job_ids.discard(job.job_id)
+            clear_cancel_event(job.job_id)
+            raise
+
+    def get_cancel_event(self, job_id: str) -> asyncio.Event:
+        """Return the cooperative cancellation event for a job (instance helper)."""
+        return get_cancel_event(job_id)
+
+    async def queue_position(self, job_id: str) -> int:
+        """Return 1-indexed FIFO position for a job (instance helper)."""
+        async with open_db(self._db_path) as conn:
+            return await queue_position(conn, job_id)
 
     async def start(self) -> None:
         """Start the background FIFO worker loop (idempotent)."""
@@ -416,7 +521,8 @@ class BoundedJobQueue:
         if self._tasks:
             await asyncio.gather(*self._tasks.values(), return_exceptions=True)
         self._tasks.clear()
-        # Avoid leaking cooperative cancellation state across restarts.
+        # Queued items may remain for a later restart, but their old events
+        # must not leak across worker lifetimes.
         clear_all_cancel_events()
 
     async def worker_loop(self) -> None:
@@ -438,23 +544,29 @@ class BoundedJobQueue:
 
         def _done(_task: asyncio.Task[None]) -> None:
             self._tasks.pop(job_id, None)
+            self._scheduled_job_ids.discard(job_id)
 
         return _done
 
     async def _run_with_semaphore(self, job: JobRef) -> None:
-        """Run one placeholder job while holding the global semaphore slot."""
-        async with self._semaphore:
+        """Run one placeholder job with timeout covering semaphore wait."""
+        _CANCEL_EVENT_IN_USE.add(job.job_id)
+        get_cancel_event(job.job_id)
+        try:
             try:
-                await asyncio.wait_for(
-                    self.run_placeholder(job), timeout=float(self._job_timeout_seconds)
-                )
+
+                async def _run() -> None:
+                    async with self._semaphore:
+                        await self.run_placeholder(job)
+
+                await asyncio.wait_for(_run(), timeout=float(self._job_timeout_seconds))
             except TimeoutError:
                 logger.warning("job timed out job_id=%s", redact_text(job.job_id))
                 try:
                     async with open_db(self._db_path) as conn:
                         await set_state(conn, job.job_id, JobState.FAILED, error="job timeout")
                 except ValueError:
-                    # Already terminal (e.g. cancelled during timeout); keep it.
+                    # Already terminal (for example, cancelled while waiting).
                     pass
             except asyncio.CancelledError:
                 raise
@@ -464,11 +576,14 @@ class BoundedJobQueue:
                 try:
                     async with open_db(self._db_path) as conn:
                         await set_state(conn, job.job_id, JobState.FAILED, error=sanitized)
-                except Exception:  # noqa: BLE001, S110 - persistence best effort
+                except ValueError:
                     pass
             finally:
                 self._queue.task_done()
-                clear_cancel_event(job.job_id)
+        finally:
+            _CANCEL_EVENT_IN_USE.discard(job.job_id)
+            clear_cancel_event(job.job_id)
+            self._scheduled_job_ids.discard(job.job_id)
 
     async def run_placeholder(self, job: JobRef) -> None:
         """Placeholder execution cycling the single progress message.
@@ -485,14 +600,23 @@ class BoundedJobQueue:
 
         cancel_event = get_cancel_event(job.job_id)
         async with open_db(self._db_path) as conn:
-            await set_state(conn, job.job_id, JobState.ACTIVE)
-        if cancel_event.is_set():
-            async with open_db(self._db_path) as conn:
-                try:
-                    await set_state(conn, job.job_id, JobState.CANCELLED)
-                except ValueError:
-                    pass
-            return
+            row = await JobRepository().get(conn, job.job_id)
+            if row is None:
+                return
+            try:
+                current = JobState(str(row["state"]))
+            except ValueError:
+                return
+            if current != JobState.QUEUED:
+                return
+            if cancel_event.is_set():
+                await set_state(conn, job.job_id, JobState.CANCELLED)
+                return
+            try:
+                await set_state(conn, job.job_id, JobState.ACTIVE)
+            except ValueError:
+                # Cancellation may win between the state read and update.
+                return
         cancelled = False
         for stage in list(ProgressStage):
             if cancel_event.is_set():
