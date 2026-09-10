@@ -22,10 +22,10 @@ START_EN = (
     "/help - show examples and limits\n"
     "/whoami - show your numeric Telegram ID\n\n"
     "Plain text works like /research.\n\n"
-    "Limits: trusted users only (numeric allowlist); up to 10 requests per user "
-    "per day (max 3 deep); 3 concurrent jobs globally with 1 active job per user; "
-    "300s job timeout with 1 repair cycle; reports kept 90 days; "
-    "sessions kept 24h or last 6 interactions."
+    "Limits: trusted users only (numeric allowlist); 3 concurrent jobs globally "
+    "with 1 active job per user; 300s job timeout with 1 repair cycle; "
+    "reports kept 90 days; sessions kept 24h or last 6 interactions.\n"
+    "Daily quotas coming soon (M9)."
 )
 
 START_AR = (
@@ -42,10 +42,10 @@ START_AR = (
     "/help - عرض الأمثلة والحدود\n"
     "/whoami - عرض معرّف تيليجرام الرقمي الخاص بك\n\n"
     "النص العادي يعمل مثل /research.\n\n"
-    "الحدود: للمستخدمين الموثوقين فقط (قائمة سماح رقمية)؛ حتى 10 طلبات يوميًا "
-    "لكل مستخدم (بحد أقصى 3 معمّقة)؛ 3 مهام متزامنة عالميًا مع مهمة نشطة واحدة "
-    "لكل مستخدم؛ مهلة 300 ثانية مع دورة إصلاح واحدة؛ تُحفظ التقارير 90 يومًا؛ "
-    "وتُحفظ الجلسات 24 ساعة أو آخر 6 تفاعلات."
+    "الحدود: للمستخدمين الموثوقين فقط (قائمة سماح رقمية)؛ 3 مهام متزامنة عالميًا "
+    "مع مهمة نشطة واحدة لكل مستخدم؛ مهلة 300 ثانية مع دورة إصلاح واحدة؛ "
+    "تُحفظ التقارير 90 يومًا؛ وتُحفظ الجلسات 24 ساعة أو آخر 6 تفاعلات.\n"
+    "الحصص اليومية قادمة قريبًا (M9)."
 )
 
 HELP_EN = (
@@ -63,10 +63,10 @@ HELP_EN = (
     "/forget - clear your temporary session\n"
     "/language <en|ar> - choose English or Arabic\n"
     "/whoami - show your numeric Telegram ID\n\n"
-    "Limits: trusted users only; up to 10 requests per user per day "
-    "(max 3 deep); 3 concurrent jobs globally with 1 active job per user; "
-    "300s job timeout with 1 repair cycle; reports kept 90 days; "
-    "sessions kept 24h or last 6 interactions."
+    "Limits: trusted users only; 3 concurrent jobs globally "
+    "with 1 active job per user; 300s job timeout with 1 repair cycle; "
+    "reports kept 90 days; sessions kept 24h or last 6 interactions.\n"
+    "Daily quotas coming soon (M9)."
 )
 
 HELP_AR = (
@@ -84,10 +84,10 @@ HELP_AR = (
     "/forget - مسح جلستك المؤقتة\n"
     "/language <en|ar> - اختيار العربية أو الإنجليزية\n"
     "/whoami - عرض معرّف تيليجرام الرقمي الخاص بك\n\n"
-    "الحدود: للمستخدمين الموثوقين فقط؛ حتى 10 طلبات يوميًا لكل مستخدم "
-    "(بحد أقصى 3 معمّقة)؛ 3 مهام متزامنة عالميًا مع مهمة نشطة واحدة لكل مستخدم؛ "
-    "مهلة 300 ثانية مع دورة إصلاح واحدة؛ تُحفظ التقارير 90 يومًا؛ "
-    "وتُحفظ الجلسات 24 ساعة أو آخر 6 تفاعلات."
+    "الحدود: للمستخدمين الموثوقين فقط؛ 3 مهام متزامنة عالميًا "
+    "مع مهمة نشطة واحدة لكل مستخدم؛ مهلة 300 ثانية مع دورة إصلاح واحدة؛ "
+    "تُحفظ التقارير 90 يومًا؛ وتُحفظ الجلسات 24 ساعة أو آخر 6 تفاعلات.\n"
+    "الحصص اليومية قادمة قريبًا (M9)."
 )
 
 
@@ -106,13 +106,6 @@ UNAUTHORIZED_AR = (
 )
 
 
-def pick_unauthorized(lang_code: str | None) -> str:
-    """Pick the denial reply matching the user's language (Arabic or English)."""
-    if lang_code and lang_code.lower().startswith("ar"):
-        return UNAUTHORIZED_AR
-    return UNAUTHORIZED_EN
-
-
 def pick_lang(lang_code: str | None) -> str:
     """Pick 'ar' for Arabic language codes, otherwise 'en'."""
     if lang_code and lang_code.lower().startswith("ar"):
@@ -120,14 +113,38 @@ def pick_lang(lang_code: str | None) -> str:
     return "en"
 
 
+# Shared localized-text table: single place for en/ar switching so callers
+# use _t(key, lang_code) instead of repeating pick_lang ternaries.
+_T: dict[str, dict[str, str]] = {
+    "unauthorized": {"en": UNAUTHORIZED_EN, "ar": UNAUTHORIZED_AR},
+    "start": {"en": START_EN, "ar": START_AR},
+    "help": {"en": HELP_EN, "ar": HELP_AR},
+}
+
+
+def _t(key: str, lang_code: str | None) -> str:
+    """Return the localized string for ``key`` via :func:`pick_lang`."""
+    lang = pick_lang(lang_code)
+    entry = _T.get(key, {})
+    text = entry.get(lang)
+    if text is None:
+        text = entry.get("en", "")
+    return text
+
+
+def pick_unauthorized(lang_code: str | None) -> str:
+    """Pick the denial reply matching the user's language (Arabic or English)."""
+    return _t("unauthorized", lang_code)
+
+
 def render_start(lang_code: str | None) -> str:
     """Render the /start capability and restriction message."""
-    return START_AR if pick_lang(lang_code) == "ar" else START_EN
+    return _t("start", lang_code)
 
 
 def render_help(lang_code: str | None) -> str:
     """Render the /help examples and limits message."""
-    return HELP_AR if pick_lang(lang_code) == "ar" else HELP_EN
+    return _t("help", lang_code)
 
 
 RESEARCH_USAGE_EN = (
@@ -145,7 +162,10 @@ RESEARCH_USAGE_AR = (
 
 def render_research_usage(lang_code: str | None) -> str:
     """Render the /research usage reply (no job created)."""
-    return RESEARCH_USAGE_AR if pick_lang(lang_code) == "ar" else RESEARCH_USAGE_EN
+    lang = pick_lang(lang_code)
+    return _T.setdefault("research_usage", {"en": RESEARCH_USAGE_EN, "ar": RESEARCH_USAGE_AR}).get(
+        lang, RESEARCH_USAGE_EN
+    )
 
 
 def render_research_accepted(query: str, job_id: str, lang_code: str | None) -> str:
@@ -168,7 +188,9 @@ NON_TEXT_AR = (
 
 def render_non_text(lang_code: str | None) -> str:
     """Render the gentle reply for non-text messages (no job created)."""
-    return NON_TEXT_AR if pick_lang(lang_code) == "ar" else NON_TEXT_EN
+    lang = pick_lang(lang_code)
+    table = _T.setdefault("non_text", {"en": NON_TEXT_EN, "ar": NON_TEXT_AR})
+    return table.get(lang, NON_TEXT_EN)
 
 
 INVALID_URL_EN = (
@@ -184,7 +206,9 @@ INVALID_URL_AR = (
 
 def render_invalid_url(lang_code: str | None) -> str:
     """Render the invalid-URL reply (no job created)."""
-    return INVALID_URL_AR if pick_lang(lang_code) == "ar" else INVALID_URL_EN
+    lang = pick_lang(lang_code)
+    table = _T.setdefault("invalid_url", {"en": INVALID_URL_EN, "ar": INVALID_URL_AR})
+    return table.get(lang, INVALID_URL_EN)
 
 
 STATUS_NONE_EN = "You have no active research job. Send /research <query> to start one."
@@ -235,7 +259,8 @@ def format_status(
         if query:
             base += f"\nQuery: {query}"
         return base
-    return STATUS_NONE_AR if lang == "ar" else STATUS_NONE_EN
+    table = _T.setdefault("status_none", {"en": STATUS_NONE_EN, "ar": STATUS_NONE_AR})
+    return table.get(lang, STATUS_NONE_EN)
 
 
 CANCELLED_EN_TEMPLATE = "Your active research job {job_id} has been cancelled."
@@ -246,14 +271,16 @@ CANCEL_NONE_AR = "ليس لديك مهمة بحث نشطة لإلغائها."
 
 def render_cancelled(job_id: str, lang_code: str | None) -> str:
     """Render the cancellation confirmation, preserving the job ID verbatim."""
-    if pick_lang(lang_code) == "ar":
-        return CANCELLED_AR_TEMPLATE.format(job_id=job_id)
-    return CANCELLED_EN_TEMPLATE.format(job_id=job_id)
+    lang = pick_lang(lang_code)
+    table = _T.setdefault("cancelled", {"en": CANCELLED_EN_TEMPLATE, "ar": CANCELLED_AR_TEMPLATE})
+    return table.get(lang, CANCELLED_EN_TEMPLATE).format(job_id=job_id)
 
 
 def render_cancel_none(lang_code: str | None) -> str:
     """Render the no-active-job reply for /cancel."""
-    return CANCEL_NONE_AR if pick_lang(lang_code) == "ar" else CANCEL_NONE_EN
+    lang = pick_lang(lang_code)
+    table = _T.setdefault("cancel_none", {"en": CANCEL_NONE_EN, "ar": CANCEL_NONE_AR})
+    return table.get(lang, CANCEL_NONE_EN)
 
 
 BUSY_EN_TEMPLATE = "You already have active job {job_id}. Use /status or /cancel."
@@ -266,7 +293,8 @@ BUSY_NO_ID_AR = "لديك بالفعل مهمة نشطة. استخدم /status �
 
 def render_busy(job_id: str | None, lang_code: str | None) -> str:
     """Render the fast-reject reply when the user already has an active job."""
-    if pick_lang(lang_code) == "ar":
+    lang = pick_lang(lang_code)
+    if lang == "ar":
         if job_id:
             return BUSY_AR_TEMPLATE.format(job_id=job_id)
         return BUSY_NO_ID_AR
@@ -288,14 +316,14 @@ REPORT_NOT_FOUND_AR = "التقرير غير موجود. استخدم /history �
 def format_history(reports: Sequence[Any] | None, lang_code: str | None) -> str:
     """Format the /history reply for the last reports (owner-scoped)."""
     items = list(reports) if reports else []
-    if not items:
-        return HISTORY_EMPTY_AR if pick_lang(lang_code) == "ar" else HISTORY_EMPTY_EN
     lang = pick_lang(lang_code)
-    header = (
-        HISTORY_HEADER_AR.format(n=len(items))
-        if lang == "ar"
-        else HISTORY_HEADER_EN.format(n=len(items))
+    if not items:
+        table = _T.setdefault("history_empty", {"en": HISTORY_EMPTY_EN, "ar": HISTORY_EMPTY_AR})
+        return table.get(lang, HISTORY_EMPTY_EN)
+    header_table = _T.setdefault(
+        "history_header", {"en": HISTORY_HEADER_EN, "ar": HISTORY_HEADER_AR}
     )
+    header = header_table.get(lang, HISTORY_HEADER_EN).format(n=len(items))
     lines = [header]
     for row in items:
         try:
@@ -314,12 +342,18 @@ def format_history(reports: Sequence[Any] | None, lang_code: str | None) -> str:
 
 def render_report_usage(lang_code: str | None) -> str:
     """Render the /report usage reply (no lookup performed)."""
-    return REPORT_USAGE_AR if pick_lang(lang_code) == "ar" else REPORT_USAGE_EN
+    lang = pick_lang(lang_code)
+    table = _T.setdefault("report_usage", {"en": REPORT_USAGE_EN, "ar": REPORT_USAGE_AR})
+    return table.get(lang, REPORT_USAGE_EN)
 
 
 def render_report_not_found(lang_code: str | None) -> str:
     """Render the unknown-or-unowned report reply."""
-    return REPORT_NOT_FOUND_AR if pick_lang(lang_code) == "ar" else REPORT_NOT_FOUND_EN
+    lang = pick_lang(lang_code)
+    table = _T.setdefault(
+        "report_not_found", {"en": REPORT_NOT_FOUND_EN, "ar": REPORT_NOT_FOUND_AR}
+    )
+    return table.get(lang, REPORT_NOT_FOUND_EN)
 
 
 def format_report_bundle(report: Any, sources: Sequence[Any] | None, lang_code: str | None) -> str:
@@ -352,7 +386,9 @@ FORGET_DONE_AR = "تم مسح جلستك المؤقتة. تم الاحتفاظ �
 
 def render_forget_done(lang_code: str | None) -> str:
     """Render the /forget confirmation (jobs and reports are kept)."""
-    return FORGET_DONE_AR if pick_lang(lang_code) == "ar" else FORGET_DONE_EN
+    lang = pick_lang(lang_code)
+    table = _T.setdefault("forget_done", {"en": FORGET_DONE_EN, "ar": FORGET_DONE_AR})
+    return table.get(lang, FORGET_DONE_EN)
 
 
 LANGUAGE_USAGE_EN = "Usage: /language <en|ar> - e.g. /language en or /language ar."
@@ -363,12 +399,18 @@ LANGUAGE_INVALID_AR = "لغة غير صالحة. الاستخدام: /language <
 
 def render_language_usage(lang_code: str | None) -> str:
     """Render the /language usage reply."""
-    return LANGUAGE_USAGE_AR if pick_lang(lang_code) == "ar" else LANGUAGE_USAGE_EN
+    lang = pick_lang(lang_code)
+    table = _T.setdefault("language_usage", {"en": LANGUAGE_USAGE_EN, "ar": LANGUAGE_USAGE_AR})
+    return table.get(lang, LANGUAGE_USAGE_EN)
 
 
 def render_language_invalid(lang_code: str | None) -> str:
     """Render the invalid-argument reply for /language."""
-    return LANGUAGE_INVALID_AR if pick_lang(lang_code) == "ar" else LANGUAGE_INVALID_EN
+    lang = pick_lang(lang_code)
+    table = _T.setdefault(
+        "language_invalid", {"en": LANGUAGE_INVALID_EN, "ar": LANGUAGE_INVALID_AR}
+    )
+    return table.get(lang, LANGUAGE_INVALID_EN)
 
 
 def render_language_current(current: str, lang_code: str | None) -> str:
@@ -391,3 +433,47 @@ def render_language_set(new_code: str, lang_code: str | None) -> str:
             return "تم ضبط اللغة إلى العربية (ar)."
         return "Language set to English (en)."
     return "Language set to English (en)."
+
+
+MEDICAL_DISCLAIMER_EN = (
+    "Medical disclaimer: this research is for information only and is not medical advice. "
+    "Consult a qualified professional."
+)
+MEDICAL_DISCLAIMER_AR = (
+    "تنبيه طبي: هذا البحث لأغراض معلوماتية فقط وليس استشارة طبية. استشر مختصًا مؤهلًا."
+)
+LEGAL_DISCLAIMER_EN = (
+    "Legal disclaimer: this research is for information only and is not legal advice. "
+    "Consult a qualified professional."
+)
+LEGAL_DISCLAIMER_AR = (
+    "تنبيه قانوني: هذا البحث لأغراض معلوماتية فقط وليس استشارة قانونية. استشر مختصًا مؤهلًا."
+)
+FINANCIAL_DISCLAIMER_EN = (
+    "Financial disclaimer: this research is for information only and is not financial advice. "
+    "Consult a qualified professional."
+)
+FINANCIAL_DISCLAIMER_AR = (
+    "تنبيه مالي: هذا البحث لأغراض معلوماتية فقط وليس استشارة مالية. استشر مختصًا مؤهلًا."
+)
+
+_HIGH_STAKES_TABLE: dict[str, dict[str, str]] = {
+    "medical": {"en": MEDICAL_DISCLAIMER_EN, "ar": MEDICAL_DISCLAIMER_AR},
+    "legal": {"en": LEGAL_DISCLAIMER_EN, "ar": LEGAL_DISCLAIMER_AR},
+    "financial": {"en": FINANCIAL_DISCLAIMER_EN, "ar": FINANCIAL_DISCLAIMER_AR},
+}
+
+
+def render_high_stakes_disclaimer(domain: str | None, lang_code: str | None) -> str | None:
+    """Return the medical/legal/financial disclaimer for a domain, if any.
+
+    Returns ``None`` for general domains so callers only attach a disclaimer
+    when required. Language is resolved once via :func:`pick_lang`.
+    """
+    if not domain:
+        return None
+    entry = _HIGH_STAKES_TABLE.get(domain.strip().lower())
+    if entry is None:
+        return None
+    lang = pick_lang(lang_code)
+    return entry.get(lang, entry["en"])
