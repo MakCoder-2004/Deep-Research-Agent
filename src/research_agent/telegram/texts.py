@@ -125,3 +125,30 @@ def render_start(lang_code: str | None) -> str:
 def render_help(lang_code: str | None) -> str:
     """Render the /help examples and limits message."""
     return HELP_AR if pick_lang(lang_code) == "ar" else HELP_EN
+
+
+RESEARCH_USAGE_EN = (
+    "Please provide a research question or link. "
+    "Usage: /research <query> - e.g. /research What are recent advances "
+    "in solar batteries? Plain text also works like /research."
+)
+
+RESEARCH_USAGE_AR = (
+    "يرجى تقديم سؤال بحثي أو رابط. "
+    "الاستخدام: /research <استعلام> - مثال: /research ما هي أحدث التطورات "
+    "في البطاريات الشمسية؟ النص العادي يعمل أيضًا مثل /research."
+)
+
+
+def render_research_usage(lang_code: str | None) -> str:
+    """Render the /research usage reply (no job created)."""
+    return RESEARCH_USAGE_AR if pick_lang(lang_code) == "ar" else RESEARCH_USAGE_EN
+
+
+def render_research_accepted(query: str, job_id: str, lang_code: str | None) -> str:
+    """Render the research accepted reply, preserving the query verbatim."""
+    if pick_lang(lang_code) == "ar":
+        return (
+            f"تم استلام طلب البحث: {query}\nمعرّف المهمة: {job_id}\nاستخدم /status لمتابعة التقدم."
+        )
+    return f"Research request received: {query}\nJob ID: {job_id}\nUse /status to check progress."

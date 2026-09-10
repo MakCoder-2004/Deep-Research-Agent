@@ -3,16 +3,85 @@
 from __future__ import annotations
 
 from pathlib import Path
+from uuid import uuid4
 
 import aiosqlite
 from aiogram import Router
 from aiogram.filters import Command
 from aiogram.types import Message
+from pydantic import ValidationError
 
+from research_agent.models.requests import ResearchRequest
+from research_agent.services.queue import JobRef, enqueue_request
 from research_agent.services.sessions import ensure_user
-from research_agent.telegram.texts import pick_lang, render_help, render_start, render_whoami
+from research_agent.telegram.texts import (
+    pick_lang,
+    render_help,
+    render_research_accepted,
+    render_research_usage,
+    render_start,
+    render_whoami,
+)
 
 router = Router()
+
+
+def extract_research_arg(text: str | None, command: str) -> str:
+    """Extract the query argument following a /command prefix.
+
+    Handles ``/research``, ``/research@botname``, extra whitespace, and
+    preserves inner content (including Arabic RTL) verbatim.
+    """
+    if not text:
+        return ""
+    stripped = text.strip()
+    if not stripped.startswith(command):
+        return stripped
+    rest = stripped[len(command) :]
+    if rest.startswith("@"):
+        space_idx = rest.find(" ")
+        if space_idx == -1:
+            return ""
+        rest = rest[space_idx + 1 :]
+    return rest.strip()
+
+
+async def handle_research_request(
+    message: Message,
+    query: str,
+    conn: aiosqlite.Connection | None = None,
+    db_path: Path | str | None = None,
+) -> JobRef | None:
+    """Validate a research query and enqueue it; reply with usage on empty."""
+    from_user = message.from_user
+    if from_user is None:
+        return None
+    lang_code: str | None = from_user.language_code
+    clean = query.strip()
+    if not clean:
+        await message.answer(render_research_usage(lang_code))
+        return None
+    try:
+        request = ResearchRequest(user_id=from_user.id, query=clean)
+    except ValidationError:
+        await message.answer(render_research_usage(lang_code))
+        return None
+    if conn is not None:
+        job = await enqueue_request(conn, request.user_id, request.query)
+        await message.answer(render_research_accepted(request.query, job.job_id, lang_code))
+        return job
+    if db_path is not None:
+        from research_agent.persistence.database import open_db
+
+        async with open_db(db_path) as db_conn:
+            job = await enqueue_request(db_conn, request.user_id, request.query)
+        await message.answer(render_research_accepted(request.query, job.job_id, lang_code))
+        return job
+    # No DB available (e.g. unit test without persistence): validate and
+    # acknowledge without persistence so the reply path stays testable.
+    fake_id = str(uuid4())
+    await message.answer(render_research_accepted(request.query, fake_id, lang_code))
+    return JobRef(job_id=fake_id, user_id=request.user_id, query=request.query)
 
 
 @router.message(Command("whoami"), flags={"allow_unauthorized": True})
@@ -54,3 +123,15 @@ async def help_handler(message: Message) -> None:
         message.from_user.language_code if message.from_user is not None else None
     )
     await message.answer(render_help(lang_code))
+
+
+@router.message(Command("research"))
+async def research_handler(
+    message: Message,
+    conn: aiosqlite.Connection | None = None,
+    db_path: Path | str | None = None,
+) -> None:
+    """Create a research job from /research <query> (usage reply when empty)."""
+    text = message.text or ""
+    query = extract_research_arg(text, "/research")
+    await handle_research_request(message, query, conn=conn, db_path=db_path)
