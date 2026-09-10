@@ -4,7 +4,9 @@ from __future__ import annotations
 
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
+from dataclasses import dataclass
 from pathlib import Path
+from typing import TYPE_CHECKING, Literal
 from uuid import uuid4
 
 import aiosqlite
@@ -12,6 +14,9 @@ from aiogram import F, Router
 from aiogram.filters import Command
 from aiogram.types import Message
 from pydantic import ValidationError
+
+if TYPE_CHECKING:
+    from research_agent.services.queue import BoundedJobQueue
 
 from research_agent.models.requests import ResearchRequest
 from research_agent.services.queue import (
@@ -60,6 +65,42 @@ from research_agent.telegram.texts import (
 from research_agent.telegram.validators import classify_input, is_accepted_url
 
 router = Router()
+
+LangCode = Literal["en", "ar"]
+
+
+@dataclass
+class RequestCtx:
+    """Bundled per-request DB handles plus a normalized language code."""
+
+    conn: aiosqlite.Connection | None = None
+    db_path: Path | str | None = None
+    lang_code: LangCode = "en"
+    job_queue: BoundedJobQueue | None = None
+
+
+def resolve_lang(raw: str | None) -> LangCode:
+    """Normalize a Telegram language code once per handler to en/ar."""
+    normalized = normalize_language(raw)
+    if normalized == "en":
+        return "en"
+    if normalized == "ar":
+        return "ar"
+    # Fall back to prefix matching so unknown Arabic variants (e.g. ar-DZ)
+    # still resolve to Arabic instead of incorrectly falling back to English.
+    return "ar" if pick_lang(raw) == "ar" else "en"
+
+
+def build_ctx(
+    message: Message,
+    conn: aiosqlite.Connection | None = None,
+    db_path: Path | str | None = None,
+    job_queue: BoundedJobQueue | None = None,
+) -> RequestCtx:
+    """Build a RequestCtx with language normalized once from the sender."""
+    from_user = message.from_user
+    raw: str | None = from_user.language_code if from_user is not None else None
+    return RequestCtx(conn=conn, db_path=db_path, lang_code=resolve_lang(raw), job_queue=job_queue)
 
 
 @asynccontextmanager
@@ -111,6 +152,7 @@ async def handle_research_request(
     query: str,
     conn: aiosqlite.Connection | None = None,
     db_path: Path | str | None = None,
+    job_queue: BoundedJobQueue | None = None,
 ) -> JobRef | None:
     """Validate a research query and enqueue it; reply with usage on empty.
 
@@ -121,7 +163,8 @@ async def handle_research_request(
     from_user = message.from_user
     if from_user is None:
         return None
-    lang_code: str | None = from_user.language_code
+    ctx = build_ctx(message, conn=conn, db_path=db_path, job_queue=job_queue)
+    lang_code: LangCode = ctx.lang_code
     clean = query.strip()
     if not clean:
         await message.answer(render_research_usage(lang_code))
@@ -155,7 +198,7 @@ async def handle_research_request(
         else:
             await message.answer(render_research_usage(lang_code))
         return None
-    async with with_db(conn, db_path) as db_conn:
+    async with with_db(ctx.conn, ctx.db_path) as db_conn:
         if db_conn is None:
             # No DB available (e.g. unit test without persistence): validate and
             # acknowledge without persistence so the reply path stays testable.
@@ -195,13 +238,13 @@ async def start_handler(
 ) -> None:
     """Explain capabilities and limits; upsert the user on /start."""
     from_user = message.from_user
-    lang_code: str | None = from_user.language_code if from_user is not None else None
-    lang = pick_lang(lang_code)
+    ctx = build_ctx(message, conn=conn, db_path=db_path)
+    lang_code: LangCode = ctx.lang_code
     if from_user is not None:
         try:
-            async with with_db(conn, db_path) as db_conn:
+            async with with_db(ctx.conn, ctx.db_path) as db_conn:
                 if db_conn is not None:
-                    await ensure_user(db_conn, from_user.id, lang)
+                    await ensure_user(db_conn, from_user.id, lang_code)
         except Exception:  # noqa: BLE001, S110 - start reply must not fail on DB issues
             pass
     await message.answer(render_start(lang_code))
@@ -221,11 +264,12 @@ async def research_handler(
     message: Message,
     conn: aiosqlite.Connection | None = None,
     db_path: Path | str | None = None,
+    job_queue: BoundedJobQueue | None = None,
 ) -> None:
     """Create a research job from /research <query> (usage reply when empty)."""
     text = message.text or ""
     query = extract_research_arg(text, "/research")
-    await handle_research_request(message, query, conn=conn, db_path=db_path)
+    await handle_research_request(message, query, conn=conn, db_path=db_path, job_queue=job_queue)
 
 
 @router.message(Command("status"))
@@ -238,7 +282,8 @@ async def status_handler(
     from_user = message.from_user
     if from_user is None:
         return
-    lang_code: str | None = from_user.language_code
+    ctx = build_ctx(message, conn=conn, db_path=db_path)
+    lang_code: LangCode = ctx.lang_code
 
     async def _reply_with_conn(db_conn: aiosqlite.Connection) -> None:
         job = await get_user_active_job(db_conn, from_user.id)
@@ -270,7 +315,7 @@ async def status_handler(
                 )
             )
 
-    async with with_db(conn, db_path) as db_conn:
+    async with with_db(ctx.conn, ctx.db_path) as db_conn:
         if db_conn is None:
             await message.answer(format_status("none", lang_code=lang_code))
             return
@@ -287,7 +332,8 @@ async def cancel_handler(
     from_user = message.from_user
     if from_user is None:
         return
-    lang_code: str | None = from_user.language_code
+    ctx = build_ctx(message, conn=conn, db_path=db_path)
+    lang_code: LangCode = ctx.lang_code
 
     async def _cancel_with_conn(db_conn: aiosqlite.Connection) -> None:
         existing = await get_user_active_job(db_conn, from_user.id)
@@ -300,7 +346,7 @@ async def cancel_handler(
         else:
             await message.answer(render_cancel_none(lang_code))
 
-    async with with_db(conn, db_path) as db_conn:
+    async with with_db(ctx.conn, ctx.db_path) as db_conn:
         if db_conn is None:
             await message.answer(render_cancel_none(lang_code))
             return
@@ -317,13 +363,14 @@ async def history_handler(
     from_user = message.from_user
     if from_user is None:
         return
-    lang_code: str | None = from_user.language_code
+    ctx = build_ctx(message, conn=conn, db_path=db_path)
+    lang_code: LangCode = ctx.lang_code
 
     async def _reply_with_conn(db_conn: aiosqlite.Connection) -> None:
         reports = await list_recent_reports(db_conn, from_user.id, limit=5)
         await message.answer(format_history(reports, lang_code))
 
-    async with with_db(conn, db_path) as db_conn:
+    async with with_db(ctx.conn, ctx.db_path) as db_conn:
         if db_conn is None:
             await message.answer(format_history([], lang_code))
             return
@@ -341,7 +388,8 @@ async def report_handler(
     from_user = message.from_user
     if from_user is None:
         return
-    lang_code: str | None = from_user.language_code
+    ctx = build_ctx(message, conn=conn, db_path=db_path)
+    lang_code: LangCode = ctx.lang_code
     report_id = extract_research_arg(message.text or "", "/report")
     if not report_id:
         await message.answer(render_report_usage(lang_code))
@@ -380,7 +428,7 @@ async def report_handler(
                 topic,
                 findings,
                 list(sources),
-                pick_lang(lang_code),
+                lang_code,
                 partial=False,
                 disclaimer=None,
                 tools_used=tools,
@@ -407,7 +455,7 @@ async def report_handler(
         except Exception:  # noqa: BLE001 - fall back to plain bundle on render issues
             await message.answer(format_report_bundle(report, sources, lang_code))
 
-    async with with_db(conn, db_path) as db_conn:
+    async with with_db(ctx.conn, ctx.db_path) as db_conn:
         if db_conn is None:
             await message.answer(render_report_not_found(lang_code))
             return
@@ -424,8 +472,9 @@ async def forget_handler(
     from_user = message.from_user
     if from_user is None:
         return
-    lang_code: str | None = from_user.language_code
-    async with with_db(conn, db_path) as db_conn:
+    ctx = build_ctx(message, conn=conn, db_path=db_path)
+    lang_code: LangCode = ctx.lang_code
+    async with with_db(ctx.conn, ctx.db_path) as db_conn:
         if db_conn is None:
             await message.answer(render_forget_done(lang_code))
             return
@@ -450,14 +499,15 @@ async def language_handler(
     from_user = message.from_user
     if from_user is None:
         return
-    lang_code: str | None = from_user.language_code
+    ctx = build_ctx(message, conn=conn, db_path=db_path)
+    lang_code: LangCode = ctx.lang_code
     raw_arg = extract_research_arg(message.text or "", "/language")
 
     async def _current_with_conn(db_conn: aiosqlite.Connection) -> str:
         try:
             return await get_language(db_conn, from_user.id)
         except Exception:  # noqa: BLE001 - fall back to Telegram language
-            return pick_lang(lang_code)
+            return lang_code
 
     async def _set_with_conn(db_conn: aiosqlite.Connection, arg: str) -> str | None:
         try:
@@ -466,9 +516,9 @@ async def language_handler(
             return None
 
     if not raw_arg:
-        async with with_db(conn, db_path) as db_conn:
+        async with with_db(ctx.conn, ctx.db_path) as db_conn:
             if db_conn is None:
-                await message.answer(render_language_current(pick_lang(lang_code), lang_code))
+                await message.answer(render_language_current(lang_code, lang_code))
                 return
             current = await _current_with_conn(db_conn)
             await message.answer(render_language_current(current, current))
@@ -478,7 +528,7 @@ async def language_handler(
     if normalized is None:
         await message.answer(render_language_invalid(lang_code))
         return
-    async with with_db(conn, db_path) as db_conn:
+    async with with_db(ctx.conn, ctx.db_path) as db_conn:
         if db_conn is None:
             await message.answer(render_language_set(normalized, normalized))
             return
@@ -494,10 +544,11 @@ async def plaintext_handler(
     message: Message,
     conn: aiosqlite.Connection | None = None,
     db_path: Path | str | None = None,
+    job_queue: BoundedJobQueue | None = None,
 ) -> None:
     """Route plain text through the same path as /research."""
     query = (message.text or "").strip()
-    await handle_research_request(message, query, conn=conn, db_path=db_path)
+    await handle_research_request(message, query, conn=conn, db_path=db_path, job_queue=job_queue)
 
 
 @router.message(~F.text)
