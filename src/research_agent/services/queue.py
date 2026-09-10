@@ -12,6 +12,7 @@ from uuid import uuid4
 
 import aiosqlite
 
+from research_agent.config import Settings
 from research_agent.models import JobState
 from research_agent.observability.redaction import redact_text
 from research_agent.persistence.database import open_db
@@ -244,7 +245,9 @@ class BoundedJobQueue:
         self._bot: Any | None = None
 
     @classmethod
-    def from_settings(cls, settings: Any, db_path: Path | str | None = None) -> BoundedJobQueue:
+    def from_settings(
+        cls, settings: Settings, db_path: Path | str | None = None
+    ) -> BoundedJobQueue:
         """Build a queue with Semaphore sized from settings.max_concurrent_jobs."""
         path = db_path if db_path is not None else settings.database_path
         return cls(
