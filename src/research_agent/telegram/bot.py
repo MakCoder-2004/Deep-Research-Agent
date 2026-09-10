@@ -6,6 +6,8 @@ from aiogram import Bot, Dispatcher
 from aiogram.client.default import DefaultBotProperties
 
 from research_agent.config import Settings
+from research_agent.telegram.handlers import router
+from research_agent.telegram.middlewares import AllowlistMiddleware
 
 
 def create_bot(settings: Settings) -> Bot:
@@ -14,9 +16,22 @@ def create_bot(settings: Settings) -> Bot:
     return Bot(token=token, default=DefaultBotProperties(parse_mode=None))
 
 
-def create_dispatcher() -> Dispatcher:
-    """Create a Dispatcher for long polling."""
-    return Dispatcher()
+def create_dispatcher(allowed_user_ids: set[int] | None = None) -> Dispatcher:
+    """Create a Dispatcher with allowlist middleware and app router."""
+    dp = Dispatcher()
+    dp.message.outer_middleware(AllowlistMiddleware(allowed_user_ids or set()))
+    # Global router is a singleton; allow the factory to be called repeatedly
+    # (e.g. across unit tests) by re-parenting it to the newest dispatcher.
+    parent = router.parent_router
+    if parent is not None and parent is not dp:
+        try:
+            parent.sub_routers.remove(router)
+        except ValueError:
+            pass
+        router._parent_router = None
+    if router.parent_router is None:
+        dp.include_router(router)
+    return dp
 
 
 async def start_polling(bot: Bot, dp: Dispatcher) -> None:
