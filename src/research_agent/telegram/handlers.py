@@ -20,7 +20,12 @@ from research_agent.services.queue import (
     queue_position,
 )
 from research_agent.services.reports import get_report_bundle, list_recent_reports
-from research_agent.services.sessions import ensure_user
+from research_agent.services.sessions import (
+    ensure_user,
+    get_language,
+    normalize_language,
+    set_language,
+)
 from research_agent.telegram.texts import (
     format_history,
     format_report_bundle,
@@ -31,6 +36,9 @@ from research_agent.telegram.texts import (
     render_forget_done,
     render_help,
     render_invalid_url,
+    render_language_current,
+    render_language_invalid,
+    render_language_set,
     render_non_text,
     render_report_not_found,
     render_report_usage,
@@ -363,6 +371,70 @@ async def forget_handler(
         await message.answer(render_forget_done(lang_code))
         return
     await message.answer(render_forget_done(lang_code))
+
+
+@router.message(Command("language"))
+async def language_handler(
+    message: Message,
+    conn: aiosqlite.Connection | None = None,
+    db_path: Path | str | None = None,
+) -> None:
+    """Show or set the English/Arabic language preference."""
+    from_user = message.from_user
+    if from_user is None:
+        return
+    lang_code: str | None = from_user.language_code
+    raw_arg = extract_research_arg(message.text or "", "/language")
+
+    async def _current_with_conn(db_conn: aiosqlite.Connection) -> str:
+        try:
+            return await get_language(db_conn, from_user.id)
+        except Exception:  # noqa: BLE001 - fall back to Telegram language
+            return pick_lang(lang_code)
+
+    async def _set_with_conn(db_conn: aiosqlite.Connection, arg: str) -> str | None:
+        try:
+            return await set_language(db_conn, from_user.id, arg)
+        except ValueError:
+            return None
+
+    if not raw_arg:
+        if conn is not None:
+            current = await _current_with_conn(conn)
+            await message.answer(render_language_current(current, current))
+            return
+        if db_path is not None:
+            from research_agent.persistence.database import open_db
+
+            async with open_db(db_path) as db_conn:
+                current = await _current_with_conn(db_conn)
+            await message.answer(render_language_current(current, current))
+            return
+        await message.answer(render_language_current(pick_lang(lang_code), lang_code))
+        return
+
+    normalized = normalize_language(raw_arg)
+    if normalized is None:
+        await message.answer(render_language_invalid(lang_code))
+        return
+    if conn is not None:
+        new_code = await _set_with_conn(conn, raw_arg)
+        if new_code is None:
+            await message.answer(render_language_invalid(lang_code))
+        else:
+            await message.answer(render_language_set(new_code, new_code))
+        return
+    if db_path is not None:
+        from research_agent.persistence.database import open_db
+
+        async with open_db(db_path) as db_conn:
+            new_code = await _set_with_conn(db_conn, raw_arg)
+        if new_code is None:
+            await message.answer(render_language_invalid(lang_code))
+        else:
+            await message.answer(render_language_set(new_code, new_code))
+        return
+    await message.answer(render_language_set(normalized, normalized))
 
 
 @router.message(F.text, ~F.text.startswith("/"))

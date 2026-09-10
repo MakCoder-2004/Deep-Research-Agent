@@ -331,3 +331,41 @@ FORGET_DONE_AR = "تم مسح جلستك المؤقتة. تم الاحتفاظ �
 def render_forget_done(lang_code: str | None) -> str:
     """Render the /forget confirmation (jobs and reports are kept)."""
     return FORGET_DONE_AR if pick_lang(lang_code) == "ar" else FORGET_DONE_EN
+
+
+LANGUAGE_USAGE_EN = "Usage: /language <en|ar> - e.g. /language en or /language ar."
+LANGUAGE_USAGE_AR = "الاستخدام: /language <en|ar> - مثال: /language ar أو /language en."
+LANGUAGE_INVALID_EN = "Invalid language. Usage: /language <en|ar>."
+LANGUAGE_INVALID_AR = "لغة غير صالحة. الاستخدام: /language <en|ar>."
+
+
+def render_language_usage(lang_code: str | None) -> str:
+    """Render the /language usage reply."""
+    return LANGUAGE_USAGE_AR if pick_lang(lang_code) == "ar" else LANGUAGE_USAGE_EN
+
+
+def render_language_invalid(lang_code: str | None) -> str:
+    """Render the invalid-argument reply for /language."""
+    return LANGUAGE_INVALID_AR if pick_lang(lang_code) == "ar" else LANGUAGE_INVALID_EN
+
+
+def render_language_current(current: str, lang_code: str | None) -> str:
+    """Render the bare /language reply with current preference plus usage."""
+    lang = pick_lang(lang_code)
+    code = "ar" if current == "ar" else "en"
+    if lang == "ar":
+        label = "العربية" if code == "ar" else "الإنجليزية"
+        return f"لغتك الحالية هي {label} ({code}). {LANGUAGE_USAGE_AR}"
+    label = "Arabic" if code == "ar" else "English"
+    return f"Your current language is {label} ({code}). {LANGUAGE_USAGE_EN}"
+
+
+def render_language_set(new_code: str, lang_code: str | None) -> str:
+    """Render the /language confirmation, preserving the new code verbatim."""
+    code = "ar" if new_code == "ar" else "en"
+    if pick_lang(lang_code) == "ar" or code == "ar":
+        # Reply in Arabic when the new preference is Arabic for immediate feedback.
+        if code == "ar":
+            return "تم ضبط اللغة إلى العربية (ar)."
+        return "Language set to English (en)."
+    return "Language set to English (en)."
