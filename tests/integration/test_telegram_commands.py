@@ -10,6 +10,7 @@ from research_agent.persistence.database import open_db
 from research_agent.persistence.repositories import UserRepository
 from research_agent.services.queue import get_user_active_job
 from research_agent.telegram.handlers import (
+    handle_research_request,
     help_handler,
     language_handler,
     non_text_handler,
@@ -182,3 +183,27 @@ async def test_language_set_get_invalid(tmp_path: Path) -> None:
         set_en = _msg(123, "/language english", "ar")
         await language_handler(set_en, conn=conn)
         assert "en" in set_en.answer.call_args[0][0].lower()
+
+
+async def test_research_no_db_replies_unavailable() -> None:
+    message = _msg(123, "/research hello", "en")
+    result = await handle_research_request(message, "hello")
+    assert result is None
+    reply = message.answer.call_args[0][0]
+    assert "unavailable" in reply.lower() or "غير متاحة" in reply
+    assert "Job ID" not in reply and "معرّف المهمة" not in reply
+
+
+async def test_research_no_db_arabic_unavailable() -> None:
+    message = _msg(123, "/research hello", "ar-EG")
+    result = await handle_research_request(message, "hello")
+    assert result is None
+    reply = message.answer.call_args[0][0]
+    assert "غير متاحة" in reply
+
+
+async def test_plaintext_no_db_replies_unavailable() -> None:
+    message = _msg(123, "hello world", "en")
+    await plaintext_handler(message)
+    reply = message.answer.call_args[0][0]
+    assert "unavailable" in reply.lower() or "غير متاحة" in reply

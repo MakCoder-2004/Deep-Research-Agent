@@ -105,6 +105,9 @@ UNAUTHORIZED_AR = (
     "استخدم /whoami لمعرفة المعرّف الخاص بك واطلب من المسؤول منحك حق الوصول."
 )
 
+UNAVAILABLE_EN = "Service temporarily unavailable. Please try again later."
+UNAVAILABLE_AR = "الخدمة غير متاحة مؤقتًا. يرجى المحاولة لاحقًا."
+
 
 def pick_lang(lang_code: str | None) -> str:
     """Pick 'ar' for Arabic language codes, otherwise 'en'."""
@@ -117,6 +120,7 @@ def pick_lang(lang_code: str | None) -> str:
 # use _t(key, lang_code) instead of repeating pick_lang ternaries.
 _T: dict[str, dict[str, str]] = {
     "unauthorized": {"en": UNAUTHORIZED_EN, "ar": UNAUTHORIZED_AR},
+    "unavailable": {"en": UNAVAILABLE_EN, "ar": UNAVAILABLE_AR},
     "start": {"en": START_EN, "ar": START_AR},
     "help": {"en": HELP_EN, "ar": HELP_AR},
 }
@@ -135,6 +139,11 @@ def _t(key: str, lang_code: str | None) -> str:
 def pick_unauthorized(lang_code: str | None) -> str:
     """Pick the denial reply matching the user's language (Arabic or English)."""
     return _t("unauthorized", lang_code)
+
+
+def render_unavailable(lang_code: str | None) -> str:
+    """Render the service-unavailable reply (no job created, no fake ID)."""
+    return _t("unavailable", lang_code)
 
 
 def render_start(lang_code: str | None) -> str:

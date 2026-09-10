@@ -7,7 +7,6 @@ from contextlib import asynccontextmanager
 from dataclasses import dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING, Literal
-from uuid import uuid4
 
 import aiosqlite
 from aiogram import F, Router
@@ -60,6 +59,7 @@ from research_agent.telegram.texts import (
     render_research_accepted,
     render_research_usage,
     render_start,
+    render_unavailable,
     render_whoami,
 )
 from research_agent.telegram.validators import classify_input, is_accepted_url
@@ -200,11 +200,10 @@ async def handle_research_request(
         return None
     async with with_db(ctx.conn, ctx.db_path) as db_conn:
         if db_conn is None:
-            # No DB available (e.g. unit test without persistence): validate and
-            # acknowledge without persistence so the reply path stays testable.
-            fake_id = str(uuid4())
-            await message.answer(render_research_accepted(request.query, fake_id, lang_code))
-            return JobRef(job_id=fake_id, user_id=request.user_id, query=request.query)
+            # No persistence available: never invent a job ID. Reply with a
+            # localized service-unavailable message instead of fake-accepting.
+            await message.answer(render_unavailable(lang_code))
+            return None
         try:
             job = await enqueue_request(db_conn, request.user_id, request.query)
         except UserBusyError as busy:
