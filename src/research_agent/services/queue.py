@@ -39,17 +39,18 @@ class JobRef:
     position: int = 1
 
 
-async def enqueue_request(
+async def _insert_job(
     conn: aiosqlite.Connection,
     user_id: int,
     query: str,
     language: str = "mixed",
 ) -> JobRef:
-    """Persist a queued job and return its reference with FIFO position.
+    """Insert one queued job on an open connection (shared enqueue core).
 
-    Enforces one active job per user (``max_active_per_user=1``); raises
-    :class:`UserBusyError` when the user already has a queued/active job.
-    NOTE: daily quotas are M9 scope (stub only); not enforced here.
+    Enforces one active job per user; raises :class:`UserBusyError` when the
+    user already has a queued/active job. Computes FIFO position, commits,
+    and returns the :class:`JobRef`. Callers reuse the same connection for
+    check+insert so the two steps stay in one transaction scope.
     """
     if await has_active_for_user(conn, user_id):
         existing = await get_user_active_job(conn, user_id)
@@ -66,6 +67,21 @@ async def enqueue_request(
     position = await queue_position(conn, job_id)
     await conn.commit()
     return JobRef(job_id=job_id, user_id=user_id, query=query, position=position)
+
+
+async def enqueue_request(
+    conn: aiosqlite.Connection,
+    user_id: int,
+    query: str,
+    language: str = "mixed",
+) -> JobRef:
+    """Persist a queued job and return its reference with FIFO position.
+
+    Enforces one active job per user (``max_active_per_user=1``); raises
+    :class:`UserBusyError` when the user already has a queued/active job.
+    NOTE: daily quotas are M9 scope (stub only); not enforced here.
+    """
+    return await _insert_job(conn, user_id, query, language)
 
 
 async def get_user_active_job(conn: aiosqlite.Connection, user_id: int) -> aiosqlite.Row | None:
@@ -264,24 +280,15 @@ class BoundedJobQueue:
         """
         # NOTE: daily quotas are M9 scope (stub only); not enforced here.
         async with open_db(self._db_path) as conn:
-            if await has_active_for_user(conn, user_id):
-                existing = await get_user_active_job(conn, user_id)
-                existing_id = str(existing["job_id"]) if existing is not None else ""
-                raise UserBusyError(user_id, existing_id)
-            job_id = str(uuid4())
-            await JobRepository().create(
-                conn,
-                job_id=job_id,
-                user_id=user_id,
-                query=query,
-                language=language,
-            )
-            position = await queue_position(conn, job_id)
-            await conn.commit()
-        ref = JobRef(job_id=job_id, user_id=user_id, query=query, position=position)
-        get_cancel_event(job_id)
+            ref = await _insert_job(conn, user_id, query, language)
+        get_cancel_event(ref.job_id)
         await self._queue.put(ref)
-        logger.info("job enqueued job_id=%s user_id=%d position=%d", job_id, user_id, position)
+        logger.info(
+            "job enqueued job_id=%s user_id=%d position=%d",
+            ref.job_id,
+            user_id,
+            ref.position,
+        )
         return ref
 
     async def start(self) -> None:
