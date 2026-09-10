@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import sqlite3
 from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
@@ -51,23 +52,62 @@ async def _insert_job(
     Enforces one active job per user; raises :class:`UserBusyError` when the
     user already has a queued/active job. Computes FIFO position, commits,
     and returns the :class:`JobRef`. Callers reuse the same connection for
-    check+insert so the two steps stay in one transaction scope.
+    check+insert so the two steps stay in one transaction scope; a UNIQUE
+    partial index backs the check so concurrent writers on separate
+    connections still serialize to one winner via ``IntegrityError``.
     """
+    await _ensure_one_active_index(conn)
     if await has_active_for_user(conn, user_id):
         existing = await get_user_active_job(conn, user_id)
         existing_id = str(existing["job_id"]) if existing is not None else ""
         raise UserBusyError(user_id, existing_id)
     job_id = str(uuid4())
-    await JobRepository().create(
-        conn,
-        job_id=job_id,
-        user_id=user_id,
-        query=query,
-        language=language,
-    )
+    try:
+        await JobRepository().create(
+            conn,
+            job_id=job_id,
+            user_id=user_id,
+            query=query,
+            language=language,
+        )
+    except sqlite3.IntegrityError as exc:
+        # Concurrent winner committed first (partial unique index).
+        try:
+            existing = await get_user_active_job(conn, user_id)
+        except Exception:  # noqa: BLE001 - error path must still raise busy
+            existing = None
+        if existing is not None:
+            raise UserBusyError(user_id, str(existing["job_id"])) from exc
+        raise UserBusyError(user_id, "") from exc
+    except sqlite3.OperationalError as exc:
+        # "database is locked" while another writer holds the lock.
+        if "locked" in str(exc).lower():
+            try:
+                existing = await get_user_active_job(conn, user_id)
+            except Exception:  # noqa: BLE001 - error path must still raise busy
+                existing = None
+            if existing is not None:
+                raise UserBusyError(user_id, str(existing["job_id"])) from exc
+        raise
     position = await queue_position(conn, job_id)
     await conn.commit()
     return JobRef(job_id=job_id, user_id=user_id, query=query, position=position)
+
+
+_ONE_ACTIVE_INDEX_SQL = (
+    "CREATE UNIQUE INDEX IF NOT EXISTS ux_jobs_one_active_per_user "
+    "ON jobs(user_id) WHERE state IN ('queued', 'active')"
+)
+
+
+async def _ensure_one_active_index(conn: aiosqlite.Connection) -> None:
+    """Create the partial unique index backing atomic 1-per-user enqueue."""
+    try:
+        await conn.execute(_ONE_ACTIVE_INDEX_SQL)
+    except sqlite3.OperationalError:
+        # Concurrent CREATE INDEX or locked writer; the other connection
+        # creates it. Proceed - INSERT still enforces via existing index.
+        pass
 
 
 async def enqueue_request(

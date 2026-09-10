@@ -13,6 +13,7 @@ from research_agent.models import JobState
 from research_agent.persistence.database import open_db
 from research_agent.services.queue import (
     BoundedJobQueue,
+    JobRef,
     UserBusyError,
     cancel_user_job,
     enqueue_request,
@@ -224,3 +225,32 @@ async def test_run_with_semaphore_timeout_while_queued(tmp_path: Path) -> None:
         row = await cursor.fetchone()
         assert row is not None and str(row["state"]) == "failed"
     await queue.stop()
+
+
+async def test_concurrent_enqueue_one_active_per_user(tmp_path: Path) -> None:
+    """Concurrent enqueues for one user must leave exactly one winner."""
+    import asyncio
+
+    db_path = tmp_path / "race.db"
+    async with open_db(db_path):
+        pass
+    queue = BoundedJobQueue(db_path)
+    results = await asyncio.gather(
+        queue.enqueue(77, "first"),
+        queue.enqueue(77, "second"),
+        return_exceptions=True,
+    )
+    successes = [r for r in results if isinstance(r, JobRef)]
+    busy = [r for r in results if isinstance(r, UserBusyError)]
+    assert len(successes) == 1
+    assert len(busy) == 1
+    assert busy[0].user_id == 77
+    await queue.stop()
+    async with open_db(db_path) as conn:
+        cursor = await conn.execute(
+            "SELECT COUNT(*) AS n FROM jobs "
+            "WHERE user_id = ? AND state IN ('queued', 'active')",
+            (77,),
+        )
+        row = await cursor.fetchone()
+        assert row is not None and int(row["n"]) == 1
