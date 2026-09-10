@@ -48,3 +48,7 @@
 
 - Keep `main` deployable; use short-lived branches and pull requests with required CI checks before merging.
 - Do not bypass branch protection or deploy untested commits; keep deployment credentials in the protected GitHub `production` environment or on the Oracle host.
+
+## Task Tracking
+
+- After completely finishing and reviewing each milestone, mark all finished tasks as done (`- [x]`) in [`docs/tasks.md`](docs/tasks.md), including the milestone exit gate; leave unfinished and future-milestone tasks unchecked.
