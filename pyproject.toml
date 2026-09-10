@@ -17,6 +17,7 @@ dependencies = [
   "lxml>=5.0",
   "tenacity>=8.0",
   "aiosqlite>=0.19",
+  "python-dotenv>=1.2.3",
 ]
 
 [project.scripts]

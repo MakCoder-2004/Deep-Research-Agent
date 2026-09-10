@@ -10,7 +10,7 @@ from pathlib import Path
 from typing import Annotated, Any, Literal
 
 from pydantic import BeforeValidator, Field, SecretStr, field_validator
-from pydantic_settings import BaseSettings, SettingsConfigDict
+from pydantic_settings import BaseSettings, NoDecode, SettingsConfigDict
 
 KNOWN_LLM_PROVIDERS = frozenset({"groq", "openrouter", "cloudflare"})
 
@@ -48,7 +48,7 @@ def _parse_allowed_user_ids(value: Any) -> set[int]:
     return parsed
 
 
-AllowedUserIds = Annotated[set[int], BeforeValidator(_parse_allowed_user_ids)]
+AllowedUserIds = Annotated[set[int], BeforeValidator(_parse_allowed_user_ids), NoDecode]
 
 
 class Settings(BaseSettings):

@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from pathlib import Path
+
 import pytest
 from pydantic import ValidationError
 
@@ -22,6 +24,31 @@ def test_allowlist_parses_comma_separated_ids() -> None:
 def test_allowlist_empty_by_default() -> None:
     settings = _make_settings()
     assert settings.telegram_allowed_user_ids == set()
+
+
+def test_settings_loads_values_from_dotenv_file(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Settings must pick up local .env values (requires python-dotenv)."""
+    (tmp_path / ".env").write_text(
+        "ENVIRONMENT=development\n"
+        "TELEGRAM_BOT_TOKEN=file-loaded-value\n"
+        "TELEGRAM_ALLOWED_USER_IDS=\n",
+        encoding="utf-8",
+    )
+    monkeypatch.chdir(tmp_path)
+    settings = Settings()
+    assert settings.telegram_bot_token.get_secret_value() == "file-loaded-value"
+    assert settings.telegram_allowed_user_ids == set()
+
+
+def test_allowlist_parses_comma_separated_ids_from_environment(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Raw env strings must reach the allowlist parser without JSON decoding."""
+    monkeypatch.setenv("TELEGRAM_ALLOWED_USER_IDS", "123, 456;789")
+    settings = Settings(_env_file=None, ENVIRONMENT="development")
+    assert settings.telegram_allowed_user_ids == {123, 456, 789}
 
 
 def test_allowlist_rejects_usernames() -> None:
