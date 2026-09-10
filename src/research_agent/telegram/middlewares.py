@@ -1,4 +1,4 @@
-"""Telegram access middleware (minimal stub; enforcement lands in M2.3)."""
+"""Numeric allowlist enforcement for Telegram private chats."""
 
 from __future__ import annotations
 
@@ -6,6 +6,7 @@ from collections.abc import Awaitable, Callable
 from typing import Any
 
 from aiogram import BaseMiddleware
+from aiogram.dispatcher.flags import get_flag
 from aiogram.types import TelegramObject
 
 
@@ -15,7 +16,11 @@ def is_allowed(user_id: int | None, allowed: set[int]) -> bool:
 
 
 class AllowlistMiddleware(BaseMiddleware):
-    """Pass-through stub; M2.3 adds allowlist enforcement."""
+    """Block messages from users missing from the numeric allowlist.
+
+    Handlers flagged with ``allow_unauthorized=True`` (e.g. ``/whoami``)
+    bypass the check so users can discover their numeric ID.
+    """
 
     def __init__(self, allowed_user_ids: set[int]) -> None:
         self.allowed_user_ids = set(allowed_user_ids)
@@ -26,4 +31,10 @@ class AllowlistMiddleware(BaseMiddleware):
         event: TelegramObject,
         data: dict[str, Any],
     ) -> Any:
+        if get_flag(data, "allow_unauthorized", default=False):
+            return await handler(event, data)
+        from_user: Any = getattr(event, "from_user", None)
+        user_id: int | None = from_user.id if from_user is not None else None
+        if not is_allowed(user_id, self.allowed_user_ids):
+            return None
         return await handler(event, data)
