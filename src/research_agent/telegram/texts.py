@@ -182,3 +182,54 @@ INVALID_URL_AR = (
 def render_invalid_url(lang_code: str | None) -> str:
     """Render the invalid-URL reply (no job created)."""
     return INVALID_URL_AR if pick_lang(lang_code) == "ar" else INVALID_URL_EN
+
+
+STATUS_NONE_EN = "You have no active research job. Send /research <query> to start one."
+
+STATUS_NONE_AR = "ليس لديك مهمة بحث نشطة. أرسل /research <استعلام> لبدء مهمة."
+
+
+def format_status(
+    state: str,
+    position: int | None = None,
+    stage: str | None = None,
+    lang_code: str | None = None,
+    job_id: str | None = None,
+    query: str | None = None,
+) -> str:
+    """Format /status replies for none/queued #N/active stage cases."""
+    lang = pick_lang(lang_code)
+    normalized = (state or "none").lower()
+    if normalized == "queued":
+        pos = position if position and position > 0 else 1
+        if lang == "ar":
+            base = f"مهمتك في قائمة الانتظار بالموضع #{pos}."
+            if job_id:
+                base += f"\nمعرّف المهمة: {job_id}"
+            if query:
+                base += f"\nالاستعلام: {query}"
+            base += "\nاستخدم /cancel للإلغاء."
+            return base
+        base = f"Your research job is queued at position #{pos}."
+        if job_id:
+            base += f"\nJob ID: {job_id}"
+        if query:
+            base += f"\nQuery: {query}"
+        base += "\nUse /cancel to cancel."
+        return base
+    if normalized == "active":
+        current_stage = stage or "active"
+        if lang == "ar":
+            base = f"مهمتك نشطة الآن (المرحلة: {current_stage})."
+            if job_id:
+                base += f"\nمعرّف المهمة: {job_id}"
+            if query:
+                base += f"\nالاستعلام: {query}"
+            return base
+        base = f"Your research job is active (stage: {current_stage})."
+        if job_id:
+            base += f"\nJob ID: {job_id}"
+        if query:
+            base += f"\nQuery: {query}"
+        return base
+    return STATUS_NONE_AR if lang == "ar" else STATUS_NONE_EN

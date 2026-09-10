@@ -12,9 +12,15 @@ from aiogram.types import Message
 from pydantic import ValidationError
 
 from research_agent.models.requests import ResearchRequest
-from research_agent.services.queue import JobRef, enqueue_request
+from research_agent.services.queue import (
+    JobRef,
+    enqueue_request,
+    get_user_active_job,
+    queue_position,
+)
 from research_agent.services.sessions import ensure_user
 from research_agent.telegram.texts import (
+    format_status,
     pick_lang,
     render_help,
     render_invalid_url,
@@ -167,6 +173,60 @@ async def research_handler(
     text = message.text or ""
     query = extract_research_arg(text, "/research")
     await handle_research_request(message, query, conn=conn, db_path=db_path)
+
+
+@router.message(Command("status"))
+async def status_handler(
+    message: Message,
+    conn: aiosqlite.Connection | None = None,
+    db_path: Path | str | None = None,
+) -> None:
+    """Show queue position and current stage for the user's active job."""
+    from_user = message.from_user
+    if from_user is None:
+        return
+    lang_code: str | None = from_user.language_code
+
+    async def _reply_with_conn(db_conn: aiosqlite.Connection) -> None:
+        job = await get_user_active_job(db_conn, from_user.id)
+        if job is None:
+            await message.answer(format_status("none", lang_code=lang_code))
+            return
+        state = str(job["state"])
+        job_id = str(job["job_id"])
+        query_text = str(job["query"])
+        if state == "queued":
+            pos = await queue_position(db_conn, job_id)
+            await message.answer(
+                format_status(
+                    "queued",
+                    position=pos,
+                    lang_code=lang_code,
+                    job_id=job_id,
+                    query=query_text,
+                )
+            )
+        else:
+            await message.answer(
+                format_status(
+                    "active",
+                    stage=state,
+                    lang_code=lang_code,
+                    job_id=job_id,
+                    query=query_text,
+                )
+            )
+
+    if conn is not None:
+        await _reply_with_conn(conn)
+        return
+    if db_path is not None:
+        from research_agent.persistence.database import open_db
+
+        async with open_db(db_path) as db_conn:
+            await _reply_with_conn(db_conn)
+        return
+    await message.answer(format_status("none", lang_code=lang_code))
 
 
 @router.message(F.text, ~F.text.startswith("/"))
