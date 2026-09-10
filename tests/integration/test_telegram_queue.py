@@ -179,3 +179,48 @@ async def test_bounded_queue_enqueue_fifo_pending(tmp_path: Path) -> None:
     with pytest.raises(UserBusyError):
         await queue.enqueue(101, "q1 again")
     await queue.stop()
+
+
+async def test_timeout_while_queued_marks_failed(tmp_path: Path) -> None:
+    """Queued -> failed must be allowed so timeouts while queued stay durable."""
+    db_path = tmp_path / "timeout-queued.db"
+    async with open_db(db_path) as conn:
+        job = await enqueue_request(conn, 55, "timeout query")
+        # Direct transition used by the worker timeout path while still queued.
+        await set_state(conn, job.job_id, JobState.FAILED, error="job timeout")
+        cursor = await conn.execute(
+            "SELECT state FROM jobs WHERE job_id = ?", (job.job_id,)
+        )
+        row = await cursor.fetchone()
+        assert row is not None and str(row["state"]) == "failed"
+    async with open_db(db_path) as reopened:
+        cursor = await reopened.execute(
+            "SELECT state FROM jobs WHERE job_id = ?", (job.job_id,)
+        )
+        persisted = await cursor.fetchone()
+        assert persisted is not None and str(persisted["state"]) == "failed"
+
+
+async def test_run_with_semaphore_timeout_while_queued(tmp_path: Path) -> None:
+    """Worker timeout before active must mark queued jobs failed, not stuck."""
+    import asyncio
+
+    db_path = tmp_path / "timeout-worker.db"
+    async with open_db(db_path):
+        pass
+    queue = BoundedJobQueue(db_path, job_timeout_seconds=1)
+    ref = await queue.enqueue(56, "slow query")
+
+    async def _slow(_job: object) -> None:
+        await asyncio.sleep(5)
+
+    queue.run_placeholder = _slow  # type: ignore[method-assign]
+    # Must not raise ValueError for queued -> failed.
+    await queue._run_with_semaphore(ref)
+    async with open_db(db_path) as conn:
+        cursor = await conn.execute(
+            "SELECT state FROM jobs WHERE job_id = ?", (ref.job_id,)
+        )
+        row = await cursor.fetchone()
+        assert row is not None and str(row["state"]) == "failed"
+    await queue.stop()

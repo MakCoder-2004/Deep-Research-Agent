@@ -161,7 +161,7 @@ def clear_cancel_event(job_id: str) -> None:
 
 
 _ALLOWED_TRANSITIONS: dict[JobState, set[JobState]] = {
-    JobState.QUEUED: {JobState.ACTIVE, JobState.CANCELLED},
+    JobState.QUEUED: {JobState.ACTIVE, JobState.CANCELLED, JobState.FAILED},
     JobState.ACTIVE: {JobState.COMPLETED, JobState.FAILED, JobState.CANCELLED},
 }
 
@@ -177,7 +177,8 @@ async def set_state(
     """Persist a job lifecycle transition via JobRepository.
 
     Allows ``queued -> active -> completed|failed|cancelled`` plus
-    ``queued -> cancelled``; same-state is a no-op. Sanitizes ``error``
+    ``queued -> cancelled`` and ``queued -> failed`` (timeout while queued);
+    same-state is a no-op. Sanitizes ``error``
     with redaction, refreshes ``updated_at`` via the repository, and
     commits. Raises ``ValueError`` for unknown jobs or illegal moves.
     """
