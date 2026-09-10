@@ -13,28 +13,38 @@ from pydantic import BeforeValidator, Field, SecretStr, field_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
+KNOWN_LLM_PROVIDERS = frozenset({"groq", "openrouter", "cloudflare"})
+
+
+def _split_list(value: str) -> list[str]:
+    """Split a comma/semicolon/whitespace-separated environment value."""
+    normalized = value.replace(";", ",").replace(" ", ",")
+    return [part.strip() for part in normalized.split(",") if part.strip()]
+
+
 def _parse_allowed_user_ids(value: Any) -> set[int]:
     """Parse TELEGRAM_ALLOWED_USER_IDS into a set of numeric Telegram IDs."""
     if value is None or value == "":
         return set()
     if isinstance(value, set):
-        return value
-    if isinstance(value, (list, tuple)):
         items: list[Any] = list(value)
+    elif isinstance(value, (list, tuple)):
+        items = list(value)
     elif isinstance(value, int):
-        return {value}
+        items = [value]
     elif isinstance(value, str):
-        normalized = value.replace(";", ",").replace(" ", ",")
-        items = [part.strip() for part in normalized.split(",")]
-        items = [part for part in items if part]
+        items = _split_list(value)
     else:
         raise ValueError("TELEGRAM_ALLOWED_USER_IDS must be comma-separated numeric IDs.")
     parsed: set[int] = set()
     for item in items:
         text = str(item).strip()
-        if not text.lstrip("+-").isdigit():
+        # Telegram user IDs are positive integers: reject usernames as well as
+        # signed, zero, or otherwise non-numeric values.
+        if not text.isdigit() or int(text) <= 0:
             raise ValueError(
-                f"Invalid Telegram user ID {text!r}: must be a numeric ID, not a username."
+                f"Invalid Telegram user ID {text!r}: must be a positive numeric ID, "
+                "not a username."
             )
         parsed.add(int(text))
     return parsed
@@ -124,7 +134,7 @@ class Settings(BaseSettings):
     @classmethod
     def _split_priority(cls, value: Any) -> Any:
         if isinstance(value, str):
-            return [part.strip() for part in value.replace(";", ",").split(",") if part.strip()]
+            return _split_list(value)
         return value
 
     @field_validator("model_map", mode="before")
@@ -155,12 +165,27 @@ def validate_at_startup(settings_or_cls: Any = Settings) -> Settings:
     settings = settings_or_cls() if isinstance(settings_or_cls, type) else settings_or_cls
     if not isinstance(settings, Settings):
         raise ValueError("validate_at_startup expects a Settings instance or class.")
+    if not settings.llm_provider_priority:
+        raise ValueError("LLM_PROVIDER_PRIORITY must list at least one provider.")
+    unknown = [name for name in settings.llm_provider_priority if name not in KNOWN_LLM_PROVIDERS]
+    if unknown:
+        raise ValueError(f"Unknown LLM providers in LLM_PROVIDER_PRIORITY: {sorted(unknown)}.")
     if settings.runtime_environment == "production":
         token = settings.telegram_bot_token.get_secret_value()
         if not token:
             raise ValueError("TELEGRAM_BOT_TOKEN is required in production.")
         if not settings.telegram_allowed_user_ids:
             raise ValueError("TELEGRAM_ALLOWED_USER_IDS is required in production.")
+        provider_keys = {
+            "groq": settings.groq_api_key.get_secret_value(),
+            "openrouter": settings.openrouter_api_key.get_secret_value(),
+            "cloudflare": settings.cloudflare_api_key.get_secret_value(),
+        }
+        if not any(provider_keys.get(name) for name in settings.llm_provider_priority):
+            raise ValueError(
+                "At least one API key for the configured LLM_PROVIDER_PRIORITY "
+                "is required in production."
+            )
     if settings.langsmith_tracing and not settings.langsmith_api_key.get_secret_value():
         raise ValueError("LANGSMITH_API_KEY is required when LANGSMITH_TRACING is true.")
     return settings

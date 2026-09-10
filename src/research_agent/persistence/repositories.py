@@ -12,6 +12,27 @@ def _now_iso() -> str:
     return datetime.now(UTC).isoformat()
 
 
+def _parse_iso(value: str) -> datetime | None:
+    """Parse an ISO-8601 timestamp, accepting a trailing 'Z' variant.
+
+    Returns None when the value is not a parseable timestamp; callers treat
+    unparseable expiries as already expired (fail closed).
+    """
+    try:
+        parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+    except (TypeError, ValueError):
+        return None
+    if parsed.tzinfo is None:
+        return parsed.replace(tzinfo=UTC)
+    return parsed
+
+
+def _is_expired(expires_at: str, now: datetime | None = None) -> bool:
+    current = now or datetime.now(UTC)
+    expires = _parse_iso(expires_at)
+    return expires is None or expires <= current
+
+
 class UserRepository:
     async def upsert(self, conn: aiosqlite.Connection, user_id: int, language: str = "en") -> None:
         now = _now_iso()
@@ -300,10 +321,15 @@ class CacheRepository:
         row = await cursor.fetchone()
         if row is None:
             return None
-        if row["expires_at"] < _now_iso():
+        if _is_expired(str(row["expires_at"])):
             return None
         return str(row["payload"])
 
     async def delete_expired(self, conn: aiosqlite.Connection) -> int:
-        cursor = await conn.execute("DELETE FROM cache WHERE expires_at < ?", (_now_iso(),))
-        return cursor.rowcount if cursor.rowcount is not None else 0
+        cursor = await conn.execute("SELECT cache_key, expires_at FROM cache")
+        expired = [
+            row["cache_key"] for row in await cursor.fetchall() if _is_expired(str(row["expires_at"]))
+        ]
+        for cache_key in expired:
+            await conn.execute("DELETE FROM cache WHERE cache_key = ?", (cache_key,))
+        return len(expired)

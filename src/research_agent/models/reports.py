@@ -101,6 +101,14 @@ class ResearchReport(BaseModel):
             for citation_id in finding.citation_ids:
                 if citation_id not in seen:
                     seen.append(citation_id)
-        if source_ids != seen:
+        seen_set = set(seen)
+        cited_in_listed_order = [source_id for source_id in source_ids if source_id in seen_set]
+        if cited_in_listed_order != seen:
+            raise ValueError("Sources must be ordered by first citation appearance.")
+        first_uncited = next(
+            (index for index, source_id in enumerate(source_ids) if source_id not in seen_set),
+            len(source_ids),
+        )
+        if any(source_id in seen_set for source_id in source_ids[first_uncited:]):
             raise ValueError("Sources must be ordered by first citation appearance.")
         return self

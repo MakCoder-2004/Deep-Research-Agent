@@ -57,7 +57,11 @@ class JsonFormatter(logging.Formatter):
 
 
 def configure_logging(level: int = logging.INFO, secrets: Iterable[str] = ()) -> None:
-    """Configure the root logger with JSON formatting (idempotent)."""
+    """Configure the root logger with JSON formatting (idempotent).
+
+    Never removes handlers installed by the host application; only ensures one
+    JSON handler exists and refreshes the configured secrets.
+    """
     set_secrets(secrets)
     root = logging.getLogger()
     root.setLevel(level)
@@ -68,5 +72,4 @@ def configure_logging(level: int = logging.INFO, secrets: Iterable[str] = ()) ->
     handler = logging.StreamHandler()
     handler.setLevel(level)
     handler.setFormatter(JsonFormatter())
-    root.handlers.clear()
     root.addHandler(handler)
