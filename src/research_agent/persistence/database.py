@@ -43,6 +43,8 @@ CREATE TABLE IF NOT EXISTS jobs (
     updated_at TEXT NOT NULL
 );
 CREATE INDEX IF NOT EXISTS idx_jobs_user_state ON jobs(user_id, state);
+CREATE UNIQUE INDEX IF NOT EXISTS ux_jobs_one_active_per_user
+    ON jobs(user_id) WHERE state IN ('queued', 'active');
 
 CREATE TABLE IF NOT EXISTS reports (
     report_id TEXT PRIMARY KEY,
