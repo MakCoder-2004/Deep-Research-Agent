@@ -3,6 +3,9 @@
 from __future__ import annotations
 
 import asyncio
+import logging
+import sqlite3
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock
@@ -11,7 +14,7 @@ import pytest
 
 from research_agent.config import Settings
 from research_agent.models import JobState
-from research_agent.persistence.database import open_db
+from research_agent.persistence.database import connect, init_schema, open_db
 from research_agent.services.queue import (
     BoundedJobQueue,
     JobRef,
@@ -98,6 +101,74 @@ async def test_one_active_index_survives_reopen(tmp_path: Path) -> None:
         assert exc_info.value.job_id == first.job_id
 
 
+async def test_legacy_duplicate_active_jobs_are_reconciled_before_index(tmp_path: Path) -> None:
+    """An upgrade keeps the oldest live row and is safe to run repeatedly."""
+    db_path = tmp_path / "legacy-duplicates.db"
+    conn = await connect(db_path)
+    try:
+        await conn.execute(
+            """
+            CREATE TABLE jobs (
+                job_id TEXT PRIMARY KEY,
+                user_id INTEGER NOT NULL,
+                query TEXT NOT NULL,
+                language TEXT NOT NULL DEFAULT 'mixed',
+                domain TEXT NOT NULL DEFAULT 'general',
+                depth TEXT NOT NULL DEFAULT 'standard',
+                risk_level TEXT NOT NULL DEFAULT 'normal',
+                state TEXT NOT NULL DEFAULT 'queued',
+                repair_count INTEGER NOT NULL DEFAULT 0,
+                trace_id TEXT,
+                error TEXT,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL
+            )
+            """
+        )
+        oldest = (datetime.now(UTC) - timedelta(minutes=3)).isoformat()
+        middle = (datetime.now(UTC) - timedelta(minutes=2)).isoformat()
+        newest = (datetime.now(UTC) - timedelta(minutes=1)).isoformat()
+        for job_id, state, created_at in (
+            ("keep-oldest", "active", oldest),
+            ("cancel-queued", "queued", middle),
+            ("fail-active", "active", newest),
+        ):
+            await conn.execute(
+                "INSERT INTO jobs (job_id, user_id, query, state, created_at, updated_at) "
+                "VALUES (?, 900, ?, ?, ?, ?)",
+                (job_id, job_id, state, created_at, created_at),
+            )
+        await conn.commit()
+
+        await init_schema(conn)
+        cursor = await conn.execute(
+            "SELECT job_id, state, error FROM jobs WHERE user_id = 900 ORDER BY job_id"
+        )
+        rows = {str(row["job_id"]): row for row in await cursor.fetchall()}
+        assert str(rows["keep-oldest"]["state"]) == "active"
+        assert str(rows["cancel-queued"]["state"]) == "cancelled"
+        assert str(rows["fail-active"]["state"]) == "failed"
+        assert "migration" in str(rows["cancel-queued"]["error"])
+        assert "migration" in str(rows["fail-active"]["error"])
+
+        cursor = await conn.execute("PRAGMA table_info('jobs')")
+        assert "deadline_at" in {str(row["name"]) for row in await cursor.fetchall()}
+        cursor = await conn.execute("PRAGMA index_list('jobs')")
+        indexes = {str(row["name"]): row for row in await cursor.fetchall()}
+        assert int(indexes["ux_jobs_one_active_per_user"]["unique"]) == 1
+        assert int(indexes["ux_jobs_one_active_per_user"]["partial"]) == 1
+
+        await init_schema(conn)
+        cursor = await conn.execute("SELECT job_id, state FROM jobs WHERE user_id = 900")
+        assert {str(row["job_id"]): str(row["state"]) for row in await cursor.fetchall()} == {
+            "keep-oldest": "active",
+            "cancel-queued": "cancelled",
+            "fail-active": "failed",
+        }
+    finally:
+        await conn.close()
+
+
 async def test_lifecycle_transitions_durable(tmp_path: Path) -> None:
     db_path = tmp_path / "life.db"
     async with open_db(db_path) as conn:
@@ -145,6 +216,47 @@ async def test_illegal_transition_rejected(tmp_path: Path) -> None:
             await set_state(conn, job.job_id, JobState.COMPLETED)
         with pytest.raises(ValueError):
             await set_state(conn, "no-such-job", JobState.ACTIVE)
+
+
+async def test_terminal_cancellation_is_a_noop(tmp_path: Path) -> None:
+    db_path = tmp_path / "terminal-cancel.db"
+    async with open_db(db_path) as conn:
+        job = await enqueue_request(conn, 12, "terminal query")
+        await set_state(conn, job.job_id, JobState.ACTIVE)
+        await set_state(conn, job.job_id, JobState.COMPLETED)
+        assert await set_state(conn, job.job_id, JobState.CANCELLED) is False
+        row = await get_user_active_job(conn, 12)
+        assert row is None
+
+
+async def test_concurrent_cancel_and_completion_keep_one_terminal_winner(tmp_path: Path) -> None:
+    """Concurrent writers cannot overwrite the state transition that won."""
+    db_path = tmp_path / "state-race.db"
+    async with open_db(db_path) as conn:
+        job = await enqueue_request(conn, 13, "race query")
+        await set_state(conn, job.job_id, JobState.ACTIVE)
+
+    first = await connect(db_path)
+    second = await connect(db_path)
+    try:
+        results = await asyncio.gather(
+            set_state(first, job.job_id, JobState.CANCELLED),
+            set_state(second, job.job_id, JobState.COMPLETED),
+            return_exceptions=True,
+        )
+        assert sum(result is True for result in results) == 1
+        assert all(
+            result is True or result is False or isinstance(result, ValueError)
+            for result in results
+        )
+        async with open_db(db_path) as conn:
+            cursor = await conn.execute("SELECT state FROM jobs WHERE job_id = ?", (job.job_id,))
+            row = await cursor.fetchone()
+            assert row is not None
+            assert str(row["state"]) in {"cancelled", "completed"}
+    finally:
+        await first.close()
+        await second.close()
 
 
 async def test_cancel_queued_and_active(tmp_path: Path) -> None:
@@ -217,14 +329,114 @@ async def test_timeout_while_queued_marks_failed(tmp_path: Path) -> None:
         assert persisted is not None and str(persisted["state"]) == "failed"
 
 
+async def test_queued_timeout_starts_before_worker_dispatch(tmp_path: Path) -> None:
+    """A job that expires before start is failed without executing."""
+    db_path = tmp_path / "timeout-before-start.db"
+    queue = BoundedJobQueue(db_path, job_timeout_seconds=1)
+    ref = await queue.enqueue(551, "queued timeout")
+    await asyncio.sleep(1.1)
+    executed = asyncio.Event()
+
+    async def _must_not_run(_job: JobRef) -> None:
+        executed.set()
+
+    queue.run_placeholder = _must_not_run  # type: ignore[method-assign]
+    await queue.start()
+
+    async def _wait_for_failure() -> None:
+        while True:
+            async with open_db(db_path) as conn:
+                cursor = await conn.execute(
+                    "SELECT state, error FROM jobs WHERE job_id = ?", (ref.job_id,)
+                )
+                row = await cursor.fetchone()
+            if row is not None and str(row["state"]) == "failed":
+                assert str(row["error"]) == "job timeout"
+                return
+            await asyncio.sleep(0.02)
+
+    try:
+        await asyncio.wait_for(_wait_for_failure(), timeout=2)
+        assert not executed.is_set()
+        async with open_db(db_path) as conn:
+            cursor = await conn.execute(
+                "SELECT deadline_at, created_at FROM jobs WHERE job_id = ?", (ref.job_id,)
+            )
+            row = await cursor.fetchone()
+            assert row is not None and row["deadline_at"] is not None
+    finally:
+        await queue.stop()
+
+
+async def test_queue_stop_persists_queued_and_active_recovery(tmp_path: Path) -> None:
+    """Shutdown does not leave queued or interrupted active jobs stranded."""
+    db_path = tmp_path / "stop-recovery.db"
+    queue = BoundedJobQueue(db_path, max_concurrent_jobs=1, job_timeout_seconds=5)
+    active = await queue.enqueue(561, "active recovery")
+    started = asyncio.Event()
+    release = asyncio.Event()
+
+    async def _active_wait(job: JobRef) -> None:
+        async with open_db(db_path) as conn:
+            await set_state(conn, job.job_id, JobState.ACTIVE)
+        if job.job_id == active.job_id:
+            started.set()
+            await release.wait()
+
+    queue.run_placeholder = _active_wait  # type: ignore[method-assign]
+    await queue.start()
+    await asyncio.wait_for(started.wait(), timeout=1)
+    queued = await queue.enqueue(562, "queued recovery")
+    await queue.stop()
+
+    async with open_db(db_path) as conn:
+        cursor = await conn.execute(
+            "SELECT job_id, state, error FROM jobs WHERE job_id IN (?, ?) ORDER BY job_id",
+            (queued.job_id, active.job_id),
+        )
+        rows = {str(row["job_id"]): row for row in await cursor.fetchall()}
+    assert str(rows[active.job_id]["state"]) == "failed"
+    assert str(rows[queued.job_id]["state"]) == "cancelled"
+    assert "recovery" in str(rows[active.job_id]["error"])
+    assert "recovery" in str(rows[queued.job_id]["error"])
+
+
+async def test_recover_pending_jobs_handles_restart_rows(tmp_path: Path) -> None:
+    db_path = tmp_path / "restart-recovery.db"
+    async with open_db(db_path) as conn:
+        queued = await enqueue_request(conn, 571, "queued restart")
+        active = await enqueue_request(conn, 572, "active restart")
+        await set_state(conn, active.job_id, JobState.ACTIVE)
+
+    queue = BoundedJobQueue(db_path)
+    try:
+        assert await queue.recover_pending_jobs() == 2
+        async with open_db(db_path) as conn:
+            cursor = await conn.execute(
+                "SELECT job_id, state FROM jobs WHERE job_id IN (?, ?)",
+                (queued.job_id, active.job_id),
+            )
+            rows = {str(row["job_id"]): str(row["state"]) for row in await cursor.fetchall()}
+        assert rows == {queued.job_id: "cancelled", active.job_id: "failed"}
+        assert await queue.recover_pending_jobs() == 0
+    finally:
+        await queue.stop()
+
+
 async def test_run_with_semaphore_timeout_while_queued(tmp_path: Path) -> None:
     """Timeout includes semaphore wait and durably fails the queued job."""
     db_path = tmp_path / "timeout-worker.db"
     async with open_db(db_path):
         pass
-    queue = BoundedJobQueue(db_path, max_concurrent_jobs=1, job_timeout_seconds=1)
+    queue = BoundedJobQueue(db_path, max_concurrent_jobs=1, job_timeout_seconds=30)
     first = await queue.enqueue(56, "first slow query")
     second = await queue.enqueue(57, "second slow query")
+    async with open_db(db_path) as conn:
+        await conn.execute(
+            "UPDATE jobs SET deadline_at = ? WHERE job_id = ?",
+            ((datetime.now(UTC) + timedelta(seconds=1)).isoformat(), second.job_id),
+        )
+        await conn.commit()
     started = asyncio.Event()
     release = asyncio.Event()
 
@@ -236,10 +448,12 @@ async def test_run_with_semaphore_timeout_while_queued(tmp_path: Path) -> None:
             await release.wait()
             async with open_db(db_path) as conn:
                 await set_state(conn, job.job_id, JobState.COMPLETED)
+        else:
+            await release.wait()
 
     queue.run_placeholder = _slow  # type: ignore[method-assign]
     await queue.start()
-    await asyncio.wait_for(started.wait(), timeout=1)
+    await asyncio.wait_for(started.wait(), timeout=5)
 
     async def _wait_for_failure() -> None:
         while True:
@@ -252,7 +466,7 @@ async def test_run_with_semaphore_timeout_while_queued(tmp_path: Path) -> None:
                 return
             await asyncio.sleep(0.02)
 
-    await asyncio.wait_for(_wait_for_failure(), timeout=2)
+    await asyncio.wait_for(_wait_for_failure(), timeout=3)
     async with open_db(db_path) as conn:
         cursor = await conn.execute(
             "SELECT state, error FROM jobs WHERE job_id = ?", (second.job_id,)
@@ -324,7 +538,7 @@ async def test_concurrent_enqueue_one_active_per_user(tmp_path: Path) -> None:
             (77,),
         )
         row = await cursor.fetchone()
-        assert row is not None and int(row["n"]) == 1
+        assert row is not None and int(row["n"]) == 0
 
 
 async def test_cancel_events_cleanup_on_terminal_and_stop(tmp_path: Path) -> None:
@@ -349,6 +563,40 @@ async def test_cancel_events_cleanup_on_terminal_and_stop(tmp_path: Path) -> Non
     await queue.stop()
     assert ref.job_id not in _CANCEL_EVENTS
     assert len(_CANCEL_EVENTS) == 0
+
+
+async def test_terminal_persistence_failure_is_logged_and_recovered(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    """A failed state write is observable and leaves a row recoverable on restart."""
+    import research_agent.services.queue as queue_module
+
+    db_path = tmp_path / "persistence-failure.db"
+    queue = BoundedJobQueue(db_path)
+    ref = await queue.enqueue(601, "persistence failure")
+
+    async def _fail_persist(*_args: object, **_kwargs: object) -> bool:
+        raise sqlite3.OperationalError("database is locked")
+
+    async def _fail_job(_job: JobRef) -> None:
+        raise RuntimeError("placeholder failure")
+
+    monkeypatch.setattr(queue_module, "set_state", _fail_persist)
+    queue.run_placeholder = _fail_job  # type: ignore[method-assign]
+    caplog.set_level(logging.ERROR, logger="research_agent.services.queue")
+    await queue.start()
+    await asyncio.wait_for(queue._queue.join(), timeout=2)
+    assert "terminal state persistence failed" in caplog.text
+
+    monkeypatch.undo()
+    try:
+        await queue.stop()
+        async with open_db(db_path) as conn:
+            cursor = await conn.execute("SELECT state FROM jobs WHERE job_id = ?", (ref.job_id,))
+            row = await cursor.fetchone()
+            assert row is not None and str(row["state"]) == "cancelled"
+    finally:
+        clear_all_cancel_events()
 
 
 async def test_cancel_registry_bounded() -> None:
