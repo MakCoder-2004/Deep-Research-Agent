@@ -3,9 +3,11 @@
 from __future__ import annotations
 
 import re
+from datetime import UTC, datetime
 
 import pytest
 
+from research_agent.models.reports import Finding, Source
 from research_agent.telegram.renderer import (
     TELEGRAM_TEXT_LIMIT,
     escape_markdown_v2,
@@ -190,6 +192,22 @@ def test_invalid_report_payloads_raise_before_rendering() -> None:
             "Topic",
             [{"statement": "Claim", "citation_ids": [1], "prompt": "do not render"}],
             [source],
+        )
+
+
+def test_constructed_pydantic_instances_are_revalidated() -> None:
+    valid_source = Source(
+        id=1,
+        title="Source",
+        url="https://example.com",  # type: ignore[arg-type]
+        accessed_at=datetime.now(UTC),
+    )
+    invalid_source = valid_source.model_copy(update={"title": ""})
+    with pytest.raises(ValueError, match="Invalid source"):
+        render_concise_report(
+            "Topic",
+            [Finding(statement="Claim", citation_ids=[1])],
+            [invalid_source],
         )
 
 

@@ -306,9 +306,13 @@ def coerce_finding(item: object) -> Finding:
     "every finding needs citations" before any delivery.
     """
     if isinstance(item, Finding):
-        if not item.citation_ids:
+        try:
+            finding = Finding.model_validate(cast(dict[str, object], item.model_dump()))
+        except ValidationError as exc:
+            raise ValueError(f"Invalid finding: {exc}") from exc
+        if not finding.citation_ids:
             raise ValueError("Every finding must have at least one citation.")
-        return item
+        return finding
     _reject_extra_fields(item, frozenset({"statement", "citation_ids"}), "Finding")
     statement_raw = item if isinstance(item, str) else _get_field(item, "statement")
     if not isinstance(statement_raw, str) or not statement_raw.strip():
@@ -335,7 +339,10 @@ def coerce_source(item: object, fallback_id: int) -> Source:
     never delivered.
     """
     if isinstance(item, Source):
-        return item
+        try:
+            return Source.model_validate(cast(dict[str, object], item.model_dump()))
+        except ValidationError as exc:
+            raise ValueError(f"Invalid source: {exc}") from exc
     _reject_extra_fields(
         item,
         frozenset(
