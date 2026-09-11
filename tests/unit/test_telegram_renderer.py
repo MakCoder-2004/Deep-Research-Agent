@@ -185,6 +185,12 @@ def test_invalid_report_payloads_raise_before_rendering() -> None:
         render_concise_report("Topic", [{"statement": "Claim", "citation_ids": [2]}], [source])
     with pytest.raises(ValueError, match="positive integers"):
         render_concise_report("Topic", [{"statement": "Claim", "citation_ids": ["bad"]}], [source])
+    with pytest.raises(ValueError, match="unsupported fields"):
+        render_concise_report(
+            "Topic",
+            [{"statement": "Claim", "citation_ids": [1], "prompt": "do not render"}],
+            [source],
+        )
 
 
 def test_report_local_source_ref_wins_over_database_id() -> None:

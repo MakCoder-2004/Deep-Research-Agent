@@ -73,6 +73,26 @@ class _RenderedMarkdownV2(str):
     """Marker for text whose formatting controls were added by this module."""
 
 
+def _reject_extra_fields(item: object, allowed: frozenset[str], label: str) -> None:
+    """Reject unexpected fields before alias normalization can hide them."""
+    keys: Iterable[object] | None = None
+    if isinstance(item, Mapping):
+        keys = cast(Mapping[object, object], item).keys()
+    else:
+        try:
+            attributes = vars(item)
+        except TypeError:
+            attributes = None
+        if isinstance(attributes, dict):
+            keys = attributes.keys()
+    if keys is None:
+        return
+    extra = [key for key in keys if not isinstance(key, str) or key not in allowed]
+    if extra:
+        names = ", ".join(repr(key) for key in extra)
+        raise ValueError(f"{label} contains unsupported fields: {names}.")
+
+
 def escape_markdown_v2(text: str) -> str:
     """Escape text for Telegram MarkdownV2.
 
@@ -290,6 +310,7 @@ def coerce_finding(item: object) -> Finding:
         if not item.citation_ids:
             raise ValueError("Every finding must have at least one citation.")
         return item
+    _reject_extra_fields(item, frozenset({"statement", "citation_ids"}), "Finding")
     statement_raw = item if isinstance(item, str) else _get_field(item, "statement")
     if not isinstance(statement_raw, str) or not statement_raw.strip():
         raise ValueError("Finding statement must be a non-empty string.")
@@ -316,6 +337,25 @@ def coerce_source(item: object, fallback_id: int) -> Source:
     """
     if isinstance(item, Source):
         return item
+    _reject_extra_fields(
+        item,
+        frozenset(
+            {
+                "id",
+                "source_ref",
+                "source_id",
+                "ref",
+                "report_id",
+                "title",
+                "url",
+                "publisher",
+                "published_at",
+                "accessed_at",
+                "source_type",
+            }
+        ),
+        "Source",
+    )
     source_id = fallback_id
     # ``source_ref`` is report-local and is the citation ID persisted by the
     # report pipeline. SQLite's ``id`` is global across all reports.
