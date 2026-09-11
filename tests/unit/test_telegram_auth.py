@@ -145,24 +145,25 @@ async def test_authorized_passes_research_handler() -> None:
     message.answer.assert_not_awaited()
 
 
-async def test_group_blocked_even_when_allowed() -> None:
+async def test_allowed_user_passes_from_group() -> None:
     middleware = AllowlistMiddleware({123})
     message = _make_message(123, "en", "group")
     research_obj = _handler_by_name("research_handler")
-    handler = AsyncMock()
+    handler = AsyncMock(return_value="ok")
     result = await middleware(handler, message, {"handler": research_obj})
-    assert result is None
-    handler.assert_not_awaited()
-    message.answer.assert_awaited_once()
+    assert result == "ok"
+    handler.assert_awaited_once()
+    message.answer.assert_not_awaited()
 
 
 async def test_group_supergroup_blocked() -> None:
     middleware = AllowlistMiddleware({123})
-    message = _make_message(123, "en", "supergroup")
+    message = _make_message(999, "en", "supergroup")
     handler = AsyncMock()
     result = await middleware(handler, message, {})
     assert result is None
     handler.assert_not_awaited()
+    message.answer.assert_awaited_once()
 
 
 async def test_whoami_bypasses_group_block() -> None:

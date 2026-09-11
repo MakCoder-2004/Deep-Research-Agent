@@ -48,7 +48,13 @@ async def _seed_report(
     summary: str,
     tools: list[str] | None = None,
 ) -> None:
-    await JobRepository().create(conn, job_id=job_id, user_id=user_id, query=topic)
+    await JobRepository().create(
+        conn,
+        job_id=job_id,
+        user_id=user_id,
+        query=topic,
+        state="completed",
+    )
     await ReportRepository().save(
         conn,
         report_id=report_id,

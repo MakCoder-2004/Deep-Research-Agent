@@ -125,14 +125,14 @@ async def test_from_user_none_blocked() -> None:
     handler.assert_not_awaited()
 
 
-async def test_group_blocked_even_for_allowed_user(tmp_path: Path) -> None:
+async def test_allowed_group_user_passes_allowlist(tmp_path: Path) -> None:
     db_path = tmp_path / "sec_group.db"
     async with open_db(db_path) as conn:
         middleware = AllowlistMiddleware({123})
         message = _make_message(123, "en", "group")
         research_obj = _handler_by_name("research_handler")
-        handler = AsyncMock()
+        handler = AsyncMock(return_value="ok")
         result = await middleware(handler, message, {"handler": research_obj})
-        assert result is None
-        handler.assert_not_awaited()
+        assert result == "ok"
+        handler.assert_awaited_once()
         assert await _job_count(conn) == 0
