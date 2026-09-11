@@ -5,10 +5,12 @@ from __future__ import annotations
 import asyncio
 import sys
 
+from aiogram import Dispatcher
+
 from research_agent.config import Settings, validate_at_startup
 from research_agent.observability.logging import configure_logging
 from research_agent.persistence.database import open_db
-from research_agent.services.queue import BoundedJobQueue
+from research_agent.services.queue import BoundedJobQueue, set_default_queue
 from research_agent.telegram.bot import (
     create_bot,
     create_dispatcher,
@@ -31,28 +33,46 @@ def _collect_secrets(settings: Settings) -> list[str]:
     return [secret for secret in candidates if secret]
 
 
+def _queue_from_settings(settings: Settings) -> BoundedJobQueue:
+    """Build a queue from typed settings (keeps ``Any`` inside queue.py).
+
+    ``BoundedJobQueue.from_settings`` accepts ``Any`` for historic reasons;
+    this wrapper restores proper :class:`Settings` typing on the caller side
+    without touching the queue implementation.
+    """
+    return BoundedJobQueue.from_settings(settings, db_path=settings.database_path)
+
+
 async def run_telegram(settings: Settings) -> None:
     """Validate config, init storage, and run Telegram long polling."""
     settings = validate_at_startup(settings)
     configure_logging(secrets=_collect_secrets(settings))
+    settings.reports_dir.mkdir(parents=True, exist_ok=True)
+    # open_db initializes the schema exactly once for the startup connection.
     async with open_db(settings.database_path):
         pass
-    settings.reports_dir.mkdir(parents=True, exist_ok=True)
     bot = create_bot(settings)
     # Semaphore is sized from settings.max_concurrent_jobs (default 3 globally).
-    queue = BoundedJobQueue.from_settings(settings)
+    queue = _queue_from_settings(settings)
     queue.set_bot(bot)
-    dp = create_dispatcher(
-        settings.telegram_allowed_user_ids,
-        settings.database_path,
-        job_queue=queue,
-        reports_dir=settings.reports_dir,
-    )
+    set_default_queue(queue)
+    dp: Dispatcher | None = None
     try:
-        await start_queue_worker(dp, queue)
+        dp = create_dispatcher(
+            settings.telegram_allowed_user_ids,
+            settings.database_path,
+            job_queue=queue,
+            reports_dir=settings.reports_dir,
+            bot=bot,
+        )
+        await start_queue_worker(dp, queue, bot)
         await start_polling(bot, dp)
     finally:
-        await stop_queue_worker(dp)
+        if dp is not None:
+            await stop_queue_worker(dp)
+        else:
+            await queue.stop()
+        set_default_queue(None)
         await bot.session.close()
 
 
