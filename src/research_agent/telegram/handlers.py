@@ -6,7 +6,7 @@ from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
 from pathlib import Path
-from typing import TYPE_CHECKING, Literal
+from typing import TYPE_CHECKING, Any, Literal, cast
 
 import aiosqlite
 from aiogram import F, Router
@@ -36,12 +36,12 @@ from research_agent.services.sessions import (
 from research_agent.telegram.renderer import (
     deliver_report,
     render_concise_report,
+    render_safe_fallback,
     report_filename,
     split_message,
 )
 from research_agent.telegram.texts import (
     format_history,
-    format_report_bundle,
     format_status,
     pick_lang,
     render_busy,
@@ -198,30 +198,73 @@ async def handle_research_request(
         else:
             await message.answer(render_research_usage(lang_code))
         return None
-    async with with_db(ctx.conn, ctx.db_path) as db_conn:
-        if db_conn is None:
-            # No persistence available: never invent a job ID. Reply with a
-            # localized service-unavailable message instead of fake-accepting.
-            await message.answer(render_unavailable(lang_code))
-            return None
-        try:
-            job = await enqueue_request(db_conn, request.user_id, request.query)
-        except UserBusyError as busy:
-            await message.answer(render_busy(busy.job_id or None, lang_code))
-            return None
-        await message.answer(render_research_accepted(request.query, job.job_id, lang_code))
-        try:
-            from research_agent.telegram.progress import ProgressStage, publish_progress
 
-            await publish_progress(
-                message, job.job_id, ProgressStage.ANALYZING, position=job.position
+    async def _enqueue() -> JobRef | None:
+        """Persist once and schedule when a live queue is injected."""
+        if ctx.job_queue is not None:
+            return await ctx.job_queue.enqueue(
+                request.user_id,
+                request.query,
+                language=request.language.value,
             )
-        except Exception:  # noqa: BLE001, S110 - progress failure must not fail enqueue
-            pass
-        return job
+        async with with_db(ctx.conn, ctx.db_path) as db_conn:
+            if db_conn is None:
+                return None
+            return await enqueue_request(
+                db_conn,
+                request.user_id,
+                request.query,
+                language=request.language.value,
+            )
+
+    try:
+        job = await _enqueue()
+    except UserBusyError as busy:
+        await message.answer(render_busy(busy.job_id or None, lang_code))
+        return None
+    except Exception:  # noqa: BLE001 - gateway must not fake-accept unavailable jobs
+        await message.answer(render_unavailable(lang_code))
+        return None
+    if job is None:
+        # No persistence available: never invent a job ID.
+        await message.answer(render_unavailable(lang_code))
+        return None
+    await message.answer(render_research_accepted(request.query, job.job_id, lang_code))
+    try:
+        from research_agent.telegram.progress import ProgressStage, publish_progress
+
+        await publish_progress(message, job.job_id, ProgressStage.ANALYZING, position=job.position)
+    except Exception:  # noqa: BLE001, S110 - progress failure must not fail enqueue
+        pass
+    return job
 
 
-@router.message(Command("whoami"), flags={"allow_unauthorized": True})
+def _status_stage(job_id: str) -> str:
+    """Return a pipeline stage without exposing the persistence state.
+
+    The current progress registry stores the editable message target. If a
+    future registry entry also carries a stage, accept it; otherwise an active
+    job starts at the meaningful ``analyzing`` stage.
+    """
+    try:
+        from research_agent.telegram.progress import ProgressStage, get_progress
+
+        entry = cast(Any, get_progress(job_id))
+        candidate: object | None = None
+        if isinstance(entry, dict):
+            candidate = entry.get("stage")
+        elif isinstance(entry, tuple) and len(entry) >= 3:
+            candidate = entry[2]
+        if isinstance(candidate, str):
+            try:
+                return ProgressStage(candidate).value
+            except ValueError:
+                pass
+        return ProgressStage.ANALYZING.value
+    except Exception:  # noqa: BLE001 - status remains useful if progress is unavailable
+        return "analyzing"
+
+
 async def whoami_handler(message: Message) -> None:
     """Reply with the sender's numeric Telegram user ID."""
     if message.from_user is None:
@@ -229,7 +272,6 @@ async def whoami_handler(message: Message) -> None:
     await message.answer(render_whoami(message.from_user.id))
 
 
-@router.message(Command("start"), flags={"allow_unauthorized": True})
 async def start_handler(
     message: Message,
     conn: aiosqlite.Connection | None = None,
@@ -249,7 +291,6 @@ async def start_handler(
     await message.answer(render_start(lang_code))
 
 
-@router.message(Command("help"), flags={"allow_unauthorized": True})
 async def help_handler(message: Message) -> None:
     """Show examples and limits without creating jobs."""
     lang_code: str | None = (
@@ -258,7 +299,6 @@ async def help_handler(message: Message) -> None:
     await message.answer(render_help(lang_code))
 
 
-@router.message(Command("research"))
 async def research_handler(
     message: Message,
     conn: aiosqlite.Connection | None = None,
@@ -271,7 +311,6 @@ async def research_handler(
     await handle_research_request(message, query, conn=conn, db_path=db_path, job_queue=job_queue)
 
 
-@router.message(Command("status"))
 async def status_handler(
     message: Message,
     conn: aiosqlite.Connection | None = None,
@@ -304,10 +343,11 @@ async def status_handler(
                 )
             )
         else:
+            stage = _status_stage(job_id)
             await message.answer(
                 format_status(
                     "active",
-                    stage=state,
+                    stage=stage,
                     lang_code=lang_code,
                     job_id=job_id,
                     query=query_text,
@@ -321,7 +361,6 @@ async def status_handler(
         await _reply_with_conn(db_conn)
 
 
-@router.message(Command("cancel"))
 async def cancel_handler(
     message: Message,
     conn: aiosqlite.Connection | None = None,
@@ -352,7 +391,6 @@ async def cancel_handler(
         await _cancel_with_conn(db_conn)
 
 
-@router.message(Command("history"))
 async def history_handler(
     message: Message,
     conn: aiosqlite.Connection | None = None,
@@ -376,7 +414,6 @@ async def history_handler(
         await _reply_with_conn(db_conn)
 
 
-@router.message(Command("report"))
 async def report_handler(
     message: Message,
     conn: aiosqlite.Connection | None = None,
@@ -451,8 +488,18 @@ async def report_handler(
                 return
             for chunk in split_message(concise):
                 await message.answer(chunk, parse_mode="MarkdownV2")
-        except Exception:  # noqa: BLE001 - fall back to plain bundle on render issues
-            await message.answer(format_report_bundle(report, sources, lang_code))
+        except Exception:  # noqa: BLE001 - validation/render failures stay safely escaped
+            try:
+                topic = str(report["topic"])
+            except Exception:  # noqa: BLE001 - fallback must not expose raw row access
+                topic = "report"
+            try:
+                summary = str(report["summary"])
+            except Exception:  # noqa: BLE001 - fallback must not expose raw row access
+                summary = ""
+            safe_fallback = render_safe_fallback(topic, summary, lang_code)
+            for chunk in split_message(safe_fallback):
+                await message.answer(chunk, parse_mode="MarkdownV2")
 
     async with with_db(ctx.conn, ctx.db_path) as db_conn:
         if db_conn is None:
@@ -461,7 +508,6 @@ async def report_handler(
         await _reply_with_conn(db_conn)
 
 
-@router.message(Command("forget"))
 async def forget_handler(
     message: Message,
     conn: aiosqlite.Connection | None = None,
@@ -488,7 +534,6 @@ async def forget_handler(
         await message.answer(render_forget_done(lang_code))
 
 
-@router.message(Command("language"))
 async def language_handler(
     message: Message,
     conn: aiosqlite.Connection | None = None,
@@ -538,7 +583,6 @@ async def language_handler(
             await message.answer(render_language_set(new_code, new_code))
 
 
-@router.message(F.text, ~F.text.startswith("/"))
 async def plaintext_handler(
     message: Message,
     conn: aiosqlite.Connection | None = None,
@@ -550,10 +594,28 @@ async def plaintext_handler(
     await handle_research_request(message, query, conn=conn, db_path=db_path, job_queue=job_queue)
 
 
-@router.message(~F.text)
 async def non_text_handler(message: Message) -> None:
     """Gently ignore non-text messages without creating jobs."""
     lang_code: str | None = (
         message.from_user.language_code if message.from_user is not None else None
     )
     await message.answer(render_non_text(lang_code))
+
+
+def register_handlers(target: Router) -> None:
+    """Register the Telegram handlers on a dispatcher-owned router."""
+    target.message.register(whoami_handler, Command("whoami"), flags={"allow_unauthorized": True})
+    target.message.register(start_handler, Command("start"), flags={"allow_unauthorized": True})
+    target.message.register(help_handler, Command("help"), flags={"allow_unauthorized": True})
+    target.message.register(research_handler, Command("research"))
+    target.message.register(status_handler, Command("status"))
+    target.message.register(cancel_handler, Command("cancel"))
+    target.message.register(history_handler, Command("history"))
+    target.message.register(report_handler, Command("report"))
+    target.message.register(forget_handler, Command("forget"))
+    target.message.register(language_handler, Command("language"))
+    target.message.register(plaintext_handler, F.text, ~F.text.startswith("/"))
+    target.message.register(non_text_handler, ~F.text)
+
+
+register_handlers(router)

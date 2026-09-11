@@ -2,13 +2,14 @@
 
 from __future__ import annotations
 
+import asyncio
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock
 
 from research_agent.persistence.database import open_db
 from research_agent.persistence.repositories import UserRepository
-from research_agent.services.queue import get_user_active_job
+from research_agent.services.queue import BoundedJobQueue, get_user_active_job
 from research_agent.telegram.handlers import (
     handle_research_request,
     help_handler,
@@ -207,3 +208,44 @@ async def test_plaintext_no_db_replies_unavailable() -> None:
     await plaintext_handler(message)
     reply = message.answer.call_args[0][0]
     assert "unavailable" in reply.lower() or "غير متاحة" in reply
+
+
+async def test_research_with_live_queue_reaches_terminal_state(tmp_path: Path) -> None:
+    db_path = tmp_path / "live_queue.db"
+    queue = BoundedJobQueue(db_path)
+    await queue.start()
+    try:
+        message = _msg(321, "/research live queue query", "en")
+        result = await handle_research_request(
+            message,
+            "live queue query",
+            db_path=db_path,
+            job_queue=queue,
+        )
+        assert result is not None
+
+        async def _wait_for_terminal() -> None:
+            while True:
+                async with open_db(db_path) as conn:
+                    cursor = await conn.execute(
+                        "SELECT state FROM jobs WHERE job_id = ?", (result.job_id,)
+                    )
+                    row = await cursor.fetchone()
+                if row is not None and str(row["state"]) in {
+                    "completed",
+                    "failed",
+                    "cancelled",
+                }:
+                    return
+                await asyncio.sleep(0.01)
+
+        await asyncio.wait_for(_wait_for_terminal(), timeout=2)
+        async with open_db(db_path) as conn:
+            cursor = await conn.execute(
+                "SELECT COUNT(*) AS n, state FROM jobs WHERE job_id = ?", (result.job_id,)
+            )
+            row = await cursor.fetchone()
+        assert row is not None and int(row["n"]) == 1
+        assert str(row["state"]) == "completed"
+    finally:
+        await queue.stop()
