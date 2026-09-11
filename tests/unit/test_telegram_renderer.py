@@ -18,6 +18,12 @@ from research_agent.telegram.renderer import (
     split_message,
 )
 
+_SPLIT_HEADER_RE = re.compile(r"^\\\(\d+/\d+\\\) ")
+
+
+def _without_split_header(chunk: str) -> str:
+    return _SPLIT_HEADER_RE.sub("", chunk, count=1)
+
 
 def test_escape_table_all_specials() -> None:
     specials = [
@@ -94,8 +100,8 @@ def test_split_respects_limit_and_rejoins() -> None:
     assert len(chunks) >= 2
     for chunk in chunks:
         assert len(chunk) <= TELEGRAM_TEXT_LIMIT
-        assert re.fullmatch(r"\(\d+/\d+\) .*", chunk, flags=re.DOTALL)
-    stripped = [re.sub(r"^\(\d+/\d+\) ", "", chunk) for chunk in chunks]
+        assert re.fullmatch(r"\\\(\d+/\d+\\\) .*", chunk, flags=re.DOTALL)
+    stripped = [_without_split_header(chunk) for chunk in chunks]
     assert "".join(stripped) == text
 
 
@@ -106,7 +112,8 @@ def test_split_small_limit_paragraph_boundaries() -> None:
     chunks = split_message(text, 60)
     for chunk in chunks:
         assert len(chunk) <= 60
-    stripped = [re.sub(r"^\(\d+/\d+\) ", "", chunk) for chunk in chunks]
+        assert _SPLIT_HEADER_RE.match(chunk)
+    stripped = [_without_split_header(chunk) for chunk in chunks]
     assert "".join(stripped) == text
 
 
@@ -116,11 +123,11 @@ def test_split_never_mid_marker_or_escape() -> None:
     chunks = split_message(text, 100)
     for chunk in chunks:
         assert len(chunk) <= 100
-        body = re.sub(r"^\(\d+/\d+\) ", "", chunk)
+        body = _without_split_header(chunk)
         # No dangling single escape at the end.
         trailing = len(body) - len(body.rstrip("\\"))
         assert trailing % 2 == 0
-    stripped = [re.sub(r"^\(\d+/\d+\) ", "", chunk) for chunk in chunks]
+    stripped = [_without_split_header(chunk) for chunk in chunks]
     rejoined = "".join(stripped)
     assert rejoined == text
     assert "[12]" in rejoined
@@ -132,6 +139,49 @@ def test_split_never_mid_marker_or_escape() -> None:
 def test_split_invalid_limit() -> None:
     with pytest.raises(ValueError):
         split_message("hi", 5)
+
+
+def test_split_headers_are_escaped_for_markdown_v2() -> None:
+    chunks = split_message("word " * 100, 60)
+    assert len(chunks) > 1
+    for chunk in chunks:
+        assert _SPLIT_HEADER_RE.match(chunk)
+        assert not re.match(r"^\(\d+/\d+\) ", chunk)
+        assert len(chunk) <= 60
+
+
+def test_split_preserves_links_bold_topics_and_citations() -> None:
+    text = (
+        "*topic* "
+        "context words before the source "
+        "[source title](https://example.com/source) [12] after the source"
+    )
+    chunks = split_message(text, 50)
+    bodies = [_without_split_header(chunk) for chunk in chunks]
+    assert "".join(bodies) == text
+    assert any("*topic*" in body for body in bodies)
+    assert any("[source title](https://example.com/source)" in body for body in bodies)
+    assert any("[12]" in body for body in bodies)
+
+
+def test_split_flattens_long_topic_and_source_link_safely() -> None:
+    long_topic = "long topic " + "x" * 180
+    long_title = "long source title " + "y" * 180
+    long_url = "https://example.com/" + "z" * 180
+    text = render_concise_report(
+        long_topic,
+        [{"statement": "Claim", "citation_ids": [1]}],
+        [{"id": 1, "title": long_title, "url": long_url}],
+    )
+    chunks = split_message(text, 100)
+    bodies = [_without_split_header(chunk) for chunk in chunks]
+    flattened = "".join(bodies)
+    assert all(len(chunk) <= 100 for chunk in chunks)
+    assert long_topic in flattened
+    assert long_title in flattened
+    assert "https://example\\.com/" in flattened
+    assert "](" not in flattened
+    assert "*" not in flattened
 
 
 def test_concise_en_contains_markers_tools_partial() -> None:

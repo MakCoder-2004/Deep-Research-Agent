@@ -162,31 +162,140 @@ def _adjust_hard_cut(text: str, cut: int) -> int:
     return cut
 
 
+def _find_unescaped(text: str, value: str, start: int) -> int:
+    """Find an unescaped MarkdownV2 delimiter."""
+    position = text.find(value, start)
+    while position != -1:
+        backslashes = 0
+        index = position - 1
+        while index >= 0 and text[index] == "\\":
+            backslashes += 1
+            index -= 1
+        if backslashes % 2 == 0:
+            return position
+        position = text.find(value, position + 1)
+    return -1
+
+
+def _markdown_protected_spans(text: str) -> list[tuple[int, int]]:
+    """Return MarkdownV2 spans that must not be split across messages."""
+    spans: list[tuple[int, int]] = []
+    index = 0
+    while index < len(text):
+        if text[index] == "\\":
+            index += 2
+            continue
+        if text[index] == "[":
+            citation = re.match(r"\[\d+\]", text[index:])
+            if citation is not None:
+                end = index + len(citation.group(0))
+                spans.append((index, end))
+                index = end
+                continue
+            label_end = _find_unescaped(text, "]", index + 1)
+            if label_end != -1 and label_end + 1 < len(text) and text[label_end + 1] == "(":
+                link_end = _find_unescaped(text, ")", label_end + 2)
+                if link_end != -1:
+                    end = link_end + 1
+                    spans.append((index, end))
+                    index = end
+                    continue
+        if text[index] == "*":
+            bold_end = _find_unescaped(text, "*", index + 1)
+            if bold_end != -1:
+                end = bold_end + 1
+                spans.append((index, end))
+                index = end
+                continue
+        index += 1
+    return spans
+
+
+def _flatten_oversized_span(text: str, start: int, end: int) -> str:
+    """Turn an oversized formatting span into safe escaped text."""
+    span = text[start:end]
+    if span.startswith("*") and span.endswith("*"):
+        return escape_markdown_v2(span[1:-1])
+    if span.startswith("["):
+        label_end = span.find("](")
+        if label_end != -1 and span.endswith(")"):
+            label = span[1:label_end]
+            destination = span[label_end + 2 : -1]
+            return escape_markdown_v2(f"{label} ({destination})")
+    if span.startswith("[") and span.endswith("]"):
+        # A very small split limit may not fit a citation marker. Keep its
+        # number visible without emitting an unmatched Markdown delimiter.
+        return escape_markdown_v2(span[1:-1])
+    return escape_markdown_v2(span)
+
+
+def _flatten_oversized_spans(text: str, limit: int) -> str:
+    """Flatten formatting controls whose atomic span cannot fit in a chunk."""
+    replacements: list[tuple[int, int, str]] = []
+    for start, end in _markdown_protected_spans(text):
+        if end - start > limit:
+            replacements.append((start, end, _flatten_oversized_span(text, start, end)))
+    if not replacements:
+        return text
+    output: list[str] = []
+    previous = 0
+    for start, end, replacement in replacements:
+        output.append(text[previous:start])
+        output.append(replacement)
+        previous = end
+    output.append(text[previous:])
+    return "".join(output)
+
+
+def _adjust_markdown_cut(text: str, cut: int, effective: int) -> int:
+    """Adjust a cut so it does not land inside a protected MarkdownV2 span."""
+    cut = _adjust_hard_cut(text, cut)
+    for start, end in _markdown_protected_spans(text):
+        if start < cut < end:
+            if start == 0 and end <= effective:
+                return end
+            return start
+    return cut
+
+
 def _find_cut_position(remaining: str, effective: int) -> int:
     """Find the best cut index within ``effective`` preserving boundaries."""
     if len(remaining) <= effective:
         return len(remaining)
+
+    def adjusted(candidate: int) -> int | None:
+        cut = _adjust_markdown_cut(remaining, candidate, effective)
+        if 0 < cut < len(remaining):
+            return cut
+        return None
+
     pos = remaining.rfind("\n\n", 0, effective)
     if pos != -1:
         cut = pos + 2
-        if 0 < cut < len(remaining):
-            return cut
+        result = adjusted(cut)
+        if result is not None:
+            return result
     pos = remaining.rfind("\n", 0, effective)
     if pos != -1:
         cut = pos + 1
-        if 0 < cut < len(remaining):
-            return cut
+        result = adjusted(cut)
+        if result is not None:
+            return result
     last_end = -1
     for match in _SENTENCE_RE.finditer(remaining[:effective]):
         last_end = match.end()
     if last_end > 0 and last_end < len(remaining):
-        return last_end
+        result = adjusted(last_end)
+        if result is not None:
+            return result
     pos = remaining.rfind(" ", 0, effective)
     if pos != -1:
         cut = pos + 1
-        if 0 < cut < len(remaining):
-            return cut
-    return _adjust_hard_cut(remaining, effective)
+        result = adjusted(cut)
+        if result is not None:
+            return result
+    cut = _adjust_markdown_cut(remaining, effective, effective)
+    return cut if cut > 0 else effective
 
 
 def _split_without_headers(text: str, effective: int) -> list[str]:
@@ -207,16 +316,22 @@ def _split_without_headers(text: str, effective: int) -> list[str]:
     return chunks
 
 
+def _split_header(index: int, total: int) -> str:
+    """Return an escaped MarkdownV2 chunk header."""
+    return f"\\({index}/{total}\\) "
+
+
 def split_message(text: str, limit: int = TELEGRAM_TEXT_LIMIT) -> list[str]:
     """Split oversized text on paragraph-safe boundaries.
 
     Priority is ``\\n\\n`` then ``\\n`` then sentence boundaries then spaces,
     falling back to a hard cut that never splits mid-code-point (Python
-    slicing is code-point safe), inside ``[n]`` markers, on a dangling
-    escape backslash, or inside CRLF. When more than one chunk is needed,
-    each chunk is prefixed with a ``(i/n)`` header and the header length is
-    counted inside ``limit`` so every returned chunk satisfies
-    ``len(chunk) <= limit``.
+    slicing is code-point safe), inside MarkdownV2 links, bold spans,
+    ``[n]`` markers, escape sequences, or CRLF. An individual formatting
+    span that is larger than the limit is rendered as safe escaped text
+    instead of being emitted as malformed MarkdownV2. When more than one
+    chunk is needed, each chunk is prefixed with an escaped ``(i/n)`` header
+    and the header length is counted inside ``limit``.
     """
     if limit < 10:
         raise ValueError("Split limit must be >= 10.")
@@ -225,20 +340,21 @@ def split_message(text: str, limit: int = TELEGRAM_TEXT_LIMIT) -> list[str]:
     total_guess = max(2, len(text) // max(1, limit - 10) + 1)
     raw: list[str] = []
     total = total_guess
-    for _ in range(10):
-        header_len = len(f"({total_guess}/{total_guess}) ")
+    for _ in range(20):
+        header_len = len(_split_header(total_guess, total_guess))
         effective = max(1, limit - header_len)
-        raw = _split_without_headers(text, effective)
+        safe_text = _flatten_oversized_spans(text, effective)
+        raw = _split_without_headers(safe_text, effective)
         total = len(raw)
         if total == total_guess:
             break
         total_guess = total
     else:
-        header_len = len(f"({total_guess}/{total_guess}) ")
+        header_len = len(_split_header(total_guess, total_guess))
         effective = max(1, limit - header_len)
-        raw = _split_without_headers(text, effective)
+        raw = _split_without_headers(_flatten_oversized_spans(text, effective), effective)
         total = len(raw)
-    return [f"({i}/{total}) {chunk}" for i, chunk in enumerate(raw, start=1)]
+    return [_split_header(i, total) + chunk for i, chunk in enumerate(raw, start=1)]
 
 
 def _normalize_report_lang(lang: str | None) -> str:
