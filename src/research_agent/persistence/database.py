@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
+from datetime import UTC, datetime
 from pathlib import Path
 
 import aiosqlite
@@ -40,11 +41,10 @@ CREATE TABLE IF NOT EXISTS jobs (
     trace_id TEXT,
     error TEXT,
     created_at TEXT NOT NULL,
-    updated_at TEXT NOT NULL
+    updated_at TEXT NOT NULL,
+    deadline_at TEXT
 );
 CREATE INDEX IF NOT EXISTS idx_jobs_user_state ON jobs(user_id, state);
-CREATE UNIQUE INDEX IF NOT EXISTS ux_jobs_one_active_per_user
-    ON jobs(user_id) WHERE state IN ('queued', 'active');
 
 CREATE TABLE IF NOT EXISTS reports (
     report_id TEXT PRIMARY KEY,
@@ -128,9 +128,125 @@ async def connect(db_path: Path | str) -> aiosqlite.Connection:
 
 
 async def init_schema(conn: aiosqlite.Connection) -> None:
-    """Create all foundation tables and the FTS5 index."""
+    """Create the schema and apply idempotent job-table migrations.
+
+    The active-job index is deliberately created after duplicate reconciliation.
+    Older databases may have been written before that invariant existed.
+    """
     await conn.executescript(SCHEMA_SQL)
+    if await _job_schema_is_current(conn):
+        return
+    await conn.execute("BEGIN IMMEDIATE")
+    try:
+        await _ensure_deadline_column(conn)
+        await _reconcile_duplicate_active_jobs(conn)
+        await _ensure_active_job_index(conn)
+    except BaseException:
+        await conn.rollback()
+        raise
     await conn.commit()
+
+
+async def _job_schema_is_current(conn: aiosqlite.Connection) -> bool:
+    """Avoid taking a write lock when the job migrations are already applied."""
+    cursor = await conn.execute("PRAGMA table_info('jobs')")
+    columns = {str(row["name"]) for row in await cursor.fetchall()}
+    if "deadline_at" not in columns:
+        return False
+    cursor = await conn.execute("PRAGMA index_list('jobs')")
+    for row in await cursor.fetchall():
+        if str(row["name"]) != "ux_jobs_one_active_per_user":
+            continue
+        if int(row["unique"]) != 1 or int(row["partial"]) != 1:
+            return False
+        sql_cursor = await conn.execute(
+            "SELECT sql FROM sqlite_master WHERE type = 'index' AND name = ?",
+            (row["name"],),
+        )
+        sql_row = await sql_cursor.fetchone()
+        if sql_row is None or sql_row["sql"] is None:
+            return False
+        normalized_sql = " ".join(str(sql_row["sql"]).lower().split())
+        if (
+            "on jobs(user_id)" in normalized_sql
+            and "where state in ('queued', 'active')" in normalized_sql
+        ):
+            return True
+    return False
+
+
+async def _ensure_deadline_column(conn: aiosqlite.Connection) -> None:
+    """Add the enqueue deadline column to databases created by older versions."""
+    cursor = await conn.execute("PRAGMA table_info('jobs')")
+    columns = {str(row["name"]) for row in await cursor.fetchall()}
+    if "deadline_at" not in columns:
+        await conn.execute("ALTER TABLE jobs ADD COLUMN deadline_at TEXT")
+
+
+async def _reconcile_duplicate_active_jobs(conn: aiosqlite.Connection) -> None:
+    """Keep the oldest live job per user before installing the unique index."""
+    cursor = await conn.execute(
+        """
+        SELECT rowid, job_id, user_id, state
+        FROM jobs
+        WHERE state IN ('queued', 'active')
+        ORDER BY user_id ASC, created_at ASC, rowid ASC
+        """
+    )
+    rows = await cursor.fetchall()
+    seen_users: set[int] = set()
+    now = datetime.now(UTC).isoformat()
+    for row in rows:
+        user_id = int(row["user_id"])
+        if user_id not in seen_users:
+            seen_users.add(user_id)
+            continue
+        current_state = str(row["state"])
+        replacement_state = "cancelled" if current_state == "queued" else "failed"
+        reason = (
+            "job cancelled during active-job index migration"
+            if replacement_state == "cancelled"
+            else "job failed during active-job index migration"
+        )
+        await conn.execute(
+            """
+            UPDATE jobs
+            SET state = ?, error = ?, updated_at = ?
+            WHERE rowid = ? AND state = ?
+            """,
+            (replacement_state, reason, now, row["rowid"], current_state),
+        )
+
+
+async def _ensure_active_job_index(conn: aiosqlite.Connection) -> None:
+    """Create the one-live-job index, replacing a malformed same-name index."""
+    cursor = await conn.execute("PRAGMA index_list('jobs')")
+    indexes = await cursor.fetchall()
+    current = next(
+        (row for row in indexes if str(row["name"]) == "ux_jobs_one_active_per_user"),
+        None,
+    )
+    if current is not None and int(current["unique"]) == 1 and int(current["partial"]) == 1:
+        sql_cursor = await conn.execute(
+            "SELECT sql FROM sqlite_master WHERE type = 'index' AND name = ?",
+            (current["name"],),
+        )
+        sql_row = await sql_cursor.fetchone()
+        if sql_row is not None and sql_row["sql"] is not None:
+            normalized_sql = " ".join(str(sql_row["sql"]).lower().split())
+            if (
+                "on jobs(user_id)" in normalized_sql
+                and "where state in ('queued', 'active')" in normalized_sql
+            ):
+                return
+    if current is not None:
+        await conn.execute("DROP INDEX ux_jobs_one_active_per_user")
+    await conn.execute(
+        """
+        CREATE UNIQUE INDEX ux_jobs_one_active_per_user
+        ON jobs(user_id) WHERE state IN ('queued', 'active')
+        """
+    )
 
 
 @asynccontextmanager
