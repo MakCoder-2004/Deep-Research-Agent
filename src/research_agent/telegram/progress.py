@@ -6,6 +6,7 @@ import asyncio
 import logging
 from collections import OrderedDict
 from enum import StrEnum
+from typing import TypedDict
 
 from aiogram import Bot
 from aiogram.exceptions import (
@@ -30,6 +31,16 @@ class ProgressStage(StrEnum):
     READING = "reading"
     CHECKING = "checking"
     PREPARING = "preparing"
+
+
+class ProgressState(TypedDict):
+    """Localized state for the status handler and other worker observers."""
+
+    chat_id: int
+    message_id: int
+    stage: str
+    lang: str
+    text: str
 
 
 STAGE_TEXT: dict[ProgressStage, dict[str, str]] = {
@@ -64,18 +75,61 @@ STAGE_TEXT: dict[ProgressStage, dict[str, str]] = {
 # from retaining stale entries if a process is interrupted mid-job.
 _MAX_PROGRESS_ENTRIES = 256
 _PROGRESS_REGISTRY: OrderedDict[str, tuple[int, int]] = OrderedDict()
+_PROGRESS_STATES: dict[str, ProgressState] = {}
 
 
 def _bound_progress_registry() -> None:
     """Evict the oldest progress targets when a job exits unexpectedly."""
     while len(_PROGRESS_REGISTRY) > _MAX_PROGRESS_ENTRIES:
-        _PROGRESS_REGISTRY.popitem(last=False)
+        job_id, _ = _PROGRESS_REGISTRY.popitem(last=False)
+        _PROGRESS_STATES.pop(job_id, None)
+
+
+def _resolve_stage(stage: ProgressStage | str) -> ProgressStage:
+    """Normalize an unknown stage to the safe initial stage."""
+    try:
+        return ProgressStage(stage)
+    except ValueError:
+        return ProgressStage.ANALYZING
+
+
+def _resolve_lang(lang: str) -> str:
+    """Normalize a Telegram language to one supported progress locale."""
+    return lang if lang in ("en", "ar") else "en"
+
+
+def _record_progress_state(
+    job_id: str,
+    chat_id: int,
+    message_id: int,
+    stage: ProgressStage,
+    lang: str,
+    text: str,
+) -> None:
+    """Record the latest localized stage without affecting edit failures."""
+    _PROGRESS_STATES[job_id] = {
+        "chat_id": chat_id,
+        "message_id": message_id,
+        "stage": stage.value,
+        "lang": lang,
+        "text": text,
+    }
 
 
 def register_progress(job_id: str, chat_id: int, message_id: int) -> None:
     """Store the chat/message IDs for a job's progress message."""
     _PROGRESS_REGISTRY.pop(job_id, None)
     _PROGRESS_REGISTRY[job_id] = (chat_id, message_id)
+    stage = ProgressStage.ANALYZING
+    lang = "en"
+    _record_progress_state(
+        job_id,
+        chat_id,
+        message_id,
+        stage,
+        lang,
+        format_initial_text(stage, job_id, None, lang),
+    )
     _bound_progress_registry()
 
 
@@ -84,9 +138,34 @@ def get_progress(job_id: str) -> tuple[int, int] | None:
     return _PROGRESS_REGISTRY.get(job_id)
 
 
+def get_progress_state(job_id: str) -> ProgressState | None:
+    """Return a copy of the latest localized stage state for a job."""
+    state = _PROGRESS_STATES.get(job_id)
+    if state is None:
+        return None
+    return {
+        "chat_id": state["chat_id"],
+        "message_id": state["message_id"],
+        "stage": state["stage"],
+        "lang": state["lang"],
+        "text": state["text"],
+    }
+
+
+def cleanup_progress(job_id: str) -> bool:
+    """Remove all progress state for a terminal job.
+
+    This API is intentionally synchronous so a worker can call it from any
+    terminal path without making Telegram edit failures part of job cleanup.
+    """
+    removed_target = _PROGRESS_REGISTRY.pop(job_id, None) is not None
+    removed_state = _PROGRESS_STATES.pop(job_id, None) is not None
+    return removed_target or removed_state
+
+
 def clear_progress(job_id: str) -> None:
-    """Remove a job's progress registry entry."""
-    _PROGRESS_REGISTRY.pop(job_id, None)
+    """Backward-compatible alias for :func:`cleanup_progress`."""
+    cleanup_progress(job_id)
 
 
 def format_initial_text(
@@ -96,17 +175,15 @@ def format_initial_text(
     lang: str,
 ) -> str:
     """Format the initial progress text with stage, short ID, and queue slot."""
-    try:
-        key = ProgressStage(stage)
-    except ValueError:
-        key = ProgressStage.ANALYZING
-    stage_line = STAGE_TEXT[key].get(lang, STAGE_TEXT[key]["en"])
+    key = _resolve_stage(stage)
+    resolved = _resolve_lang(lang)
+    stage_line = STAGE_TEXT[key][resolved]
     short_id = job_id[:8]
     if position is not None and position > 0:
-        if lang == "ar":
+        if resolved == "ar":
             return f"{stage_line}\nالمهمة {short_id} في قائمة الانتظار #{position}."
         return f"{stage_line}\nJob {short_id} queued #{position}."
-    if lang == "ar":
+    if resolved == "ar":
         return f"{stage_line}\nالمهمة {short_id}."
     return f"{stage_line}\nJob {short_id}."
 
@@ -197,11 +274,8 @@ async def update_progress(
     never sends a new message and never raises on edit failure.
     Returns True when the edit succeeded.
     """
-    try:
-        key = ProgressStage(stage)
-    except ValueError:
-        key = ProgressStage.ANALYZING
-    resolved = lang if lang in ("en", "ar") else "en"
+    key = _resolve_stage(stage)
+    resolved = _resolve_lang(lang)
     short = job_id[:8] if job_id else ""
     if short and position:
         text = format_stage_text(key, job_id or "", resolved, position)
@@ -210,6 +284,8 @@ async def update_progress(
     else:
         stage_line = STAGE_TEXT[key].get(resolved, STAGE_TEXT[key]["en"])
         text = stage_line
+    if job_id:
+        _record_progress_state(job_id, chat_id, message_id, key, resolved, text)
     return await safe_edit(bot, chat_id, message_id, text)
 
 
@@ -231,17 +307,13 @@ async def publish_progress(
     resolved = lang or pick_lang(user_lang)
     if resolved not in ("en", "ar"):
         resolved = "en"
-    if isinstance(stage, str):
-        try:
-            stage_key: ProgressStage | str = ProgressStage(stage)
-        except ValueError:
-            stage_key = ProgressStage.ANALYZING
-    else:
-        stage_key = stage
+    stage_key = _resolve_stage(stage)
+    resolved = _resolve_lang(resolved)
     text = format_initial_text(stage_key, job_id, position, resolved)
     sent = await message.answer(text)
     message_id = sent.message_id
     chat_id = message.chat.id
     if chat_id and message_id:
         register_progress(job_id, chat_id, message_id)
+        _record_progress_state(job_id, chat_id, message_id, stage_key, resolved, text)
     return message_id

@@ -14,10 +14,12 @@ from aiogram.methods import SendMessage
 
 from research_agent.telegram.progress import (
     ProgressStage,
+    cleanup_progress,
     clear_progress,
     format_initial_text,
     format_stage_text,
     get_progress,
+    get_progress_state,
     publish_progress,
     register_progress,
     safe_edit,
@@ -83,6 +85,37 @@ async def test_progress_registry_is_bounded_and_terminal_cleanup_is_idempotent()
         clear_progress(job_id)
         clear_progress(job_id)
     assert get_progress(job_ids[-1]) is None
+
+
+async def test_update_tracks_localized_stage_and_cleanup_api() -> None:
+    job_id = "job-progress-state"
+    cleanup_progress(job_id)
+    register_progress(job_id, 123, 777)
+    bot = _bot()
+
+    assert (
+        await update_progress(
+            bot,
+            123,
+            777,
+            ProgressStage.CHECKING,
+            "ar",
+            job_id=job_id,
+        )
+        is True
+    )
+    state = get_progress_state(job_id)
+    assert state is not None
+    assert state["chat_id"] == 123
+    assert state["message_id"] == 777
+    assert state["stage"] == ProgressStage.CHECKING.value
+    assert state["lang"] == "ar"
+    assert "التحقق" in state["text"]
+
+    assert cleanup_progress(job_id) is True
+    assert get_progress(job_id) is None
+    assert get_progress_state(job_id) is None
+    assert cleanup_progress(job_id) is False
 
 
 async def test_edit_failure_matrix_non_fatal() -> None:
