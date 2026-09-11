@@ -73,6 +73,18 @@ async def test_stage_texts_en_and_ar() -> None:
     clear_progress("x")
 
 
+async def test_progress_registry_is_bounded_and_terminal_cleanup_is_idempotent() -> None:
+    job_ids = [f"bounded-{index}" for index in range(300)]
+    for index, job_id in enumerate(job_ids):
+        register_progress(job_id, index, index + 1)
+    assert get_progress(job_ids[0]) is None
+    assert get_progress(job_ids[-1]) == (299, 300)
+    for job_id in job_ids:
+        clear_progress(job_id)
+        clear_progress(job_id)
+    assert get_progress(job_ids[-1]) is None
+
+
 async def test_edit_failure_matrix_non_fatal() -> None:
     method = SendMessage(chat_id=123, text="hi")
     bot = _bot()

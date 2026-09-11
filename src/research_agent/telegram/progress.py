@@ -4,8 +4,8 @@ from __future__ import annotations
 
 import asyncio
 import logging
+from collections import OrderedDict
 from enum import StrEnum
-from typing import Any
 
 from aiogram import Bot
 from aiogram.exceptions import (
@@ -60,12 +60,23 @@ STAGE_TEXT: dict[ProgressStage, dict[str, str]] = {
 }
 
 # job_id -> (chat_id, message_id) for the single editable progress message.
-_PROGRESS_REGISTRY: dict[str, tuple[int, int]] = {}
+# Terminal cleanup normally removes entries, but the cap protects the worker
+# from retaining stale entries if a process is interrupted mid-job.
+_MAX_PROGRESS_ENTRIES = 256
+_PROGRESS_REGISTRY: OrderedDict[str, tuple[int, int]] = OrderedDict()
+
+
+def _bound_progress_registry() -> None:
+    """Evict the oldest progress targets when a job exits unexpectedly."""
+    while len(_PROGRESS_REGISTRY) > _MAX_PROGRESS_ENTRIES:
+        _PROGRESS_REGISTRY.popitem(last=False)
 
 
 def register_progress(job_id: str, chat_id: int, message_id: int) -> None:
     """Store the chat/message IDs for a job's progress message."""
+    _PROGRESS_REGISTRY.pop(job_id, None)
     _PROGRESS_REGISTRY[job_id] = (chat_id, message_id)
+    _bound_progress_registry()
 
 
 def get_progress(job_id: str) -> tuple[int, int] | None:
@@ -110,7 +121,7 @@ def format_stage_text(
     return format_initial_text(stage, job_id, position, lang)
 
 
-async def safe_edit(bot: Bot | Any, chat_id: int, message_id: int, text: str) -> bool:
+async def safe_edit(bot: Bot, chat_id: int, message_id: int, text: str) -> bool:
     """Edit a message without ever failing the job.
 
     - ``TelegramBadRequest`` (e.g. message not modified/deleted): ok-continue.
@@ -171,7 +182,7 @@ async def safe_edit(bot: Bot | Any, chat_id: int, message_id: int, text: str) ->
 
 
 async def update_progress(
-    bot: Bot | Any,
+    bot: Bot,
     chat_id: int,
     message_id: int,
     stage: ProgressStage | str,
@@ -216,8 +227,7 @@ async def publish_progress(
     short-ID and queued #N slot, stores (chat_id, message_id) in the
     registry, and returns the message_id.
     """
-    from_user = getattr(message, "from_user", None)
-    user_lang = getattr(from_user, "language_code", None) if from_user is not None else None
+    user_lang = message.from_user.language_code if message.from_user is not None else None
     resolved = lang or pick_lang(user_lang)
     if resolved not in ("en", "ar"):
         resolved = "en"
@@ -230,12 +240,8 @@ async def publish_progress(
         stage_key = stage
     text = format_initial_text(stage_key, job_id, position, resolved)
     sent = await message.answer(text)
-    message_id = int(getattr(sent, "message_id", 0) or 0)
-    try:
-        chat = getattr(message, "chat", None)
-        chat_id = int(getattr(chat, "id", 0) or 0)
-    except (TypeError, ValueError):
-        chat_id = 0
+    message_id = sent.message_id
+    chat_id = message.chat.id
     if chat_id and message_id:
         register_progress(job_id, chat_id, message_id)
     return message_id
