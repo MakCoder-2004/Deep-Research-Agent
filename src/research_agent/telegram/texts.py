@@ -2,10 +2,31 @@
 
 from __future__ import annotations
 
-from collections.abc import Sequence
-from typing import Any
+from collections.abc import Mapping, Sequence
+from typing import Protocol, cast
 
 WHOAMI_TEMPLATE = "Your Telegram user ID is: {user_id}"
+
+
+class _StringKeyed(Protocol):
+    """Protocol for SQLite rows and other string-keyed payloads."""
+
+    def __getitem__(self, key: str, /) -> object:
+        ...
+
+
+def _get_field(item: object, key: str) -> object | None:
+    """Read a field from mappings, SQLite rows, or attribute objects."""
+    if isinstance(item, Mapping):
+        return cast(Mapping[str, object], item).get(key)
+    try:
+        return cast(_StringKeyed, item)[key]
+    except (KeyError, IndexError, TypeError):
+        pass
+    try:
+        return cast(object | None, getattr(item, key, None))
+    except Exception:  # noqa: BLE001, S110 - malformed rows are skipped
+        return None
 
 START_EN = (
     "Welcome to Deep Research Agent.\n\n"
@@ -116,14 +137,9 @@ def pick_lang(lang_code: str | None) -> str:
     return "en"
 
 
-# Shared localized-text table: single place for en/ar switching so callers
-# use _t(key, lang_code) instead of repeating pick_lang ternaries.
-_T: dict[str, dict[str, str]] = {
-    "unauthorized": {"en": UNAUTHORIZED_EN, "ar": UNAUTHORIZED_AR},
-    "unavailable": {"en": UNAVAILABLE_EN, "ar": UNAVAILABLE_AR},
-    "start": {"en": START_EN, "ar": START_AR},
-    "help": {"en": HELP_EN, "ar": HELP_AR},
-}
+# Shared localized-text table: all static EN/AR switching is resolved through
+# one table rather than mutating a collection of lazy per-function maps.
+_T: dict[str, dict[str, str]] = {}
 
 
 def _t(key: str, lang_code: str | None) -> str:
@@ -171,10 +187,7 @@ RESEARCH_USAGE_AR = (
 
 def render_research_usage(lang_code: str | None) -> str:
     """Render the /research usage reply (no job created)."""
-    lang = pick_lang(lang_code)
-    return _T.setdefault("research_usage", {"en": RESEARCH_USAGE_EN, "ar": RESEARCH_USAGE_AR}).get(
-        lang, RESEARCH_USAGE_EN
-    )
+    return _t("research_usage", lang_code)
 
 
 def render_research_accepted(query: str, job_id: str, lang_code: str | None) -> str:
@@ -197,9 +210,7 @@ NON_TEXT_AR = (
 
 def render_non_text(lang_code: str | None) -> str:
     """Render the gentle reply for non-text messages (no job created)."""
-    lang = pick_lang(lang_code)
-    table = _T.setdefault("non_text", {"en": NON_TEXT_EN, "ar": NON_TEXT_AR})
-    return table.get(lang, NON_TEXT_EN)
+    return _t("non_text", lang_code)
 
 
 INVALID_URL_EN = (
@@ -215,9 +226,7 @@ INVALID_URL_AR = (
 
 def render_invalid_url(lang_code: str | None) -> str:
     """Render the invalid-URL reply (no job created)."""
-    lang = pick_lang(lang_code)
-    table = _T.setdefault("invalid_url", {"en": INVALID_URL_EN, "ar": INVALID_URL_AR})
-    return table.get(lang, INVALID_URL_EN)
+    return _t("invalid_url", lang_code)
 
 
 STATUS_NONE_EN = "You have no active research job. Send /research <query> to start one."
@@ -268,8 +277,7 @@ def format_status(
         if query:
             base += f"\nQuery: {query}"
         return base
-    table = _T.setdefault("status_none", {"en": STATUS_NONE_EN, "ar": STATUS_NONE_AR})
-    return table.get(lang, STATUS_NONE_EN)
+    return _t("status_none", lang_code)
 
 
 CANCELLED_EN_TEMPLATE = "Your active research job {job_id} has been cancelled."
@@ -280,16 +288,12 @@ CANCEL_NONE_AR = "ليس لديك مهمة بحث نشطة لإلغائها."
 
 def render_cancelled(job_id: str, lang_code: str | None) -> str:
     """Render the cancellation confirmation, preserving the job ID verbatim."""
-    lang = pick_lang(lang_code)
-    table = _T.setdefault("cancelled", {"en": CANCELLED_EN_TEMPLATE, "ar": CANCELLED_AR_TEMPLATE})
-    return table.get(lang, CANCELLED_EN_TEMPLATE).format(job_id=job_id)
+    return _t("cancelled", lang_code).format(job_id=job_id)
 
 
 def render_cancel_none(lang_code: str | None) -> str:
     """Render the no-active-job reply for /cancel."""
-    lang = pick_lang(lang_code)
-    table = _T.setdefault("cancel_none", {"en": CANCEL_NONE_EN, "ar": CANCEL_NONE_AR})
-    return table.get(lang, CANCEL_NONE_EN)
+    return _t("cancel_none", lang_code)
 
 
 BUSY_EN_TEMPLATE = "You already have active job {job_id}. Use /status or /cancel."
@@ -322,23 +326,18 @@ REPORT_NOT_FOUND_EN = "Report not found. Use /history to list your recent report
 REPORT_NOT_FOUND_AR = "التقرير غير موجود. استخدم /history لعرض تقاريرك الأخيرة."
 
 
-def format_history(reports: Sequence[Any] | None, lang_code: str | None) -> str:
+def format_history(reports: Sequence[object] | None, lang_code: str | None) -> str:
     """Format the /history reply for the last reports (owner-scoped)."""
     items = list(reports) if reports else []
     lang = pick_lang(lang_code)
     if not items:
-        table = _T.setdefault("history_empty", {"en": HISTORY_EMPTY_EN, "ar": HISTORY_EMPTY_AR})
-        return table.get(lang, HISTORY_EMPTY_EN)
-    header_table = _T.setdefault(
-        "history_header", {"en": HISTORY_HEADER_EN, "ar": HISTORY_HEADER_AR}
-    )
-    header = header_table.get(lang, HISTORY_HEADER_EN).format(n=len(items))
+        return _t("history_empty", lang_code)
+    header = _t("history_header", lang_code).format(n=len(items))
     lines = [header]
     for row in items:
-        try:
-            report_id = row["report_id"]
-            topic = row["topic"]
-        except Exception:  # noqa: BLE001, S112 - tolerate dict/Row shapes
+        report_id = _get_field(row, "report_id")
+        topic = _get_field(row, "topic")
+        if report_id is None or topic is None:
             continue
         lines.append(f"- {report_id}: {topic}")
     lines.append(
@@ -351,28 +350,23 @@ def format_history(reports: Sequence[Any] | None, lang_code: str | None) -> str:
 
 def render_report_usage(lang_code: str | None) -> str:
     """Render the /report usage reply (no lookup performed)."""
-    lang = pick_lang(lang_code)
-    table = _T.setdefault("report_usage", {"en": REPORT_USAGE_EN, "ar": REPORT_USAGE_AR})
-    return table.get(lang, REPORT_USAGE_EN)
+    return _t("report_usage", lang_code)
 
 
 def render_report_not_found(lang_code: str | None) -> str:
     """Render the unknown-or-unowned report reply."""
-    lang = pick_lang(lang_code)
-    table = _T.setdefault(
-        "report_not_found", {"en": REPORT_NOT_FOUND_EN, "ar": REPORT_NOT_FOUND_AR}
-    )
-    return table.get(lang, REPORT_NOT_FOUND_EN)
+    return _t("report_not_found", lang_code)
 
 
-def format_report_bundle(report: Any, sources: Sequence[Any] | None, lang_code: str | None) -> str:
+def format_report_bundle(
+    report: object, sources: Sequence[object] | None, lang_code: str | None
+) -> str:
     """Format a retrieved report with readable [1] citation markers."""
     lang = pick_lang(lang_code)
-    try:
-        topic = report["topic"]
-        summary = report["summary"]
-        report_id = report["report_id"]
-    except Exception:  # noqa: BLE001 - caller guarantees a valid report row
+    topic = _get_field(report, "topic")
+    summary = _get_field(report, "summary")
+    report_id = _get_field(report, "report_id")
+    if topic is None or summary is None or report_id is None:
         return render_report_not_found(lang_code)
     src_list = list(sources) if sources else []
     if lang == "ar":
@@ -380,10 +374,9 @@ def format_report_bundle(report: Any, sources: Sequence[Any] | None, lang_code: 
     else:
         lines = [f"Report: {topic}", f"ID: {report_id}", "", str(summary), "", "Sources:"]
     for idx, src in enumerate(src_list, start=1):
-        try:
-            title = src["title"]
-            url = src["url"]
-        except Exception:  # noqa: BLE001, S112 - skip malformed source rows
+        title = _get_field(src, "title")
+        url = _get_field(src, "url")
+        if title is None or url is None:
             continue
         lines.append(f"[{idx}] {title} - {url}")
     return "\n".join(lines)
@@ -395,9 +388,7 @@ FORGET_DONE_AR = "تم مسح جلستك المؤقتة. تم الاحتفاظ �
 
 def render_forget_done(lang_code: str | None) -> str:
     """Render the /forget confirmation (jobs and reports are kept)."""
-    lang = pick_lang(lang_code)
-    table = _T.setdefault("forget_done", {"en": FORGET_DONE_EN, "ar": FORGET_DONE_AR})
-    return table.get(lang, FORGET_DONE_EN)
+    return _t("forget_done", lang_code)
 
 
 LANGUAGE_USAGE_EN = "Usage: /language <en|ar> - e.g. /language en or /language ar."
@@ -408,18 +399,12 @@ LANGUAGE_INVALID_AR = "لغة غير صالحة. الاستخدام: /language <
 
 def render_language_usage(lang_code: str | None) -> str:
     """Render the /language usage reply."""
-    lang = pick_lang(lang_code)
-    table = _T.setdefault("language_usage", {"en": LANGUAGE_USAGE_EN, "ar": LANGUAGE_USAGE_AR})
-    return table.get(lang, LANGUAGE_USAGE_EN)
+    return _t("language_usage", lang_code)
 
 
 def render_language_invalid(lang_code: str | None) -> str:
     """Render the invalid-argument reply for /language."""
-    lang = pick_lang(lang_code)
-    table = _T.setdefault(
-        "language_invalid", {"en": LANGUAGE_INVALID_EN, "ar": LANGUAGE_INVALID_AR}
-    )
-    return table.get(lang, LANGUAGE_INVALID_EN)
+    return _t("language_invalid", lang_code)
 
 
 def render_language_current(current: str, lang_code: str | None) -> str:
@@ -465,6 +450,31 @@ FINANCIAL_DISCLAIMER_EN = (
 FINANCIAL_DISCLAIMER_AR = (
     "تنبيه مالي: هذا البحث لأغراض معلوماتية فقط وليس استشارة مالية. استشر مختصًا مؤهلًا."
 )
+
+
+# Populate the complete table after every static string has been declared.
+_T.update(
+    {
+        "unauthorized": {"en": UNAUTHORIZED_EN, "ar": UNAUTHORIZED_AR},
+        "unavailable": {"en": UNAVAILABLE_EN, "ar": UNAVAILABLE_AR},
+        "start": {"en": START_EN, "ar": START_AR},
+        "help": {"en": HELP_EN, "ar": HELP_AR},
+        "research_usage": {"en": RESEARCH_USAGE_EN, "ar": RESEARCH_USAGE_AR},
+        "non_text": {"en": NON_TEXT_EN, "ar": NON_TEXT_AR},
+        "invalid_url": {"en": INVALID_URL_EN, "ar": INVALID_URL_AR},
+        "status_none": {"en": STATUS_NONE_EN, "ar": STATUS_NONE_AR},
+        "cancelled": {"en": CANCELLED_EN_TEMPLATE, "ar": CANCELLED_AR_TEMPLATE},
+        "cancel_none": {"en": CANCEL_NONE_EN, "ar": CANCEL_NONE_AR},
+        "history_empty": {"en": HISTORY_EMPTY_EN, "ar": HISTORY_EMPTY_AR},
+        "history_header": {"en": HISTORY_HEADER_EN, "ar": HISTORY_HEADER_AR},
+        "report_usage": {"en": REPORT_USAGE_EN, "ar": REPORT_USAGE_AR},
+        "report_not_found": {"en": REPORT_NOT_FOUND_EN, "ar": REPORT_NOT_FOUND_AR},
+        "forget_done": {"en": FORGET_DONE_EN, "ar": FORGET_DONE_AR},
+        "language_usage": {"en": LANGUAGE_USAGE_EN, "ar": LANGUAGE_USAGE_AR},
+        "language_invalid": {"en": LANGUAGE_INVALID_EN, "ar": LANGUAGE_INVALID_AR},
+    }
+)
+
 
 _HIGH_STAKES_TABLE: dict[str, dict[str, str]] = {
     "medical": {"en": MEDICAL_DISCLAIMER_EN, "ar": MEDICAL_DISCLAIMER_AR},
