@@ -797,7 +797,7 @@ async def deliver_report(
             except AttributeError:
                 # Python < 3.9 fallback: compare parts manually.
                 if base.parts != resolved.parts[: len(base.parts)]:
-                    await _send_caption_as_text(message, caption)
+                    await _send_caption_as_text(message, safe_caption)
                     return False
             path = resolved
         if not path.is_file():
