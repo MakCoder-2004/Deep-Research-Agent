@@ -10,6 +10,7 @@ from research_agent.persistence.database import open_db
 from research_agent.telegram.handlers import router, whoami_handler
 from research_agent.telegram.middlewares import AllowlistMiddleware
 from research_agent.telegram.texts import UNAUTHORIZED_EN
+from research_agent.telegram.validators import MAX_URL_CHARS, is_accepted_url
 
 
 def _make_message(
@@ -136,3 +137,23 @@ async def test_allowed_group_user_passes_allowlist(tmp_path: Path) -> None:
         assert result == "ok"
         handler.assert_awaited_once()
         assert await _job_count(conn) == 0
+
+
+def test_url_validator_rejects_all_userinfo_and_unsupported_schemes() -> None:
+    accepted = [
+        "https://example.com",
+        "http://example.com/path?q=1",
+    ]
+    rejected = [
+        "https://user:password@example.com",
+        "https://@example.com",
+        "https://:@example.com",
+        "javascript:alert(1)",
+        "file:///tmp/report",
+        "ftp://example.com/report",
+        "https://example.com/" + "x" * MAX_URL_CHARS,
+    ]
+    for url in accepted:
+        assert is_accepted_url(url)
+    for url in rejected:
+        assert not is_accepted_url(url)

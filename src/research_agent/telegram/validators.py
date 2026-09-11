@@ -51,11 +51,12 @@ def is_accepted_url(value: str) -> bool:
     scheme = parts.scheme.lower()
     if scheme not in ("http", "https"):
         return False
+    # Reject every form of userinfo, including empty credentials such as
+    # ``https://@example.com`` and ``https://:@example.com``.
+    if "@" in parts.netloc:
+        return False
     # Reject embedded credentials (user:pass@host).
     if parts.username or parts.password:
-        return False
-    if "@" in parts.netloc and (parts.username is None):
-        # Covers malformed userinfo that urlsplit did not parse as username.
         return False
     if not parts.hostname:
         return False
