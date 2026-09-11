@@ -18,6 +18,7 @@ from research_agent.telegram.bot import (
     start_queue_worker,
     stop_queue_worker,
 )
+from research_agent.telegram.texts import TelegramLimits
 
 
 def _collect_secrets(settings: Settings) -> list[str]:
@@ -64,16 +65,19 @@ async def run_telegram(settings: Settings) -> None:
             job_queue=queue,
             reports_dir=settings.reports_dir,
             bot=bot,
+            limits=TelegramLimits.from_settings(settings),
         )
         await start_queue_worker(dp, queue, bot)
         await start_polling(bot, dp)
     finally:
-        if dp is not None:
-            await stop_queue_worker(dp)
-        else:
-            await queue.stop()
-        set_default_queue(None)
-        await bot.session.close()
+        try:
+            if dp is not None:
+                await stop_queue_worker(dp, queue)
+            else:
+                await queue.stop()
+        finally:
+            set_default_queue(None)
+            await bot.session.close()
 
 
 def main() -> None:
