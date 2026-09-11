@@ -9,7 +9,10 @@ from unittest.mock import AsyncMock, MagicMock
 from research_agent.persistence.database import open_db
 from research_agent.telegram.handlers import router, whoami_handler
 from research_agent.telegram.middlewares import AllowlistMiddleware, is_allowed
-from research_agent.telegram.texts import UNAUTHORIZED_AR, UNAUTHORIZED_EN
+from research_agent.telegram.texts import (
+    UNAUTHORIZED_AR,
+    UNAUTHORIZED_EN,
+)
 
 
 def test_is_allowed() -> None:
@@ -145,7 +148,7 @@ async def test_authorized_passes_research_handler() -> None:
     message.answer.assert_not_awaited()
 
 
-async def test_allowed_user_passes_from_group() -> None:
+async def test_allowed_user_passes_allowlist_from_group() -> None:
     middleware = AllowlistMiddleware({123})
     message = _make_message(123, "en", "group")
     research_obj = _handler_by_name("research_handler")
@@ -154,6 +157,18 @@ async def test_allowed_user_passes_from_group() -> None:
     assert result == "ok"
     handler.assert_awaited_once()
     message.answer.assert_not_awaited()
+
+
+async def test_harmless_start_help_whoami_are_allowed_in_groups() -> None:
+    middleware = AllowlistMiddleware({123})
+    for handler_name in ("start_handler", "help_handler", "whoami_handler"):
+        message = _make_message(123, "en", "group")
+        handler_obj = _handler_by_name(handler_name)
+        handler = AsyncMock(return_value="ok")
+        result = await middleware(handler, message, {"handler": handler_obj})
+        assert result == "ok"
+        handler.assert_awaited_once()
+        message.answer.assert_not_awaited()
 
 
 async def test_group_supergroup_blocked() -> None:

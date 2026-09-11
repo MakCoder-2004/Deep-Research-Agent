@@ -13,6 +13,7 @@ from research_agent.persistence.repositories import (
     ReportRepository,
     SessionRepository,
     SourceRepository,
+    ToolRunRepository,
     UserRepository,
 )
 from research_agent.telegram.handlers import (
@@ -26,13 +27,14 @@ def _msg(
     user_id: int | None,
     text: str | None,
     lang: str | None = "en",
+    chat_type: str = "private",
 ) -> MagicMock:
     message = MagicMock()
     if user_id is None:
         message.from_user = None
     else:
         message.from_user = SimpleNamespace(id=user_id, language_code=lang)
-    message.chat = SimpleNamespace(id=user_id or 0, type="private")
+    message.chat = SimpleNamespace(id=user_id or 0, type=chat_type)
     message.text = text
     message.answer = AsyncMock(return_value=SimpleNamespace(message_id=21))
     message.answer_document = AsyncMock()
@@ -110,6 +112,16 @@ async def test_history_empty(tmp_path: Path) -> None:
         assert "no saved reports" in reply.lower() or "لا توجد" in reply
 
 
+async def test_history_prefers_stored_language(tmp_path: Path) -> None:
+    db_path = tmp_path / "history_language.db"
+    async with open_db(db_path) as conn:
+        await UserRepository().upsert(conn, 111, "ar")
+        await _seed_report(conn, 111, "job-lang", "rep-lang", "موضوع", "ملخص")
+        message = _msg(111, "/history", "en")
+        await history_handler(message, conn=conn)
+        assert "تقاريرك الأخيرة" in message.answer.call_args[0][0]
+
+
 async def test_report_found_not_found_forbidden(tmp_path: Path) -> None:
     db_path = tmp_path / "report.db"
     async with open_db(db_path) as conn:
@@ -136,6 +148,73 @@ async def test_report_found_not_found_forbidden(tmp_path: Path) -> None:
         await report_handler(usage, conn=conn)
         usage_reply = usage.answer.call_args[0][0]
         assert "Usage" in usage_reply or "الاستخدام" in usage_reply
+
+
+async def test_group_report_is_rejected_without_exposing_report_data(tmp_path: Path) -> None:
+    db_path = tmp_path / "group_report.db"
+    async with open_db(db_path) as conn:
+        await _seed_report(conn, 111, "job-group", "rep-group", "Secret topic", "Secret summary")
+        message = _msg(111, "/report rep-group", "en", chat_type="supergroup")
+        await report_handler(message, conn=conn)
+        reply = message.answer.call_args[0][0]
+        assert "private chat" in reply
+        assert "Secret topic" not in reply
+        assert "Secret summary" not in reply
+
+
+async def test_invalid_report_fallback_is_generic(tmp_path: Path) -> None:
+    db_path = tmp_path / "invalid_report.db"
+    async with open_db(db_path) as conn:
+        await JobRepository().create(
+            conn,
+            job_id="job-invalid",
+            user_id=111,
+            query="Invalid topic",
+            state="completed",
+        )
+        await ReportRepository().save(
+            conn,
+            report_id="rep-invalid",
+            job_id="job-invalid",
+            topic="Stored secret topic",
+            summary="Stored secret summary",
+            markdown_path="data/reports/research-rep-invalid.md",
+            tools_used=[],
+        )
+        await conn.commit()
+        message = _msg(111, "/report rep-invalid", "en")
+        await report_handler(message, conn=conn)
+        reply = message.answer.call_args[0][0]
+        assert "could not be displayed safely" in reply
+        assert "Stored secret topic" not in reply
+        assert "Stored secret summary" not in reply
+
+
+async def test_report_tools_mismatch_is_omitted(tmp_path: Path) -> None:
+    db_path = tmp_path / "tools_mismatch.db"
+    async with open_db(db_path) as conn:
+        await _seed_report(
+            conn,
+            111,
+            "job-mismatch",
+            "rep-mismatch",
+            "Mismatch topic",
+            "Mismatch summary",
+            tools=["model_claimed_tool"],
+        )
+        await ToolRunRepository().record(
+            conn,
+            job_id="job-mismatch",
+            tool_name="actual_tool",
+            success=True,
+        )
+        await conn.commit()
+        message = _msg(111, "/report rep-mismatch", "en")
+        await report_handler(message, conn=conn)
+        text = "\n".join(call.args[0] for call in message.answer.call_args_list if call.args)
+        assert "Tools:" not in text
+        assert "model_claimed_tool" not in text
+        assert "actual_tool" not in text
 
 
 async def test_forget_deletes_sessions_keeps_reports(tmp_path: Path) -> None:

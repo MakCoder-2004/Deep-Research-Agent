@@ -5,12 +5,19 @@ from __future__ import annotations
 import asyncio
 from pathlib import Path
 from types import SimpleNamespace
-from unittest.mock import AsyncMock, MagicMock
+from unittest.mock import AsyncMock, MagicMock, patch
 
+from research_agent.models import JobState
 from research_agent.persistence.database import open_db
 from research_agent.persistence.repositories import UserRepository
-from research_agent.services.queue import BoundedJobQueue, get_user_active_job
+from research_agent.services.queue import (
+    BoundedJobQueue,
+    enqueue_request,
+    get_user_active_job,
+    set_state,
+)
 from research_agent.telegram.handlers import (
+    cancel_handler,
     handle_research_request,
     help_handler,
     language_handler,
@@ -18,20 +25,23 @@ from research_agent.telegram.handlers import (
     plaintext_handler,
     research_handler,
     start_handler,
+    status_handler,
 )
+from research_agent.telegram.texts import TelegramLimits
 
 
 def _msg(
     user_id: int | None,
     text: str | None,
     lang: str | None = "en",
+    chat_type: str = "private",
 ) -> MagicMock:
     message = MagicMock()
     if user_id is None:
         message.from_user = None
     else:
         message.from_user = SimpleNamespace(id=user_id, language_code=lang)
-    message.chat = SimpleNamespace(id=user_id or 0, type="private")
+    message.chat = SimpleNamespace(id=user_id or 0, type=chat_type)
     message.text = text
     message.answer = AsyncMock(return_value=SimpleNamespace(message_id=11))
     message.answer_document = AsyncMock()
@@ -68,6 +78,18 @@ async def test_start_arabic_upserts_ar(tmp_path: Path) -> None:
         assert str(row["language"]) == "ar"
 
 
+async def test_start_does_not_overwrite_stored_language(tmp_path: Path) -> None:
+    db_path = tmp_path / "stored_start_language.db"
+    async with open_db(db_path) as conn:
+        await UserRepository().upsert(conn, 124, "ar")
+        await conn.commit()
+        message = _msg(124, "/start", "en")
+        await start_handler(message, conn=conn)
+        assert "وكيل البحث" in message.answer.call_args[0][0]
+        row = await UserRepository().get(conn, 124)
+        assert row is not None and str(row["language"]) == "ar"
+
+
 async def test_help_replies_without_job(tmp_path: Path) -> None:
     db_path = tmp_path / "help.db"
     async with open_db(db_path) as conn:
@@ -75,6 +97,49 @@ async def test_help_replies_without_job(tmp_path: Path) -> None:
         await help_handler(message)
         reply = message.answer.call_args[0][0]
         assert "/research" in reply
+        assert await _job_count_for(conn, 123) == 0
+
+
+async def test_normal_handlers_prefer_stored_language(tmp_path: Path) -> None:
+    db_path = tmp_path / "stored_language.db"
+    async with open_db(db_path) as conn:
+        await UserRepository().upsert(conn, 123, "ar")
+        await conn.commit()
+        help_message = _msg(123, "/help", "en")
+        await help_handler(help_message, conn=conn)
+        assert "كيفية استخدام" in help_message.answer.call_args[0][0]
+        research_message = _msg(123, "/research stored language", "en")
+        await research_handler(research_message, conn=conn)
+        assert "تم استلام" in research_message.answer.call_args_list[0][0][0]
+
+
+async def test_custom_limits_are_passed_to_capability_responses(tmp_path: Path) -> None:
+    db_path = tmp_path / "custom_limits.db"
+    limits = TelegramLimits(
+        max_concurrent_jobs=2,
+        max_active_per_user=3,
+        job_timeout_seconds=45,
+        report_retention_days=7,
+    )
+    async with open_db(db_path) as conn:
+        message = _msg(123, "/start", "en")
+        await start_handler(message, conn=conn, limits=limits)
+        reply = message.answer.call_args[0][0]
+        assert "2 concurrent jobs globally" in reply
+        assert "3 active jobs per user" in reply
+        assert "45s job timeout" in reply
+        assert "reports kept 7 days" in reply
+
+
+async def test_group_research_is_rejected_without_creating_a_job(tmp_path: Path) -> None:
+    db_path = tmp_path / "group_research.db"
+    async with open_db(db_path) as conn:
+        await UserRepository().upsert(conn, 123, "ar")
+        await conn.commit()
+        message = _msg(123, "/research group secret", "en", chat_type="group")
+        await research_handler(message, conn=conn)
+        reply = message.answer.call_args[0][0]
+        assert "الخصوصية" in reply
         assert await _job_count_for(conn, 123) == 0
 
 
@@ -120,6 +185,43 @@ async def test_plaintext_empty_no_job(tmp_path: Path) -> None:
         message = _msg(123, "   ", "en")
         await plaintext_handler(message, conn=conn)
         assert await _job_count_for(conn, 123) == 0
+
+
+async def test_status_uses_current_progress_stage_and_stored_language(
+    tmp_path: Path, monkeypatch
+) -> None:
+    db_path = tmp_path / "status_stage.db"
+    async with open_db(db_path) as conn:
+        await UserRepository().upsert(conn, 123, "ar")
+        job = await enqueue_request(conn, 123, "stage query")
+        await set_state(conn, job.job_id, JobState.ACTIVE)
+        monkeypatch.setattr(
+            "research_agent.telegram.progress.get_progress",
+            lambda _job_id: (123, 11, "reading"),
+        )
+        message = _msg(123, "/status", "en")
+        await status_handler(message, conn=conn)
+        reply = message.answer.call_args[0][0]
+        assert "قراءة المصادر" in reply
+        assert "reading" not in reply
+
+
+async def test_cancel_race_does_not_claim_a_completed_job(tmp_path: Path) -> None:
+    db_path = tmp_path / "cancel_race.db"
+    async with open_db(db_path) as conn:
+        job = await enqueue_request(conn, 123, "race query")
+        await set_state(conn, job.job_id, JobState.ACTIVE)
+        message = _msg(123, "/cancel", "en")
+        with patch(
+            "research_agent.telegram.handlers.cancel_user_job",
+            new_callable=AsyncMock,
+            side_effect=ValueError("terminal transition won the race"),
+        ) as cancel:
+            await cancel_handler(message, conn=conn)
+        cancel.assert_awaited_once_with(conn, 123)
+        reply = message.answer.call_args[0][0]
+        assert "no active" in reply.lower()
+        assert job.job_id not in reply
 
 
 async def test_non_text_ignored_no_job(tmp_path: Path) -> None:
@@ -247,5 +349,8 @@ async def test_research_with_live_queue_reaches_terminal_state(tmp_path: Path) -
             row = await cursor.fetchone()
         assert row is not None and int(row["n"]) == 1
         assert str(row["state"]) == "completed"
+        from research_agent.telegram.progress import get_progress
+
+        assert get_progress(result.job_id) is None
     finally:
         await queue.stop()

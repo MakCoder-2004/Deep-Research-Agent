@@ -21,9 +21,9 @@ class AllowlistMiddleware(BaseMiddleware):
     """Block messages from users missing from the numeric allowlist.
 
     Handlers flagged with ``allow_unauthorized=True`` (e.g. ``/whoami``)
-    bypass the check so users can discover their numeric ID. An allowlisted
-    sender may also use the bot from a group or supergroup; unauthorized
-    senders remain blocked regardless of chat type.
+    bypass the check so users can discover their numeric ID. Group privacy is
+    enforced by the command handlers, which can resolve stored language for a
+    localized private-chat response.
     """
 
     def __init__(self, allowed_user_ids: set[int]) -> None:
@@ -35,14 +35,16 @@ class AllowlistMiddleware(BaseMiddleware):
         event: TelegramObject,
         data: dict[str, Any],
     ) -> Any:
+        from_user: Any = getattr(event, "from_user", None)
         if get_flag(data, "allow_unauthorized", default=False):
             return await handler(event, data)
-        from_user: Any = getattr(event, "from_user", None)
         user_id: int | None = from_user.id if from_user is not None else None
         if not is_allowed(user_id, self.allowed_user_ids):
-            lang_code = getattr(from_user, "language_code", None) if from_user is not None else None
+            telegram_lang = (
+                getattr(from_user, "language_code", None) if from_user is not None else None
+            )
             answer = getattr(event, "answer", None)
             if callable(answer):
-                await answer(pick_unauthorized(lang_code))
+                await answer(pick_unauthorized(telegram_lang))
             return None
         return await handler(event, data)

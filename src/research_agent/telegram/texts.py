@@ -3,9 +3,52 @@
 from __future__ import annotations
 
 from collections.abc import Mapping, Sequence
-from typing import Protocol, cast
+from dataclasses import dataclass
+from typing import TYPE_CHECKING, Protocol, cast
+
+if TYPE_CHECKING:
+    from research_agent.config import Settings
 
 WHOAMI_TEMPLATE = "Your Telegram user ID is: {user_id}"
+
+
+@dataclass(frozen=True, slots=True)
+class TelegramLimits:
+    """Immutable user-visible limits copied from runtime settings."""
+
+    max_concurrent_jobs: int = 3
+    max_active_per_user: int = 1
+    job_timeout_seconds: int = 300
+    report_retention_days: int = 90
+    repair_cycles: int = 1
+    session_ttl_hours: int = 24
+    session_max_interactions: int = 6
+
+    @property
+    def active_jobs_en(self) -> str:
+        """Return a readable English active-job limit."""
+        noun = "job" if self.max_active_per_user == 1 else "jobs"
+        return f"{self.max_active_per_user} active {noun}"
+
+    @property
+    def active_jobs_ar(self) -> str:
+        """Return a readable Arabic active-job limit."""
+        if self.max_active_per_user == 1:
+            return "مهمة نشطة واحدة"
+        return f"{self.max_active_per_user} مهام نشطة"
+
+    @classmethod
+    def from_settings(cls, settings: Settings) -> TelegramLimits:
+        """Build the display context from validated application settings."""
+        return cls(
+            max_concurrent_jobs=int(settings.max_concurrent_jobs),
+            max_active_per_user=int(settings.max_active_per_user),
+            job_timeout_seconds=int(settings.job_timeout_seconds),
+            report_retention_days=int(settings.report_retention_days),
+            repair_cycles=int(settings.repair_cycles),
+            session_ttl_hours=int(settings.session_ttl_hours),
+            session_max_interactions=int(settings.session_max_interactions),
+        )
 
 
 class _StringKeyed(Protocol):
@@ -43,9 +86,11 @@ START_EN = (
     "/help - show examples and limits\n"
     "/whoami - show your numeric Telegram ID\n\n"
     "Plain text works like /research.\n\n"
-    "Limits: trusted users only (numeric allowlist); 3 concurrent jobs globally "
-    "with 1 active job per user; 300s job timeout with 1 repair cycle; "
-    "reports kept 90 days; sessions kept 24h or last 6 interactions.\n"
+    "Limits: trusted users only (numeric allowlist); "
+    "{max_concurrent_jobs} concurrent jobs globally "
+    "with {active_jobs_en} per user; {job_timeout_seconds}s job timeout with "
+    "{repair_cycles} repair cycle(s); reports kept {report_retention_days} days; sessions kept "
+    "{session_ttl_hours}h or last {session_max_interactions} interactions.\n"
     "Daily quotas coming soon (M9)."
 )
 
@@ -63,9 +108,11 @@ START_AR = (
     "/help - عرض الأمثلة والحدود\n"
     "/whoami - عرض معرّف تيليجرام الرقمي الخاص بك\n\n"
     "النص العادي يعمل مثل /research.\n\n"
-    "الحدود: للمستخدمين الموثوقين فقط (قائمة سماح رقمية)؛ 3 مهام متزامنة عالميًا "
-    "مع مهمة نشطة واحدة لكل مستخدم؛ مهلة 300 ثانية مع دورة إصلاح واحدة؛ "
-    "تُحفظ التقارير 90 يومًا؛ وتُحفظ الجلسات 24 ساعة أو آخر 6 تفاعلات.\n"
+    "الحدود: للمستخدمين الموثوقين فقط (قائمة سماح رقمية)؛ "
+    "{max_concurrent_jobs} مهام متزامنة عالميًا "
+    "مع {active_jobs_ar} لكل مستخدم؛ مهلة {job_timeout_seconds} ثانية مع "
+    "{repair_cycles} دورة إصلاح؛ تُحفظ التقارير {report_retention_days} يومًا؛ وتُحفظ الجلسات "
+    "{session_ttl_hours} ساعة أو آخر {session_max_interactions} تفاعلات.\n"
     "الحصص اليومية قادمة قريبًا (M9)."
 )
 
@@ -84,9 +131,10 @@ HELP_EN = (
     "/forget - clear your temporary session\n"
     "/language <en|ar> - choose English or Arabic\n"
     "/whoami - show your numeric Telegram ID\n\n"
-    "Limits: trusted users only; 3 concurrent jobs globally "
-    "with 1 active job per user; 300s job timeout with 1 repair cycle; "
-    "reports kept 90 days; sessions kept 24h or last 6 interactions.\n"
+    "Limits: trusted users only; {max_concurrent_jobs} concurrent jobs globally "
+    "with {active_jobs_en} per user; {job_timeout_seconds}s job timeout with "
+    "{repair_cycles} repair cycle(s); reports kept {report_retention_days} days; sessions kept "
+    "{session_ttl_hours}h or last {session_max_interactions} interactions.\n"
     "Daily quotas coming soon (M9)."
 )
 
@@ -105,9 +153,10 @@ HELP_AR = (
     "/forget - مسح جلستك المؤقتة\n"
     "/language <en|ar> - اختيار العربية أو الإنجليزية\n"
     "/whoami - عرض معرّف تيليجرام الرقمي الخاص بك\n\n"
-    "الحدود: للمستخدمين الموثوقين فقط؛ 3 مهام متزامنة عالميًا "
-    "مع مهمة نشطة واحدة لكل مستخدم؛ مهلة 300 ثانية مع دورة إصلاح واحدة؛ "
-    "تُحفظ التقارير 90 يومًا؛ وتُحفظ الجلسات 24 ساعة أو آخر 6 تفاعلات.\n"
+    "الحدود: للمستخدمين الموثوقين فقط؛ {max_concurrent_jobs} مهام متزامنة عالميًا "
+    "مع {active_jobs_ar} لكل مستخدم؛ مهلة {job_timeout_seconds} ثانية مع "
+    "{repair_cycles} دورة إصلاح؛ تُحفظ التقارير {report_retention_days} يومًا؛ وتُحفظ الجلسات "
+    "{session_ttl_hours} ساعة أو آخر {session_max_interactions} تفاعلات.\n"
     "الحصص اليومية قادمة قريبًا (M9)."
 )
 
@@ -162,14 +211,30 @@ def render_unavailable(lang_code: str | None) -> str:
     return _t("unavailable", lang_code)
 
 
-def render_start(lang_code: str | None) -> str:
+def _render_with_limits(key: str, lang_code: str | None, limits: TelegramLimits | None) -> str:
+    """Render a capability message with the validated runtime limits."""
+    selected = limits or TelegramLimits()
+    return _t(key, lang_code).format(
+        max_concurrent_jobs=selected.max_concurrent_jobs,
+        max_active_per_user=selected.max_active_per_user,
+        active_jobs_en=selected.active_jobs_en,
+        active_jobs_ar=selected.active_jobs_ar,
+        job_timeout_seconds=selected.job_timeout_seconds,
+        repair_cycles=selected.repair_cycles,
+        report_retention_days=selected.report_retention_days,
+        session_ttl_hours=selected.session_ttl_hours,
+        session_max_interactions=selected.session_max_interactions,
+    )
+
+
+def render_start(lang_code: str | None, limits: TelegramLimits | None = None) -> str:
     """Render the /start capability and restriction message."""
-    return _t("start", lang_code)
+    return _render_with_limits("start", lang_code, limits)
 
 
-def render_help(lang_code: str | None) -> str:
+def render_help(lang_code: str | None, limits: TelegramLimits | None = None) -> str:
     """Render the /help examples and limits message."""
-    return _t("help", lang_code)
+    return _render_with_limits("help", lang_code, limits)
 
 
 RESEARCH_USAGE_EN = (
@@ -233,6 +298,43 @@ STATUS_NONE_EN = "You have no active research job. Send /research <query> to sta
 
 STATUS_NONE_AR = "ليس لديك مهمة بحث نشطة. أرسل /research <استعلام> لبدء مهمة."
 
+PRIVATE_CHAT_ONLY_EN = (
+    "For privacy, research jobs and reports are available only in a private chat."
+)
+PRIVATE_CHAT_ONLY_AR = "حفاظًا على الخصوصية، تتوفر مهام البحث والتقارير في المحادثات الخاصة فقط."
+
+REPORT_FAILURE_EN = "The report could not be displayed safely. Please try again later."
+REPORT_FAILURE_AR = "تعذر عرض التقرير بأمان. يرجى المحاولة لاحقًا."
+
+_STAGE_LABELS: dict[str, dict[str, str]] = {
+    "analyzing": {"en": "analyzing", "ar": "تحليل الاستفسار"},
+    "selecting": {"en": "selecting sources", "ar": "اختيار المصادر"},
+    "searching": {"en": "searching", "ar": "البحث"},
+    "reading": {"en": "reading sources", "ar": "قراءة المصادر"},
+    "checking": {"en": "checking evidence", "ar": "التحقق من الأدلة"},
+    "preparing": {"en": "preparing the report", "ar": "إعداد التقرير"},
+    "active": {"en": "active", "ar": "نشطة"},
+}
+
+
+def render_private_chat_only(lang_code: str | None) -> str:
+    """Explain that job and report operations cannot run in group chats."""
+    return _t("private_chat_only", lang_code)
+
+
+def render_report_failure(lang_code: str | None) -> str:
+    """Return a generic failure without including report-derived content."""
+    return _t("report_failure", lang_code)
+
+
+def _stage_label(stage: str | None, lang_code: str | None) -> str:
+    """Localize a known progress stage without trusting arbitrary labels."""
+    normalized = (stage or "active").strip().lower()
+    entry = _STAGE_LABELS.get(normalized)
+    if entry is None:
+        return _STAGE_LABELS["active"][pick_lang(lang_code)]
+    return entry[pick_lang(lang_code)]
+
 
 def format_status(
     state: str,
@@ -263,7 +365,7 @@ def format_status(
         base += "\nUse /cancel to cancel."
         return base
     if normalized == "active":
-        current_stage = stage or "active"
+        current_stage = _stage_label(stage, lang_code)
         if lang == "ar":
             base = f"مهمتك نشطة الآن (المرحلة: {current_stage})."
             if job_id:
@@ -282,13 +384,17 @@ def format_status(
 
 CANCELLED_EN_TEMPLATE = "Your active research job {job_id} has been cancelled."
 CANCELLED_AR_TEMPLATE = "تم إلغاء مهمة البحث النشطة {job_id}."
+CANCELLED_GENERIC_EN = "Your active research job has been cancelled."
+CANCELLED_GENERIC_AR = "تم إلغاء مهمة البحث النشطة."
 CANCEL_NONE_EN = "You have no active research job to cancel."
 CANCEL_NONE_AR = "ليس لديك مهمة بحث نشطة لإلغائها."
 
 
-def render_cancelled(job_id: str, lang_code: str | None) -> str:
-    """Render the cancellation confirmation, preserving the job ID verbatim."""
-    return _t("cancelled", lang_code).format(job_id=job_id)
+def render_cancelled(job_id: str | None, lang_code: str | None) -> str:
+    """Render a verified-ID cancellation confirmation or a generic one."""
+    if job_id:
+        return _t("cancelled", lang_code).format(job_id=job_id)
+    return _t("cancelled_generic", lang_code)
 
 
 def render_cancel_none(lang_code: str | None) -> str:
@@ -464,11 +570,14 @@ _T.update(
         "invalid_url": {"en": INVALID_URL_EN, "ar": INVALID_URL_AR},
         "status_none": {"en": STATUS_NONE_EN, "ar": STATUS_NONE_AR},
         "cancelled": {"en": CANCELLED_EN_TEMPLATE, "ar": CANCELLED_AR_TEMPLATE},
+        "cancelled_generic": {"en": CANCELLED_GENERIC_EN, "ar": CANCELLED_GENERIC_AR},
         "cancel_none": {"en": CANCEL_NONE_EN, "ar": CANCEL_NONE_AR},
         "history_empty": {"en": HISTORY_EMPTY_EN, "ar": HISTORY_EMPTY_AR},
         "history_header": {"en": HISTORY_HEADER_EN, "ar": HISTORY_HEADER_AR},
         "report_usage": {"en": REPORT_USAGE_EN, "ar": REPORT_USAGE_AR},
         "report_not_found": {"en": REPORT_NOT_FOUND_EN, "ar": REPORT_NOT_FOUND_AR},
+        "private_chat_only": {"en": PRIVATE_CHAT_ONLY_EN, "ar": PRIVATE_CHAT_ONLY_AR},
+        "report_failure": {"en": REPORT_FAILURE_EN, "ar": REPORT_FAILURE_AR},
         "forget_done": {"en": FORGET_DONE_EN, "ar": FORGET_DONE_AR},
         "language_usage": {"en": LANGUAGE_USAGE_EN, "ar": LANGUAGE_USAGE_AR},
         "language_invalid": {"en": LANGUAGE_INVALID_EN, "ar": LANGUAGE_INVALID_AR},

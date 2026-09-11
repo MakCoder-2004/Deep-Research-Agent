@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import json
+from collections import OrderedDict
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
@@ -18,10 +20,17 @@ if TYPE_CHECKING:
     from research_agent.services.queue import BoundedJobQueue
 
 from research_agent.models.requests import ResearchRequest
+from research_agent.persistence.repositories import (
+    JobRepository,
+    SessionRepository,
+    ToolRunRepository,
+    UserRepository,
+)
 from research_agent.services.queue import (
     JobRef,
     UserBusyError,
     cancel_user_job,
+    clear_cancel_event,
     enqueue_request,
     get_user_active_job,
     queue_position,
@@ -36,11 +45,11 @@ from research_agent.services.sessions import (
 from research_agent.telegram.renderer import (
     deliver_report,
     render_concise_report,
-    render_safe_fallback,
     report_filename,
     split_message,
 )
 from research_agent.telegram.texts import (
+    TelegramLimits,
     format_history,
     format_status,
     pick_lang,
@@ -54,6 +63,8 @@ from research_agent.telegram.texts import (
     render_language_invalid,
     render_language_set,
     render_non_text,
+    render_private_chat_only,
+    render_report_failure,
     render_report_not_found,
     render_report_usage,
     render_research_accepted,
@@ -100,7 +111,183 @@ def build_ctx(
     """Build a RequestCtx with language normalized once from the sender."""
     from_user = message.from_user
     raw: str | None = from_user.language_code if from_user is not None else None
-    return RequestCtx(conn=conn, db_path=db_path, lang_code=resolve_lang(raw), job_queue=job_queue)
+    effective_db_path = db_path
+    if effective_db_path is None and job_queue is not None:
+        effective_db_path = job_queue.db_path
+    return RequestCtx(
+        conn=conn,
+        db_path=effective_db_path,
+        lang_code=resolve_lang(raw),
+        job_queue=job_queue,
+    )
+
+
+async def resolve_preferred_lang(ctx: RequestCtx, user_id: int) -> LangCode:
+    """Resolve a stored user/session preference before Telegram's fallback."""
+    async with with_db(ctx.conn, ctx.db_path) as db_conn:
+        if db_conn is None:
+            return ctx.lang_code
+        try:
+            user = await UserRepository().get(db_conn, user_id)
+            session = await SessionRepository().get(db_conn, user_id)
+            if user is None and session is None:
+                return ctx.lang_code
+            return resolve_lang(await get_language(db_conn, user_id))
+        except Exception:  # noqa: BLE001 - language lookup must not block a reply
+            return ctx.lang_code
+
+
+def is_group_chat(message: Message) -> bool:
+    """Return whether a Telegram message came from a group or supergroup."""
+    chat = getattr(message, "chat", None)
+    return getattr(chat, "type", None) in {"group", "supergroup"}
+
+
+async def reject_group_chat(message: Message, lang_code: LangCode) -> bool:
+    """Reject operations that could expose jobs, progress, or reports in groups."""
+    if not is_group_chat(message):
+        return False
+    await message.answer(render_private_chat_only(lang_code))
+    return True
+
+
+# The progress module's public registry stores the editable target, while its
+# current implementation does not store the stage. Keep a bounded adapter-side
+# view until that public API carries stage data itself.
+_MAX_TRACKED_PROGRESS = 256
+_PROGRESS_STAGES: OrderedDict[str, str] = OrderedDict()
+_PROGRESS_LANGS: OrderedDict[str, LangCode] = OrderedDict()
+_TERMINAL_PROGRESS_JOBS: OrderedDict[str, None] = OrderedDict()
+_WIRED_QUEUE_IDS: set[int] = set()
+_PROGRESS_TRACKING_INSTALLED = False
+
+
+def _remember_progress(job_id: str, lang_code: LangCode, stage: str = "analyzing") -> None:
+    """Track stage and language for the public progress API adapter."""
+    _TERMINAL_PROGRESS_JOBS.pop(job_id, None)
+    _PROGRESS_STAGES.pop(job_id, None)
+    _PROGRESS_STAGES[job_id] = stage
+    _PROGRESS_LANGS.pop(job_id, None)
+    _PROGRESS_LANGS[job_id] = lang_code
+    while len(_PROGRESS_STAGES) > _MAX_TRACKED_PROGRESS:
+        old_job, _ = _PROGRESS_STAGES.popitem(last=False)
+        _PROGRESS_LANGS.pop(old_job, None)
+
+
+def _remember_stage(job_id: str, stage: object) -> None:
+    """Record a normalized stage emitted by ``update_progress``."""
+    value = getattr(stage, "value", stage)
+    if not isinstance(value, str):
+        return
+    _PROGRESS_STAGES.pop(job_id, None)
+    _PROGRESS_STAGES[job_id] = value
+    while len(_PROGRESS_STAGES) > _MAX_TRACKED_PROGRESS:
+        old_job, _ = _PROGRESS_STAGES.popitem(last=False)
+        _PROGRESS_LANGS.pop(old_job, None)
+
+
+def _clear_tracked_progress(job_id: str) -> None:
+    """Clear both public progress data and adapter state for one job."""
+    from research_agent.telegram.progress import clear_progress
+
+    clear_progress(job_id)
+    _PROGRESS_STAGES.pop(job_id, None)
+    _PROGRESS_LANGS.pop(job_id, None)
+    _TERMINAL_PROGRESS_JOBS.pop(job_id, None)
+
+
+def clear_tracked_progress() -> None:
+    """Clear all adapter-tracked progress entries during queue shutdown."""
+    for job_id in tuple(_PROGRESS_STAGES):
+        _clear_tracked_progress(job_id)
+    _PROGRESS_STAGES.clear()
+    _PROGRESS_LANGS.clear()
+    _TERMINAL_PROGRESS_JOBS.clear()
+
+
+def _mark_progress_terminal(job_id: str) -> None:
+    """Clear a worker's progress and remember terminal completion briefly."""
+    from research_agent.telegram.progress import clear_progress
+
+    clear_progress(job_id)
+    _PROGRESS_STAGES.pop(job_id, None)
+    _PROGRESS_LANGS.pop(job_id, None)
+    _TERMINAL_PROGRESS_JOBS.pop(job_id, None)
+    _TERMINAL_PROGRESS_JOBS[job_id] = None
+    while len(_TERMINAL_PROGRESS_JOBS) > _MAX_TRACKED_PROGRESS:
+        _TERMINAL_PROGRESS_JOBS.popitem(last=False)
+
+
+def _is_progress_terminal(job_id: str) -> bool:
+    """Return whether the adapter observed the worker leave this job."""
+    return job_id in _TERMINAL_PROGRESS_JOBS
+
+
+def _install_progress_tracking() -> None:
+    """Track stages and route worker edits through the resolved user language."""
+    global _PROGRESS_TRACKING_INSTALLED
+    if _PROGRESS_TRACKING_INSTALLED:
+        return
+    from research_agent.telegram import progress as progress_module
+
+    original = progress_module.update_progress
+
+    async def tracked_update(
+        bot: Any,
+        chat_id: int,
+        message_id: int,
+        stage: Any,
+        lang: str = "en",
+        *,
+        job_id: str | None = None,
+        position: int | None = None,
+    ) -> bool:
+        if job_id is not None:
+            _remember_stage(job_id, stage)
+            resolved = _PROGRESS_LANGS.get(job_id, resolve_lang(lang))
+        else:
+            resolved = resolve_lang(lang)
+        return await original(
+            bot,
+            chat_id,
+            message_id,
+            stage,
+            resolved,
+            job_id=job_id,
+            position=position,
+        )
+
+    progress_module.update_progress = tracked_update
+    _PROGRESS_TRACKING_INSTALLED = True
+
+
+def wire_queue_worker(queue: BoundedJobQueue) -> None:
+    """Install progress cleanup around queue methods when no hook is exposed."""
+    _install_progress_tracking()
+    queue_id = id(queue)
+    if queue_id in _WIRED_QUEUE_IDS:
+        return
+    original_worker = queue._run_with_semaphore
+    original_stop = queue.stop
+
+    async def tracked_worker(job: Any) -> None:
+        try:
+            await original_worker(job)
+        finally:
+            _mark_progress_terminal(str(job.job_id))
+
+    async def tracked_stop() -> None:
+        try:
+            await original_stop()
+        finally:
+            clear_tracked_progress()
+
+    # The queue currently has no terminal callback. Track the worker boundary
+    # rather than only run_placeholder, because timeout/cancelled jobs may exit
+    # before the placeholder is entered.
+    queue._run_with_semaphore = tracked_worker  # type: ignore[method-assign]
+    queue.stop = tracked_stop  # type: ignore[method-assign]
+    _WIRED_QUEUE_IDS.add(queue_id)
 
 
 @asynccontextmanager
@@ -164,7 +351,9 @@ async def handle_research_request(
     if from_user is None:
         return None
     ctx = build_ctx(message, conn=conn, db_path=db_path, job_queue=job_queue)
-    lang_code: LangCode = ctx.lang_code
+    lang_code = await resolve_preferred_lang(ctx, from_user.id)
+    if await reject_group_chat(message, lang_code):
+        return None
     clean = query.strip()
     if not clean:
         await message.answer(render_research_usage(lang_code))
@@ -199,6 +388,9 @@ async def handle_research_request(
             await message.answer(render_research_usage(lang_code))
         return None
 
+    if ctx.job_queue is not None:
+        wire_queue_worker(ctx.job_queue)
+
     async def _enqueue() -> JobRef | None:
         """Persist once and schedule when a live queue is injected."""
         if ctx.job_queue is not None:
@@ -230,12 +422,23 @@ async def handle_research_request(
         await message.answer(render_unavailable(lang_code))
         return None
     await message.answer(render_research_accepted(request.query, job.job_id, lang_code))
-    try:
-        from research_agent.telegram.progress import ProgressStage, publish_progress
+    if ctx.job_queue is not None:
+        if not _is_progress_terminal(job.job_id):
+            _remember_progress(job.job_id, lang_code)
+            try:
+                from research_agent.telegram.progress import ProgressStage, publish_progress
 
-        await publish_progress(message, job.job_id, ProgressStage.ANALYZING, position=job.position)
-    except Exception:  # noqa: BLE001, S110 - progress failure must not fail enqueue
-        pass
+                await publish_progress(
+                    message,
+                    job.job_id,
+                    ProgressStage.ANALYZING,
+                    position=job.position,
+                    lang=lang_code,
+                )
+                if _is_progress_terminal(job.job_id):
+                    _clear_tracked_progress(job.job_id)
+            except Exception:  # noqa: BLE001, S110 - progress failure must not fail enqueue
+                _clear_tracked_progress(job.job_id)
     return job
 
 
@@ -244,7 +447,7 @@ def _status_stage(job_id: str) -> str:
 
     The current progress registry stores the editable message target. If a
     future registry entry also carries a stage, accept it; otherwise an active
-    job starts at the meaningful ``analyzing`` stage.
+    job is reported as active rather than guessing a pipeline stage.
     """
     try:
         from research_agent.telegram.progress import ProgressStage, get_progress
@@ -255,14 +458,22 @@ def _status_stage(job_id: str) -> str:
             candidate = entry.get("stage")
         elif isinstance(entry, tuple) and len(entry) >= 3:
             candidate = entry[2]
+        if not isinstance(candidate, str):
+            candidate = getattr(entry, "stage", None)
         if isinstance(candidate, str):
             try:
                 return ProgressStage(candidate).value
             except ValueError:
                 pass
-        return ProgressStage.ANALYZING.value
+        tracked = _PROGRESS_STAGES.get(job_id)
+        if tracked is not None:
+            try:
+                return ProgressStage(tracked).value
+            except ValueError:
+                pass
+        return "active"
     except Exception:  # noqa: BLE001 - status remains useful if progress is unavailable
-        return "analyzing"
+        return _PROGRESS_STAGES.get(job_id, "active")
 
 
 async def whoami_handler(message: Message) -> None:
@@ -276,11 +487,14 @@ async def start_handler(
     message: Message,
     conn: aiosqlite.Connection | None = None,
     db_path: Path | str | None = None,
+    limits: TelegramLimits | None = None,
 ) -> None:
     """Explain capabilities and limits; upsert the user on /start."""
     from_user = message.from_user
     ctx = build_ctx(message, conn=conn, db_path=db_path)
-    lang_code: LangCode = ctx.lang_code
+    lang_code = (
+        await resolve_preferred_lang(ctx, from_user.id) if from_user is not None else ctx.lang_code
+    )
     if from_user is not None:
         try:
             async with with_db(ctx.conn, ctx.db_path) as db_conn:
@@ -288,15 +502,23 @@ async def start_handler(
                     await ensure_user(db_conn, from_user.id, lang_code)
         except Exception:  # noqa: BLE001, S110 - start reply must not fail on DB issues
             pass
-    await message.answer(render_start(lang_code))
+    await message.answer(render_start(lang_code, limits))
 
 
-async def help_handler(message: Message) -> None:
+async def help_handler(
+    message: Message,
+    conn: aiosqlite.Connection | None = None,
+    db_path: Path | str | None = None,
+    limits: TelegramLimits | None = None,
+) -> None:
     """Show examples and limits without creating jobs."""
-    lang_code: str | None = (
-        message.from_user.language_code if message.from_user is not None else None
+    ctx = build_ctx(message, conn=conn, db_path=db_path)
+    lang_code: LangCode = (
+        await resolve_preferred_lang(ctx, message.from_user.id)
+        if message.from_user is not None
+        else ctx.lang_code
     )
-    await message.answer(render_help(lang_code))
+    await message.answer(render_help(lang_code, limits))
 
 
 async def research_handler(
@@ -321,7 +543,9 @@ async def status_handler(
     if from_user is None:
         return
     ctx = build_ctx(message, conn=conn, db_path=db_path)
-    lang_code: LangCode = ctx.lang_code
+    lang_code = await resolve_preferred_lang(ctx, from_user.id)
+    if await reject_group_chat(message, lang_code):
+        return
 
     async def _reply_with_conn(db_conn: aiosqlite.Connection) -> None:
         job = await get_user_active_job(db_conn, from_user.id)
@@ -371,18 +595,33 @@ async def cancel_handler(
     if from_user is None:
         return
     ctx = build_ctx(message, conn=conn, db_path=db_path)
-    lang_code: LangCode = ctx.lang_code
+    lang_code = await resolve_preferred_lang(ctx, from_user.id)
+    if await reject_group_chat(message, lang_code):
+        return
 
     async def _cancel_with_conn(db_conn: aiosqlite.Connection) -> None:
         existing = await get_user_active_job(db_conn, from_user.id)
         job_id = str(existing["job_id"]) if existing is not None else ""
-        cancelled = await cancel_user_job(db_conn, from_user.id)
-        if cancelled and job_id:
-            await message.answer(render_cancelled(job_id, lang_code))
-        elif cancelled:
-            await message.answer(render_cancelled("unknown", lang_code))
-        else:
+        try:
+            # The queue owns the cancellation transition. The preliminary ID
+            # is used only when verified after the atomic operation.
+            cancelled = await cancel_user_job(db_conn, from_user.id)
+        except ValueError:
+            # Completion or failure won the race; do not claim cancellation.
+            if job_id:
+                clear_cancel_event(job_id)
+            cancelled = False
+        if not cancelled:
+            if job_id:
+                clear_cancel_event(job_id)
             await message.answer(render_cancel_none(lang_code))
+            return
+        confirmed_id: str | None = None
+        if job_id:
+            cancelled_row = await JobRepository().get(db_conn, job_id)
+            if cancelled_row is not None and str(cancelled_row["state"]) == "cancelled":
+                confirmed_id = job_id
+        await message.answer(render_cancelled(confirmed_id, lang_code))
 
     async with with_db(ctx.conn, ctx.db_path) as db_conn:
         if db_conn is None:
@@ -401,7 +640,9 @@ async def history_handler(
     if from_user is None:
         return
     ctx = build_ctx(message, conn=conn, db_path=db_path)
-    lang_code: LangCode = ctx.lang_code
+    lang_code = await resolve_preferred_lang(ctx, from_user.id)
+    if await reject_group_chat(message, lang_code):
+        return
 
     async def _reply_with_conn(db_conn: aiosqlite.Connection) -> None:
         reports = await list_recent_reports(db_conn, from_user.id, limit=5)
@@ -425,11 +666,38 @@ async def report_handler(
     if from_user is None:
         return
     ctx = build_ctx(message, conn=conn, db_path=db_path)
-    lang_code: LangCode = ctx.lang_code
+    lang_code = await resolve_preferred_lang(ctx, from_user.id)
+    if await reject_group_chat(message, lang_code):
+        return
     report_id = extract_research_arg(message.text or "", "/report")
     if not report_id:
         await message.answer(render_report_usage(lang_code))
         return
+
+    async def _report_tools(
+        db_conn: aiosqlite.Connection, report: aiosqlite.Row
+    ) -> list[str] | None:
+        """Use recorded executions as the authority for the tools line."""
+        raw_tools = report["tools_used"]
+        try:
+            parsed = json.loads(str(raw_tools)) if raw_tools else []
+        except (TypeError, ValueError):
+            return None
+        if not isinstance(parsed, list) or any(
+            not isinstance(tool, str) or not tool.strip() for tool in parsed
+        ):
+            return None
+        stored = [str(tool) for tool in parsed]
+        job_id = str(report["job_id"])
+        tool_runs = await ToolRunRepository().list_by_job(db_conn, job_id)
+        if not tool_runs:
+            return stored
+        recorded: list[str] = []
+        for run in tool_runs:
+            name = str(run["tool_name"]).strip()
+            if name and name not in recorded:
+                recorded.append(name)
+        return recorded if stored == recorded else None
 
     async def _reply_with_conn(db_conn: aiosqlite.Connection) -> None:
         report, sources = await get_report_bundle(db_conn, from_user.id, report_id)
@@ -437,16 +705,9 @@ async def report_handler(
             await message.answer(render_report_not_found(lang_code))
             return
         try:
-            import json as _json
-
             topic = str(report["topic"])
             summary = str(report["summary"])
-            try:
-                raw_tools = report["tools_used"]
-                tools: list[str] = list(_json.loads(str(raw_tools))) if raw_tools else []
-                tools = [str(tool) for tool in tools]
-            except Exception:  # noqa: BLE001, S110 - tools line is optional
-                tools = []
+            tools = await _report_tools(db_conn, report)
             source_ids: list[int] = []
             for idx, src in enumerate(list(sources), start=1):
                 sid = idx
@@ -489,16 +750,8 @@ async def report_handler(
             for chunk in split_message(concise):
                 await message.answer(chunk, parse_mode="MarkdownV2")
         except Exception:  # noqa: BLE001 - validation/render failures stay safely escaped
-            try:
-                topic = str(report["topic"])
-            except Exception:  # noqa: BLE001 - fallback must not expose raw row access
-                topic = "report"
-            try:
-                summary = str(report["summary"])
-            except Exception:  # noqa: BLE001 - fallback must not expose raw row access
-                summary = ""
-            safe_fallback = render_safe_fallback(topic, summary, lang_code)
-            for chunk in split_message(safe_fallback):
+            failure = render_report_failure(lang_code)
+            for chunk in split_message(failure):
                 await message.answer(chunk, parse_mode="MarkdownV2")
 
     async with with_db(ctx.conn, ctx.db_path) as db_conn:
@@ -518,7 +771,9 @@ async def forget_handler(
     if from_user is None:
         return
     ctx = build_ctx(message, conn=conn, db_path=db_path)
-    lang_code: LangCode = ctx.lang_code
+    lang_code = await resolve_preferred_lang(ctx, from_user.id)
+    if await reject_group_chat(message, lang_code):
+        return
     async with with_db(ctx.conn, ctx.db_path) as db_conn:
         if db_conn is None:
             await message.answer(render_forget_done(lang_code))
@@ -544,7 +799,9 @@ async def language_handler(
     if from_user is None:
         return
     ctx = build_ctx(message, conn=conn, db_path=db_path)
-    lang_code: LangCode = ctx.lang_code
+    lang_code = await resolve_preferred_lang(ctx, from_user.id)
+    if await reject_group_chat(message, lang_code):
+        return
     raw_arg = extract_research_arg(message.text or "", "/language")
 
     async def _current_with_conn(db_conn: aiosqlite.Connection) -> str:
@@ -594,19 +851,29 @@ async def plaintext_handler(
     await handle_research_request(message, query, conn=conn, db_path=db_path, job_queue=job_queue)
 
 
-async def non_text_handler(message: Message) -> None:
+async def non_text_handler(
+    message: Message,
+    conn: aiosqlite.Connection | None = None,
+    db_path: Path | str | None = None,
+) -> None:
     """Gently ignore non-text messages without creating jobs."""
-    lang_code: str | None = (
-        message.from_user.language_code if message.from_user is not None else None
+    ctx = build_ctx(message, conn=conn, db_path=db_path)
+    lang_code: LangCode = (
+        await resolve_preferred_lang(ctx, message.from_user.id)
+        if message.from_user is not None
+        else ctx.lang_code
     )
+    if await reject_group_chat(message, lang_code):
+        return
     await message.answer(render_non_text(lang_code))
 
 
 def register_handlers(target: Router) -> None:
     """Register the Telegram handlers on a dispatcher-owned router."""
-    target.message.register(whoami_handler, Command("whoami"), flags={"allow_unauthorized": True})
-    target.message.register(start_handler, Command("start"), flags={"allow_unauthorized": True})
-    target.message.register(help_handler, Command("help"), flags={"allow_unauthorized": True})
+    harmless_group_flags = {"allow_unauthorized": True}
+    target.message.register(whoami_handler, Command("whoami"), flags=harmless_group_flags)
+    target.message.register(start_handler, Command("start"), flags=harmless_group_flags)
+    target.message.register(help_handler, Command("help"), flags=harmless_group_flags)
     target.message.register(research_handler, Command("research"))
     target.message.register(status_handler, Command("status"))
     target.message.register(cancel_handler, Command("cancel"))
