@@ -60,6 +60,34 @@ async def test_missing_file_graceful(tmp_path: Path) -> None:
     assert kwargs.get("parse_mode") == "MarkdownV2"
 
 
+async def test_raw_caption_is_escaped_on_text_fallback(tmp_path: Path) -> None:
+    reports_dir = tmp_path / "reports"
+    reports_dir.mkdir()
+    message = _msg(111, "caption")
+    ok = await deliver_report(
+        message,
+        reports_dir / "research-missing2.md",
+        "Raw *caption* [x].",
+        reports_dir,
+    )
+    assert ok is False
+    delivered = message.answer.call_args[0][0]
+    assert delivered == "Raw \\*caption\\* \\[x\\]\\."
+    assert message.answer.call_args[1]["parse_mode"] == "MarkdownV2"
+
+
+async def test_raw_caption_is_escaped_on_document_delivery(tmp_path: Path) -> None:
+    reports_dir = tmp_path / "reports"
+    reports_dir.mkdir()
+    path = reports_dir / "research-caption1.md"
+    path.write_text("# Report\n", encoding="utf-8")
+    message = _msg(111, "caption")
+    ok = await deliver_report(message, path, "Raw *caption* [x].", reports_dir)
+    assert ok is True
+    kwargs = message.answer_document.call_args[1]
+    assert kwargs["caption"] == "Raw \\*caption\\* \\[x\\]\\."
+
+
 async def test_traversal_prevented(tmp_path: Path) -> None:
     reports_dir = tmp_path / "reports"
     reports_dir.mkdir()
@@ -116,6 +144,79 @@ async def test_report_handler_attaches_file(tmp_path: Path) -> None:
         message.answer_document.assert_awaited_once()
         kwargs = message.answer_document.call_args[1]
         assert kwargs["document"].filename == filename
+
+
+async def test_report_handler_uses_report_local_source_refs(tmp_path: Path) -> None:
+    db_path = tmp_path / "source_refs.db"
+    reports_dir = tmp_path / "reports"
+    reports_dir.mkdir()
+    first_path = reports_dir / report_filename("rep-first")
+    second_path = reports_dir / report_filename("rep-second")
+    first_path.write_text("# First\n", encoding="utf-8")
+    second_path.write_text("# Second\n", encoding="utf-8")
+    async with open_db(db_path) as conn:
+        await JobRepository().create(
+            conn,
+            job_id="job-first",
+            user_id=111,
+            query="First",
+            state="completed",
+        )
+        await ReportRepository().save(
+            conn,
+            report_id="rep-first",
+            job_id="job-first",
+            topic="First",
+            summary="First summary",
+            markdown_path=str(first_path),
+            tools_used=[],
+        )
+        await SourceRepository().save_many(
+            conn,
+            "rep-first",
+            [
+                {
+                    "source_ref": 1,
+                    "title": "First source",
+                    "url": "https://example.com/first",
+                    "publisher": None,
+                    "published_at": None,
+                    "accessed_at": "2026-01-01T00:00:00+00:00",
+                    "source_type": "web",
+                }
+            ],
+        )
+        await JobRepository().create(conn, job_id="job-second", user_id=111, query="Second")
+        await ReportRepository().save(
+            conn,
+            report_id="rep-second",
+            job_id="job-second",
+            topic="Second",
+            summary="Second summary",
+            markdown_path=str(second_path),
+            tools_used=[],
+        )
+        await SourceRepository().save_many(
+            conn,
+            "rep-second",
+            [
+                {
+                    "source_ref": 1,
+                    "title": "Second source",
+                    "url": "https://example.com/second",
+                    "publisher": None,
+                    "published_at": None,
+                    "accessed_at": "2026-01-01T00:00:00+00:00",
+                    "source_type": "web",
+                }
+            ],
+        )
+        await conn.commit()
+        message = _msg(111, "/report rep-second", "en")
+        await report_handler(message, conn=conn, reports_dir=reports_dir)
+        kwargs = message.answer_document.call_args[1]
+        assert kwargs["caption"].find("[1]") >= 0
+        assert "[2]" not in kwargs["caption"]
 
 
 async def test_report_handler_missing_file_sends_text(tmp_path: Path) -> None:

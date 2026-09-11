@@ -11,6 +11,7 @@ from research_agent.telegram.renderer import (
     escape_markdown_v2,
     render_citation_marker,
     render_concise_report,
+    render_safe_fallback,
     report_filename,
     split_message,
 )
@@ -149,6 +150,7 @@ def test_concise_en_contains_markers_tools_partial() -> None:
         partial=True,
         disclaimer="Not financial advice.",
         tools_used=["tavily_search"],
+        tools_failed=["provider_down"],
     )
     assert text.startswith("⚠️ Partial report")
     assert "*Solar\\_batteries\\* v1\\.0*" in text
@@ -158,6 +160,57 @@ def test_concise_en_contains_markers_tools_partial() -> None:
     assert "Sources:" in text
     assert "Tools:" in text
     assert "tavily\\_search" in text
+    assert r"Failed tools \(coverage affected\): provider\_down" in text
+    assert r"Not financial advice\." in text
+
+
+def test_failed_tools_are_hidden_when_report_is_not_partial() -> None:
+    text = render_concise_report(
+        "Topic",
+        [{"statement": "Claim", "citation_ids": [1]}],
+        [{"id": 1, "title": "Source", "url": "https://example.com"}],
+        tools_used=["successful_tool"],
+        tools_failed=["optional_tool"],
+    )
+    assert r"successful\_tool" in text
+    assert "Failed tools" not in text
+    assert r"optional\_tool" not in text
+
+
+def test_invalid_report_payloads_raise_before_rendering() -> None:
+    source = {"id": 1, "title": "Source", "url": "https://example.com"}
+    with pytest.raises(ValueError, match="Every finding must have at least one citation"):
+        render_concise_report("Topic", [{"statement": "Claim", "citation_ids": []}], [source])
+    with pytest.raises(ValueError, match="existing source"):
+        render_concise_report("Topic", [{"statement": "Claim", "citation_ids": [2]}], [source])
+    with pytest.raises(ValueError, match="positive integers"):
+        render_concise_report("Topic", [{"statement": "Claim", "citation_ids": ["bad"]}], [source])
+
+
+def test_report_local_source_ref_wins_over_database_id() -> None:
+    text = render_concise_report(
+        "Topic",
+        [{"statement": "Claim", "citation_ids": [1]}],
+        [
+            {
+                "id": 42,
+                "source_ref": 1,
+                "title": "Report-local source",
+                "url": "https://example.com/local",
+            }
+        ],
+    )
+    assert r"[1] [Report\-local source]" in text
+    assert "[42]" not in text
+
+
+def test_safe_fallback_escapes_english_and_arabic_text() -> None:
+    english = render_safe_fallback("Topic *one*", "Summary [unsafe] _text_.", "en")
+    arabic = render_safe_fallback("موضوع [1]", "ملخص *غير آمن*.", "ar")
+    assert "Topic \\*one\\*" in english
+    assert r"Summary \[unsafe\] \_text\_\." in english
+    assert r"موضوع \[1\]" in arabic
+    assert r"ملخص \*غير آمن\*\." in arabic
 
 
 def test_concise_ar_ltr_markers() -> None:

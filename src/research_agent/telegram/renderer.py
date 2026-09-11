@@ -15,12 +15,13 @@ from __future__ import annotations
 import asyncio
 import logging
 import re
-from collections.abc import Mapping, Sequence
+from collections.abc import Iterable, Mapping, Sequence
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import Any, TypedDict, cast
+from typing import Protocol, TypedDict, cast
 
 from aiogram.types import BufferedInputFile, Message
+from pydantic import ValidationError
 
 from research_agent.models.reports import Finding, ResearchReport, Source
 
@@ -56,9 +57,20 @@ class SourceDict(TypedDict, total=False):
     title: str
     url: str
     publisher: str | None
-    published_at: str | None
-    accessed_at: str | None
+    published_at: datetime | str | None
+    accessed_at: datetime | str
     source_type: str
+
+
+class _StringKeyed(Protocol):
+    """Protocol for SQLite rows and other string-keyed payloads."""
+
+    def __getitem__(self, key: str, /) -> object:
+        ...
+
+
+class _RenderedMarkdownV2(str):
+    """Marker for text whose formatting controls were added by this module."""
 
 
 def escape_markdown_v2(text: str) -> str:
@@ -217,49 +229,52 @@ def _normalize_report_lang(lang: str | None) -> str:
     return "en"
 
 
-def _get_field(item: object, key: str) -> Any | None:
+def _get_field(item: object, key: str) -> object | None:
     """Read one field from a model, mapping, or DB row without chaining.
 
     Centralizes all dynamic access so rendering code works off validated
-    Pydantic models instead of ``Any`` attribute/mapping chains. Returns
-    ``None`` when the field is absent.
+    Pydantic models instead of dynamic access chains. Returns ``None`` when
+    the field is absent.
     """
     if isinstance(item, Mapping):
-        try:
-            return cast(Mapping[str, Any], item).get(key)
-        except Exception:  # noqa: BLE001, S110 - fall through to other shapes
-            pass
+        return cast(Mapping[str, object], item).get(key)
     try:
-        subscript = cast(Any, item).__getitem__
-    except AttributeError:
+        # ``aiosqlite.Row`` is string-keyed but is not a Mapping at runtime.
+        return cast(_StringKeyed, item)[key]
+    except (KeyError, IndexError, TypeError):
         pass
-    else:
-        try:
-            return cast(Any, subscript(key))
-        except Exception:  # noqa: BLE001, S110 - not a mapping-like row
-            pass
     try:
-        return cast(Any, getattr(item, key, None))
+        return cast(object | None, getattr(item, key, None))
     except Exception:  # noqa: BLE001, S110 - unreadable attribute
         return None
 
 
-def _coerce_citation_ids(raw: Any | None) -> list[int]:
-    """Normalize raw citation ids preserving order, dropping invalid ones."""
+def _coerce_citation_ids(raw: object | None) -> list[int]:
+    """Normalize citation IDs and reject malformed values rather than drop them."""
     if raw is None:
         return []
+    if isinstance(raw, (str, bytes, bytearray)):
+        raise ValueError("Citation ids must be a sequence of positive integers.")
     try:
-        candidates = list(cast(Any, raw))
+        candidates = list(cast(Iterable[object], raw))
     except TypeError:
-        return []
+        raise ValueError("Citation ids must be a sequence of positive integers.") from None
     ids: list[int] = []
     for cand in candidates:
-        try:
-            num = int(cast(Any, cand))
-        except (TypeError, ValueError):
-            continue
-        if num >= 1 and num not in ids:
-            ids.append(num)
+        if isinstance(cand, bool):
+            raise ValueError("Citation ids must contain only positive integers.")
+        if isinstance(cand, int):
+            num = cand
+        elif isinstance(cand, str):
+            try:
+                num = int(cand)
+            except ValueError:
+                raise ValueError("Citation ids must contain only positive integers.") from None
+        else:
+            raise ValueError("Citation ids must contain only positive integers.")
+        if num < 1:
+            raise ValueError("Citation ids must contain only positive integers.")
+        ids.append(num)
     return ids
 
 
@@ -275,19 +290,18 @@ def coerce_finding(item: object) -> Finding:
         if not item.citation_ids:
             raise ValueError("Every finding must have at least one citation.")
         return item
-    statement_raw = _get_field(item, "statement")
-    statement = str(statement_raw).strip() if statement_raw is not None else ""
-    if not statement:
-        # Last resort mirrors legacy behavior for raw strings, but empty
-        # statements are never deliverable.
-        if isinstance(item, str) and item.strip():
-            statement = item.strip()
-        else:
-            raise ValueError("Finding statement must be non-empty.")
+    statement_raw = item if isinstance(item, str) else _get_field(item, "statement")
+    if not isinstance(statement_raw, str) or not statement_raw.strip():
+        raise ValueError("Finding statement must be a non-empty string.")
+    statement = statement_raw.strip()
     citation_ids = _coerce_citation_ids(_get_field(item, "citation_ids"))
     if not citation_ids:
         raise ValueError("Every finding must have at least one citation.")
-    return Finding(statement=statement, citation_ids=citation_ids)
+    payload: FindingDict = {"statement": statement, "citation_ids": citation_ids}
+    try:
+        return Finding.model_validate(payload)
+    except ValidationError as exc:
+        raise ValueError(f"Invalid finding: {exc}") from exc
 
 
 def coerce_source(item: object, fallback_id: int) -> Source:
@@ -303,12 +317,14 @@ def coerce_source(item: object, fallback_id: int) -> Source:
     if isinstance(item, Source):
         return item
     source_id = fallback_id
-    for key in ("id", "source_ref", "source_id", "ref"):
+    # ``source_ref`` is report-local and is the citation ID persisted by the
+    # report pipeline. SQLite's ``id`` is global across all reports.
+    for key in ("source_ref", "id", "source_id", "ref"):
         raw_id = _get_field(item, key)
         if raw_id is None:
             continue
         try:
-            num = int(cast(Any, raw_id))
+            num = int(raw_id) if isinstance(raw_id, (int, str)) else 0
         except (TypeError, ValueError):
             continue
         if num >= 1:
@@ -316,36 +332,46 @@ def coerce_source(item: object, fallback_id: int) -> Source:
             break
     title_raw = _get_field(item, "title")
     url_raw = _get_field(item, "url")
-    url_text = str(url_raw).strip() if url_raw is not None else ""
+    url_text = url_raw.strip() if isinstance(url_raw, str) else ""
     if not url_text:
         raise ValueError(f"Source {source_id} must include a URL.")
-    title_text = str(title_raw).strip() if title_raw is not None and str(title_raw).strip() else ""
+    title_text = title_raw.strip() if isinstance(title_raw, str) else ""
     if not title_text:
         title_text = url_text
     accessed_raw = _get_field(item, "accessed_at")
     if accessed_raw is None:
         accessed_at: datetime | str = datetime.now(UTC)
-    elif isinstance(accessed_raw, datetime):
+    elif isinstance(accessed_raw, (datetime, str)):
         accessed_at = accessed_raw
     else:
-        accessed_at = str(accessed_raw)
+        raise ValueError(f"Source {source_id} accessed_at must be a datetime or ISO string.")
     publisher_raw = _get_field(item, "publisher")
-    publisher = str(publisher_raw) if publisher_raw is not None else None
+    if publisher_raw is not None and not isinstance(publisher_raw, str):
+        raise ValueError(f"Source {source_id} publisher must be a string or null.")
+    publisher = publisher_raw
     published_raw = _get_field(item, "published_at")
     published_at: datetime | str | None = None
     if published_raw is not None:
-        published_at = published_raw if isinstance(published_raw, datetime) else str(published_raw)
+        if not isinstance(published_raw, (datetime, str)):
+            raise ValueError(f"Source {source_id} published_at must be a datetime or ISO string.")
+        published_at = published_raw
     source_type_raw = _get_field(item, "source_type")
-    source_type = str(source_type_raw) if source_type_raw is not None else "web"
-    return Source(
-        id=source_id,
-        title=title_text,
-        url=cast(Any, url_text),
-        publisher=publisher,
-        published_at=cast(Any, published_at),
-        accessed_at=cast(Any, accessed_at),
-        source_type=cast(Any, source_type),
-    )
+    if source_type_raw is not None and not isinstance(source_type_raw, str):
+        raise ValueError(f"Source {source_id} source_type must be a string.")
+    source_type = source_type_raw if isinstance(source_type_raw, str) else "web"
+    payload: SourceDict = {
+        "id": source_id,
+        "title": title_text,
+        "url": url_text,
+        "publisher": publisher,
+        "published_at": published_at,
+        "accessed_at": accessed_at,
+        "source_type": source_type,
+    }
+    try:
+        return Source.model_validate(payload)
+    except ValidationError as exc:
+        raise ValueError(f"Invalid source {source_id}: {exc}") from exc
 
 
 def validate_before_render(
@@ -362,9 +388,9 @@ def validate_before_render(
     enforced. Raises on any validation failure; callers must never deliver
     when this raises.
     """
+    if not isinstance(topic, str) or not topic.strip():
+        raise ValueError("Report topic must be a non-empty string.")
     clean_topic = topic.strip()
-    if not clean_topic:
-        raise ValueError("Report topic must be non-empty.")
     finding_list = list(findings)
     source_list = list(sources)
     if not finding_list:
@@ -376,7 +402,12 @@ def validate_before_render(
     summary = "\n".join(finding.statement for finding in finding_models).strip()
     if not summary:
         raise ValueError("Report summary must be non-empty.")
-    tools = [str(tool) for tool in list(tools_used)] if tools_used else []
+    tools: list[str] = []
+    if tools_used:
+        for tool in tools_used:
+            if not isinstance(tool, str) or not tool.strip():
+                raise ValueError("tools_used must contain non-empty strings.")
+            tools.append(tool)
     return ResearchReport(
         topic=clean_topic,
         key_findings=finding_models,
@@ -414,12 +445,12 @@ def render_concise_report(
     English and RTL Arabic. Formatting asterisks for the bold topic are the
     only unescaped MarkdownV2 controls added by this function.
 
-    ``partial`` adds a partial-coverage banner. ``tools_failed`` lists only
-    failed tools that affected coverage (callers must filter to
-    coverage-affecting failures); it renders as a separate escaped line.
+    ``partial`` adds a partial-coverage banner. Failed tools are rendered only
+    for partial reports because only coverage-affecting failures belong in the
+    user-visible report; the caller supplies the actual execution names.
     """
     validated = validate_before_render(topic, findings, sources, tools_used)
-    failed = [str(tool) for tool in list(tools_failed)] if tools_failed else []
+    failed = [tool for tool in tools_failed if tool.strip()] if partial and tools_failed else []
     normalized = _normalize_report_lang(lang)
     esc_topic = escape_markdown_v2(validated.topic)
     lines: list[str] = []
@@ -453,13 +484,13 @@ def render_concise_report(
         esc_failed = ", ".join(escape_markdown_v2(tool) for tool in failed)
         lines.append("")
         if normalized == "ar":
-            lines.append(f"الأدوات الفاشلة (أثّرت على التغطية): {esc_failed}")
+            lines.append(f"الأدوات الفاشلة \\(أثّرت على التغطية\\): {esc_failed}")
         else:
-            lines.append(f"Failed tools (coverage affected): {esc_failed}")
+            lines.append(f"Failed tools \\(coverage affected\\): {esc_failed}")
     if disclaimer:
         lines.append("")
         lines.append(escape_markdown_v2(disclaimer))
-    return "\n".join(lines)
+    return _RenderedMarkdownV2("\n".join(lines))
 
 
 def build_concise_from_report(
@@ -514,9 +545,9 @@ def render_safe_fallback(topic: str, summary: str, lang: str = "en") -> str:
                 "",
                 esc_summary or "No summary available.",
             ]
-        return "\n".join(lines)
+        return _RenderedMarkdownV2("\n".join(lines))
     except Exception:  # noqa: BLE001 - fallback must never raise
-        return "Report unavailable\\."
+        return _RenderedMarkdownV2("Report unavailable\\.")
 
 
 def report_filename(report_id: str) -> str:
@@ -537,14 +568,22 @@ def _is_safe_markdown_path(path: Path) -> bool:
     return _RESEARCH_FILENAME_RE.fullmatch(path.name) is not None
 
 
+def _prepare_caption(caption: str) -> str:
+    """Escape raw captions while preserving controls generated by this module."""
+    if isinstance(caption, _RenderedMarkdownV2):
+        return caption
+    return escape_markdown_v2(caption)
+
+
 async def _send_caption_as_text(message: Message, caption: str) -> None:
     """Send a caption as MarkdownV2 text messages, splitting when oversized."""
-    if not caption:
+    safe_caption = _prepare_caption(caption)
+    if not safe_caption:
         return
-    if len(caption) <= TELEGRAM_TEXT_LIMIT:
-        await message.answer(caption, parse_mode="MarkdownV2")
+    if len(safe_caption) <= TELEGRAM_TEXT_LIMIT:
+        await message.answer(safe_caption, parse_mode="MarkdownV2")
         return
-    for chunk in split_message(caption, TELEGRAM_TEXT_LIMIT):
+    for chunk in split_message(safe_caption, TELEGRAM_TEXT_LIMIT):
         await message.answer(chunk, parse_mode="MarkdownV2")
 
 
@@ -564,16 +603,20 @@ async def deliver_report(
     ``True`` only when ``answer_document`` was called. Never raises.
     """
     try:
+        safe_caption = _prepare_caption(caption)
+    except Exception:  # noqa: BLE001 - malformed fallback text must stay safe
+        safe_caption = "Report unavailable\\."
+    try:
         path = Path(markdown_path)
     except Exception:  # noqa: BLE001 - graceful fallback to caption text
         try:
-            await _send_caption_as_text(message, caption)
+            await _send_caption_as_text(message, safe_caption)
         except Exception:  # noqa: BLE001, S110 - delivery must never raise
             pass
         return False
     try:
         if ".." in path.parts or not _is_safe_markdown_path(path):
-            await _send_caption_as_text(message, caption)
+            await _send_caption_as_text(message, safe_caption)
             return False
         if reports_dir is not None:
             base = Path(reports_dir).resolve()  # noqa: ASYNC240 - tiny path resolve
@@ -583,11 +626,11 @@ async def deliver_report(
                 else:
                     resolved = (base / path.name).resolve()  # noqa: ASYNC240 - tiny resolve
             except Exception:  # noqa: BLE001 - treat unresolvable as unsafe
-                await _send_caption_as_text(message, caption)
+                await _send_caption_as_text(message, safe_caption)
                 return False
             try:
                 if not resolved.is_relative_to(base):
-                    await _send_caption_as_text(message, caption)
+                    await _send_caption_as_text(message, safe_caption)
                     return False
             except AttributeError:
                 # Python < 3.9 fallback: compare parts manually.
@@ -596,16 +639,16 @@ async def deliver_report(
                     return False
             path = resolved
         if not path.is_file():
-            await _send_caption_as_text(message, caption)
+            await _send_caption_as_text(message, safe_caption)
             return False
         data = await asyncio.to_thread(path.read_bytes)
         document = BufferedInputFile(data, filename=path.name)
-        if caption and len(caption) <= TELEGRAM_CAPTION_LIMIT:
+        if safe_caption and len(safe_caption) <= TELEGRAM_CAPTION_LIMIT:
             await message.answer_document(
-                document=document, caption=caption, parse_mode="MarkdownV2"
+                document=document, caption=safe_caption, parse_mode="MarkdownV2"
             )
-        elif caption:
-            for chunk in split_message(caption, TELEGRAM_TEXT_LIMIT):
+        elif safe_caption:
+            for chunk in split_message(safe_caption, TELEGRAM_TEXT_LIMIT):
                 await message.answer(chunk, parse_mode="MarkdownV2")
             await message.answer_document(document=document)
         else:
@@ -614,7 +657,7 @@ async def deliver_report(
     except Exception as exc:  # noqa: BLE001 - missing-file and edit failures stay graceful
         logger.warning("report delivery failed: %s: %s", type(exc).__name__, path.name)
         try:
-            await _send_caption_as_text(message, caption)
+            await _send_caption_as_text(message, safe_caption)
         except Exception:  # noqa: BLE001, S110 - never raise from delivery
             pass
         return False
