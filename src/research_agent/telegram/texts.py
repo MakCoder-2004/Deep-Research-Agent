@@ -11,8 +11,7 @@ WHOAMI_TEMPLATE = "Your Telegram user ID is: {user_id}"
 class _StringKeyed(Protocol):
     """Protocol for SQLite rows and other string-keyed payloads."""
 
-    def __getitem__(self, key: str, /) -> object:
-        ...
+    def __getitem__(self, key: str, /) -> object: ...
 
 
 def _get_field(item: object, key: str) -> object | None:
@@ -27,6 +26,7 @@ def _get_field(item: object, key: str) -> object | None:
         return cast(object | None, getattr(item, key, None))
     except Exception:  # noqa: BLE001, S110 - malformed rows are skipped
         return None
+
 
 START_EN = (
     "Welcome to Deep Research Agent.\n\n"

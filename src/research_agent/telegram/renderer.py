@@ -65,8 +65,7 @@ class SourceDict(TypedDict, total=False):
 class _StringKeyed(Protocol):
     """Protocol for SQLite rows and other string-keyed payloads."""
 
-    def __getitem__(self, key: str, /) -> object:
-        ...
+    def __getitem__(self, key: str, /) -> object: ...
 
 
 class _RenderedMarkdownV2(str):
