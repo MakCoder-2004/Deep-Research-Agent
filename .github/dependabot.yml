@@ -1,27 +1,14 @@
 version: 2
+multi-ecosystem-groups:
+  weekly-maintenance:
+    schedule:
+      interval: weekly
+
 updates:
   - package-ecosystem: pip
     directory: /
-    schedule:
-      interval: weekly
-    open-pull-requests-limit: 5
-    groups:
-      python-dependencies:
-        patterns:
-          - "*"
+    multi-ecosystem-group: weekly-maintenance
 
   - package-ecosystem: github-actions
     directory: /
-    schedule:
-      interval: weekly
-    open-pull-requests-limit: 5
-    groups:
-      github-actions:
-        patterns:
-          - "*"
-
-  - package-ecosystem: docker
-    directory: /
-    schedule:
-      interval: weekly
-    open-pull-requests-limit: 5
+    multi-ecosystem-group: weekly-maintenance
