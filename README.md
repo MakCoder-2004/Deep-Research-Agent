@@ -2,6 +2,9 @@
 
 Telegram-accessible Deep Research Agent. See [`docs/PLAN.md`](docs/PLAN.md) as the source of truth.
 
+See [`AGENTS_WORKFLOW.md`](AGENTS_WORKFLOW.md) for the bounded OpenCode agent
+workflow, delegation roles, context packets, and task commit checkpoints.
+
 ## Milestone 1 — Foundation
 
 Reproducible Python 3.12 project with shared contracts:

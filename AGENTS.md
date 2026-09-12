@@ -47,6 +47,7 @@
 ## Git Workflow
 
 - Keep `main` deployable; use short-lived branches and pull requests with required CI checks before merging.
+- Implement every milestone and new feature on a new branch, committing each plan step on that branch.
 - Do not bypass branch protection or deploy untested commits; keep deployment credentials in the protected GitHub `production` environment or on the Oracle host.
 
 ## Task Tracking
