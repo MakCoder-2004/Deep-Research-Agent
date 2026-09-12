@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from datetime import UTC, datetime
+
 import aiosqlite
 
 from research_agent.persistence.repositories import SessionRepository, UserRepository
@@ -76,7 +78,7 @@ async def get_language(conn: aiosqlite.Connection, user_id: int) -> str:
             return normalized
         if stored in ("en", "ar"):
             return stored
-    session_row = await sessions.get(conn, user_id)
+    session_row = await sessions.get_valid(conn, user_id)
     if session_row is not None:
         stored = str(session_row["language"]).strip().lower()
         normalized = normalize_language(stored)
@@ -99,8 +101,8 @@ async def set_language(conn: aiosqlite.Connection, user_id: int, language: str) 
         await sessions.save(conn, user_id, normalized, [])
     else:
         await conn.execute(
-            "UPDATE sessions SET language = ? WHERE user_id = ?",
-            (normalized, user_id),
+            "UPDATE sessions SET language = ?, updated_at = ? WHERE user_id = ?",
+            (normalized, datetime.now(UTC).isoformat(), user_id),
         )
     await conn.commit()
     return normalized

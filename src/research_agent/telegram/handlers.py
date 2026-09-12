@@ -128,7 +128,7 @@ async def resolve_preferred_lang(ctx: RequestCtx, user_id: int) -> LangCode:
             return ctx.lang_code
         try:
             user = await UserRepository().get(db_conn, user_id)
-            session = await SessionRepository().get(db_conn, user_id)
+            session = await SessionRepository().get_valid(db_conn, user_id)
             if user is None and session is None:
                 return ctx.lang_code
             return resolve_lang(await get_language(db_conn, user_id))
@@ -431,11 +431,13 @@ async def handle_research_request(
 
     async def _enqueue() -> JobRef | None:
         """Persist once and schedule when a live queue is injected."""
+        source_url = str(request.source_url) if request.source_url is not None else None
         if ctx.job_queue is not None:
             return await ctx.job_queue.enqueue(
                 request.user_id,
                 request.query,
                 language=request.language.value,
+                source_url=source_url,
             )
         async with with_db(ctx.conn, ctx.db_path) as db_conn:
             if db_conn is None:
@@ -445,6 +447,7 @@ async def handle_research_request(
                 request.user_id,
                 request.query,
                 language=request.language.value,
+                source_url=source_url,
             )
 
     try:
@@ -460,6 +463,20 @@ async def handle_research_request(
         await message.answer(render_unavailable(lang_code))
         return None
     await message.answer(render_research_accepted(request.query, job.job_id, lang_code))
+    # Record the query in temporary session memory (best-effort: a session
+    # failure must never fail the accepted job). The 24h/6-interaction cap
+    # is enforced by SessionRepository.append/prune (see retention sweep).
+    try:
+        async with with_db(ctx.conn, ctx.db_path) as db_conn:
+            if db_conn is not None:
+                await SessionRepository().append(db_conn, request.user_id, lang_code, clean[:500])
+                # open_db commits on exit; commit explicitly for injected conns.
+                try:
+                    await db_conn.commit()
+                except Exception:  # noqa: BLE001, S110 - session write is best-effort
+                    pass
+    except Exception:  # noqa: BLE001, S110 - session write is best-effort
+        pass
     if ctx.job_queue is not None:
         if not _is_progress_terminal(job.job_id):
             _remember_progress(job.job_id, lang_code)

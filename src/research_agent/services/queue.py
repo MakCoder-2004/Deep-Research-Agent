@@ -81,6 +81,7 @@ async def _insert_job(
     *,
     job_timeout_seconds: int = _DEFAULT_JOB_TIMEOUT_SECONDS,
     daily_quota: int | None = None,
+    source_url: str | None = None,
 ) -> JobRef:
     """Insert one queued job on an open connection (shared enqueue core).
 
@@ -116,6 +117,7 @@ async def _insert_job(
             user_id=user_id,
             query=query,
             language=language,
+            source_url=source_url,
         )
     except sqlite3.IntegrityError as exc:
         # A concurrent idempotent retry may have committed this request ID.
@@ -223,14 +225,25 @@ async def enqueue_request(
     request_id: str | None = None,
     *,
     job_timeout_seconds: int = _DEFAULT_JOB_TIMEOUT_SECONDS,
+    source_url: str | None = None,
 ) -> JobRef:
     """Persist a queued job and return its reference with FIFO position.
 
     Enforces one active job per user (``max_active_per_user=1``); raises
     :class:`UserBusyError` when the user already has a queued/active job.
     ``request_id`` optionally fixes the ``job_id`` for idempotent retries.
+    ``source_url`` preserves URL provenance on the job row.
     NOTE: daily quotas are M9 scope (stub only); not enforced here.
     """
+    return await _insert_job(
+        conn,
+        user_id,
+        query,
+        language,
+        request_id,
+        job_timeout_seconds=job_timeout_seconds,
+        source_url=source_url,
+    )
     return await _insert_job(
         conn,
         user_id,
@@ -426,7 +439,7 @@ async def set_state(
         cursor = await conn.execute(
             """
             UPDATE jobs
-            SET state = ?, error = ?, trace_id = ?, updated_at = ?
+            SET state = ?, error = ?, trace_id = COALESCE(?, trace_id), updated_at = ?
             WHERE job_id = ? AND state = ?
             """,
             (
@@ -509,6 +522,11 @@ class BoundedJobQueue:
         cls, settings: Settings, db_path: Path | str | None = None
     ) -> BoundedJobQueue:
         """Build a queue with Semaphore sized from settings.max_concurrent_jobs."""
+        if int(settings.max_active_per_user) != 1:
+            raise ValueError(
+                "max_active_per_user must be 1: the one-live-job guarantee is "
+                "backed by a partial unique index, not a tunable semaphore."
+            )
         path = db_path if db_path is not None else settings.database_path
         queue = cls(
             path,
@@ -543,6 +561,7 @@ class BoundedJobQueue:
         query: str,
         language: str = "mixed",
         request_id: str | None = None,
+        source_url: str | None = None,
     ) -> JobRef:
         """Persist a queued job and schedule it FIFO; return its reference.
 
@@ -561,6 +580,7 @@ class BoundedJobQueue:
                 request_id,
                 job_timeout_seconds=self._job_timeout_seconds,
                 daily_quota=self._daily_quota,
+                source_url=source_url,
             )
         await self.put(ref)
         logger.info(

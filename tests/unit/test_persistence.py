@@ -150,10 +150,9 @@ async def test_job_report_source_repositories() -> None:
 async def test_report_retention_configurable() -> None:
     conn = await _memory_db()
     try:
-        await conn.execute(
-            "INSERT INTO jobs (job_id, user_id, query, state, created_at, updated_at)"
-            " VALUES ('j-old', 1, 'q', 'completed', 'x', 'x')"
-        )
+        # Parent job via the repository so the jobs FK holds; the report
+        # itself is inserted raw with an aged timestamp like legacy rows.
+        await JobRepository().create(conn, job_id="j-old", user_id=1, query="q")
         old = (datetime.now(UTC) - timedelta(days=100)).isoformat()
         await conn.execute(
             "INSERT INTO reports"
@@ -176,6 +175,8 @@ async def test_tool_provider_cache_repositories() -> None:
         tools = ToolRunRepository()
         usage = ProviderUsageRepository()
         cache = CacheRepository()
+        # tool_runs/provider_usage reference jobs via FK: create the parent.
+        await JobRepository().create(conn, job_id="j1", user_id=1, query="q")
         await tools.record(conn, job_id="j1", tool_name="tavily", success=True, result_count=3)
         assert len(await tools.list_by_job(conn, "j1")) == 1
         await usage.record(conn, job_id="j1", provider="groq", model="m1", input_tokens=10)

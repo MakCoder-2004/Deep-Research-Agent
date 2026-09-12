@@ -42,6 +42,12 @@ def _is_expired(expires_at: str, now: datetime | None = None) -> bool:
     return expires is None or expires <= current
 
 
+def _is_older_than(created_at: str, cutoff: datetime) -> bool:
+    """Return True when a row predates the cutoff (fail closed on garbage)."""
+    created = _parse_iso(created_at)
+    return created is None or created <= cutoff
+
+
 class UserRepository:
     async def upsert(self, conn: aiosqlite.Connection, user_id: int, language: str = "en") -> None:
         now = _now_iso()
@@ -196,13 +202,25 @@ class JobRepository:
         depth: Depth | str = Depth.STANDARD,
         risk_level: RiskLevel | str = RiskLevel.NORMAL,
         state: JobState | str = JobState.QUEUED,
+        source_url: str | None = None,
     ) -> None:
         now = _now_iso()
+        # A job implies a known user: auto-create the parent so the
+        # users FK holds even when callers enqueue before /start.
+        # OR IGNORE preserves an existing language preference.
+        await conn.execute(
+            """
+            INSERT OR IGNORE INTO users (user_id, language, created_at, updated_at)
+            VALUES (?, 'en', ?, ?)
+            """,
+            (user_id, now, now),
+        )
         await conn.execute(
             """
             INSERT INTO jobs (job_id, user_id, query, language, domain, depth,
-                              risk_level, state, repair_count, created_at, updated_at)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, 0, ?, ?)
+                              risk_level, state, repair_count, source_url,
+                              created_at, updated_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, 0, ?, ?, ?)
             """,
             (
                 job_id,
@@ -213,6 +231,7 @@ class JobRepository:
                 Depth(depth).value,
                 RiskLevel(risk_level).value,
                 JobState(state).value,
+                source_url,
                 now,
                 now,
             ),
@@ -268,10 +287,8 @@ class ReportRepository:
             """,
             (report_id, job_id, topic, summary, markdown_path, json.dumps(tools_used), now),
         )
-        await conn.execute(
-            "INSERT INTO report_fts (report_id, topic, summary) VALUES (?, ?, ?)",
-            (report_id, topic, summary),
-        )
+        # FTS sync is owned by the trg_reports_fts_insert/update triggers so
+        # raw SQL and repository writes cannot diverge (no manual insert here).
 
     async def get(self, conn: aiosqlite.Connection, report_id: str) -> aiosqlite.Row | None:
         cursor = await conn.execute("SELECT * FROM reports WHERE report_id = ?", (report_id,))
@@ -302,13 +319,13 @@ class ReportRepository:
         reports_dir: Path | str | None = None,
     ) -> int:
         current = now or datetime.now(UTC)
-        cutoff = (current - timedelta(days=retention_days)).isoformat()
-        cursor = await conn.execute(
-            "SELECT report_id, markdown_path FROM reports WHERE created_at < ?",
-            (cutoff,),
-        )
+        cutoff = current - timedelta(days=retention_days)
+        # Parsed comparison (not lexicographic) so Z/offset/naive values
+        # behave; unparseable timestamps fail closed (treated as expired).
+        cursor = await conn.execute("SELECT report_id, markdown_path, created_at FROM reports")
         rows = await cursor.fetchall()
-        for row in rows:
+        expired = [row for row in rows if _is_older_than(str(row["created_at"]), cutoff)]
+        for row in expired:
             report_id = row["report_id"]
             try:
                 md = str(row["markdown_path"]) if row["markdown_path"] else ""
@@ -329,7 +346,7 @@ class ReportRepository:
                             target.unlink()
                 except Exception:  # noqa: S110, BLE001 - file cleanup best-effort
                     logger.debug("prune: markdown cleanup failed for %s", report_id)
-        return len(list(rows))
+        return len(expired)
 
 
 def _normalize_source(source: Source | Mapping[str, Any]) -> dict[str, Any]:

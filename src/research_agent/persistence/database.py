@@ -43,9 +43,11 @@ CREATE TABLE IF NOT EXISTS jobs (
     repair_count INTEGER NOT NULL DEFAULT 0,
     trace_id TEXT,
     error TEXT,
+    source_url TEXT,
     created_at TEXT NOT NULL,
     updated_at TEXT NOT NULL,
-    deadline_at TEXT
+    deadline_at TEXT,
+    FOREIGN KEY (user_id) REFERENCES users(user_id) ON DELETE CASCADE
 );
 CREATE INDEX IF NOT EXISTS idx_jobs_user_state ON jobs(user_id, state);
 
@@ -82,7 +84,8 @@ CREATE TABLE IF NOT EXISTS tool_runs (
     duration_ms INTEGER NOT NULL DEFAULT 0,
     result_count INTEGER NOT NULL DEFAULT 0,
     error_category TEXT,
-    created_at TEXT NOT NULL
+    created_at TEXT NOT NULL,
+    FOREIGN KEY (job_id) REFERENCES jobs(job_id) ON DELETE CASCADE
 );
 CREATE INDEX IF NOT EXISTS idx_tool_runs_job ON tool_runs(job_id);
 
@@ -95,7 +98,8 @@ CREATE TABLE IF NOT EXISTS provider_usage (
     output_tokens INTEGER NOT NULL DEFAULT 0,
     latency_ms INTEGER NOT NULL DEFAULT 0,
     cache_hit INTEGER NOT NULL DEFAULT 0,
-    created_at TEXT NOT NULL
+    created_at TEXT NOT NULL,
+    FOREIGN KEY (job_id) REFERENCES jobs(job_id) ON DELETE CASCADE
 );
 CREATE INDEX IF NOT EXISTS idx_provider_usage_job ON provider_usage(job_id);
 
@@ -113,6 +117,18 @@ CREATE VIRTUAL TABLE IF NOT EXISTS report_fts USING fts5(report_id, topic, summa
 CREATE TRIGGER IF NOT EXISTS trg_reports_fts_delete AFTER DELETE ON reports
 BEGIN
     DELETE FROM report_fts WHERE report_id = OLD.report_id;
+END;
+-- Keep FTS in sync on insert/update so raw SQL and future update paths
+-- cannot diverge from the index (repositories no longer insert manually).
+CREATE TRIGGER IF NOT EXISTS trg_reports_fts_insert AFTER INSERT ON reports
+BEGIN
+    INSERT INTO report_fts (report_id, topic, summary)
+    VALUES (NEW.report_id, NEW.topic, NEW.summary);
+END;
+CREATE TRIGGER IF NOT EXISTS trg_reports_fts_update AFTER UPDATE OF topic, summary ON reports
+BEGIN
+    UPDATE report_fts SET topic = NEW.topic, summary = NEW.summary
+    WHERE report_id = NEW.report_id;
 END;
 """
 
@@ -154,12 +170,31 @@ async def init_schema(conn: aiosqlite.Connection) -> None:
     await conn.execute("BEGIN IMMEDIATE")
     try:
         await _ensure_deadline_column(conn)
+        await _ensure_source_url_column(conn)
         await _reconcile_duplicate_active_jobs(conn)
         await _ensure_active_job_index(conn)
+        await _warn_on_fk_violations(conn)
     except BaseException:
         await conn.rollback()
         raise
     await conn.commit()
+
+
+async def _warn_on_fk_violations(conn: aiosqlite.Connection) -> None:
+    """Log (not fail) foreign-key violations left by pre-FK databases.
+
+    Fresh databases carry REFERENCES constraints; databases created before
+    this version keep working but surface orphans observably instead of
+    failing startup.
+    """
+    try:
+        cursor = await conn.execute("PRAGMA foreign_key_check")
+        violations = await cursor.fetchall()
+    except Exception:  # noqa: S110, BLE001 - diagnostic only
+        logger.debug("foreign_key_check unavailable")
+        return
+    if violations:
+        logger.warning("database has %d foreign-key violation(s)", len(list(violations)))
 
 
 async def _job_schema_is_current(conn: aiosqlite.Connection) -> bool:
@@ -167,6 +202,8 @@ async def _job_schema_is_current(conn: aiosqlite.Connection) -> bool:
     cursor = await conn.execute("PRAGMA table_info('jobs')")
     columns = {str(row["name"]) for row in await cursor.fetchall()}
     if "deadline_at" not in columns:
+        return False
+    if "source_url" not in columns:
         return False
     cursor = await conn.execute("PRAGMA index_list('jobs')")
     for row in await cursor.fetchall():
@@ -198,7 +235,16 @@ async def _ensure_deadline_column(conn: aiosqlite.Connection) -> None:
         await conn.execute("ALTER TABLE jobs ADD COLUMN deadline_at TEXT")
 
 
+async def _ensure_source_url_column(conn: aiosqlite.Connection) -> None:
+    """Add the provenance URL column to databases created by older versions."""
+    cursor = await conn.execute("PRAGMA table_info('jobs')")
+    columns = {str(row["name"]) for row in await cursor.fetchall()}
+    if "source_url" not in columns:
+        await conn.execute("ALTER TABLE jobs ADD COLUMN source_url TEXT")
+
+
 async def _reconcile_duplicate_active_jobs(conn: aiosqlite.Connection) -> None:
+    """Keep the oldest live job per user before installing the unique index."""
     """Keep the oldest live job per user before installing the unique index."""
     cursor = await conn.execute(
         """

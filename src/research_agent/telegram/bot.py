@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import inspect
 import logging
 from pathlib import Path
@@ -13,7 +14,8 @@ from aiogram.client.default import DefaultBotProperties
 from research_agent.config import Settings
 from research_agent.models import JobState
 from research_agent.persistence.database import open_db
-from research_agent.services.queue import BoundedJobQueue, JobRef, queue_position, set_state
+from research_agent.services.queue import BoundedJobQueue, set_state
+from research_agent.services.retention import RetentionPolicy, run_retention
 from research_agent.telegram.handlers import (
     clear_tracked_progress,
     register_handlers,
@@ -23,6 +25,8 @@ from research_agent.telegram.middlewares import AllowlistMiddleware
 from research_agent.telegram.texts import TelegramLimits
 
 logger = logging.getLogger(__name__)
+
+_RETENTION_SWEEP_SECONDS = 3600
 
 
 def create_bot(settings: Settings) -> Bot:
@@ -38,6 +42,7 @@ def create_dispatcher(
     reports_dir: Path | str | None = None,
     bot: Bot | None = None,
     limits: TelegramLimits | None = None,
+    retention: RetentionPolicy | None = None,
 ) -> Dispatcher:
     """Create a Dispatcher with allowlist middleware and app router."""
     dp = Dispatcher()
@@ -54,6 +59,8 @@ def create_dispatcher(
         dp.workflow_data["reports_dir"] = reports_dir
     if limits is not None:
         dp.workflow_data["limits"] = limits
+    if retention is not None:
+        dp.workflow_data["retention"] = retention
     if bot is not None:
         dp.workflow_data["bot"] = bot
     app_router = Router()
@@ -85,16 +92,52 @@ async def start_queue_worker(
     wire_queue_worker(queue)
     await _recover_queue(queue)
     await queue.start()
+    await _start_retention_task(dp, queue)
+
+
+async def _run_retention_once(
+    db_path: Path | str, policy: RetentionPolicy, reports_dir: Path | str | None
+) -> None:
+    """Run one best-effort retention sweep (sessions/reports/cache)."""
+    try:
+        async with open_db(db_path) as conn:
+            await run_retention(conn, policy, reports_dir)
+    except Exception as exc:  # noqa: BLE001 - sweeps never kill the worker
+        logger.debug("retention sweep failed: %s", type(exc).__name__)
+
+
+async def _start_retention_task(dp: Dispatcher, queue: BoundedJobQueue) -> None:
+    """Run a retention sweep now, then repeat hourly until worker stop."""
+    policy = dp.workflow_data.get("retention")
+    if not isinstance(policy, RetentionPolicy):
+        policy = RetentionPolicy()
+    reports_dir = dp.workflow_data.get("reports_dir")
+    db_path = queue.db_path
+    await _run_retention_once(db_path, policy, reports_dir)
+
+    async def _loop() -> None:
+        while True:
+            await asyncio.sleep(_RETENTION_SWEEP_SECONDS)
+            await _run_retention_once(db_path, policy, reports_dir)
+
+    dp.workflow_data["retention_task"] = asyncio.create_task(_loop())
 
 
 async def _reconcile_persisted_jobs(queue: BoundedJobQueue) -> None:
-    """Requeue durable queued jobs and fail stale active jobs after restart."""
-    pending: list[JobRef] = []
+    """Terminally reconcile rows after restart (cancel-on-restart policy).
+
+    Queued jobs are cancelled (FIFO position is not reconstructible) and
+    stale active jobs fail. Matches
+    :meth:`BoundedJobQueue.recover_pending_jobs`; kept as the fallback for
+    queue objects without that method.
+    """
+    if hasattr(queue, "recover_pending_jobs"):
+        await queue.recover_pending_jobs()
+        return
     async with open_db(queue.db_path) as conn:
         cursor = await conn.execute(
             """
-            SELECT job_id, user_id, query, state
-            FROM jobs
+            SELECT job_id, state FROM jobs
             WHERE state IN ('queued', 'active')
             ORDER BY created_at ASC, rowid ASC
             """
@@ -109,17 +152,8 @@ async def _reconcile_persisted_jobs(queue: BoundedJobQueue) -> None:
                     JobState.FAILED,
                     error="worker restarted before the job completed",
                 )
-                continue
-            pending.append(
-                JobRef(
-                    job_id=job_id,
-                    user_id=int(row["user_id"]),
-                    query=str(row["query"]),
-                    position=await queue_position(conn, job_id),
-                )
-            )
-    for job in pending:
-        await queue.put(job)
+            else:
+                await set_state(conn, job_id, JobState.CANCELLED, error="job cancelled on restart")
 
 
 async def _recover_queue(queue: BoundedJobQueue) -> None:
@@ -142,6 +176,15 @@ async def _recover_queue(queue: BoundedJobQueue) -> None:
 
 async def stop_queue_worker(dp: Dispatcher, queue: BoundedJobQueue | None = None) -> None:
     """Stop the dispatcher-attached queue worker, if any."""
+    task = dp.workflow_data.pop("retention_task", None)
+    if task is not None:
+        task.cancel()
+        try:
+            await task
+        except asyncio.CancelledError:
+            pass
+        except Exception:  # noqa: S110, BLE001 - shutdown must not raise
+            logger.debug("retention task stop failed")
     attached = queue or dp.workflow_data.get("job_queue")
     if isinstance(attached, BoundedJobQueue):
         await attached.stop()

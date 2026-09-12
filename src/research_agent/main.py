@@ -12,6 +12,7 @@ from research_agent.config import Settings, validate_at_startup
 from research_agent.observability.logging import configure_logging
 from research_agent.persistence.database import open_db
 from research_agent.services.queue import BoundedJobQueue, set_default_queue
+from research_agent.services.retention import RetentionPolicy
 from research_agent.telegram.bot import (
     create_bot,
     create_dispatcher,
@@ -72,6 +73,7 @@ async def run_telegram(settings: Settings) -> None:
             reports_dir=settings.reports_dir,
             bot=bot,
             limits=TelegramLimits.from_settings(settings),
+            retention=RetentionPolicy.from_settings(settings),
         )
         await start_queue_worker(dp, queue, bot)
         await start_polling(bot, dp)
