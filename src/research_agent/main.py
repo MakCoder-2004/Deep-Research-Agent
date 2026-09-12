@@ -27,6 +27,7 @@ def _collect_secrets(settings: Settings) -> list[str]:
         settings.groq_api_key.get_secret_value(),
         settings.openrouter_api_key.get_secret_value(),
         settings.cloudflare_api_key.get_secret_value(),
+        settings.cloudflare_account_id.get_secret_value(),
         settings.tavily_api_key.get_secret_value(),
         settings.brave_api_key.get_secret_value(),
         settings.langsmith_api_key.get_secret_value(),
