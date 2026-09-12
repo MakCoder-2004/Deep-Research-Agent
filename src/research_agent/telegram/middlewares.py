@@ -14,7 +14,14 @@ from research_agent.telegram.texts import pick_unauthorized
 
 def is_allowed(user_id: int | None, allowed: set[int]) -> bool:
     """Return True when user_id is present in the numeric allowlist."""
-    return user_id is not None and user_id in allowed
+    if user_id is None or isinstance(user_id, bool):
+        return False
+    if not isinstance(user_id, int):
+        try:
+            user_id = int(user_id)  # type: ignore[arg-type]
+        except (TypeError, ValueError):
+            return False
+    return user_id > 0 and user_id in allowed
 
 
 class AllowlistMiddleware(BaseMiddleware):
@@ -45,6 +52,9 @@ class AllowlistMiddleware(BaseMiddleware):
             )
             answer = getattr(event, "answer", None)
             if callable(answer):
-                await answer(pick_unauthorized(telegram_lang))
+                try:
+                    await answer(pick_unauthorized(telegram_lang))
+                except Exception:
+                    pass
             return None
         return await handler(event, data)

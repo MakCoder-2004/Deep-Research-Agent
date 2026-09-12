@@ -38,7 +38,9 @@ def create_dispatcher(
 ) -> Dispatcher:
     """Create a Dispatcher with allowlist middleware and app router."""
     dp = Dispatcher()
-    dp.message.outer_middleware(AllowlistMiddleware(allowed_user_ids or set()))
+    # Inner middleware (not outer): flags set by handler registration
+    # (allow_unauthorized for /whoami|/start|/help) are only visible here.
+    dp.message.middleware(AllowlistMiddleware(allowed_user_ids or set()))
     if db_path is not None:
         dp.workflow_data["db_path"] = db_path
     if job_queue is not None:
@@ -59,6 +61,10 @@ def create_dispatcher(
 
 async def start_polling(bot: Bot, dp: Dispatcher) -> None:
     """Start long polling for message updates only (no webhooks)."""
+    try:
+        await bot.delete_webhook(drop_pending_updates=True)
+    except Exception:
+        pass
     await dp.start_polling(bot, allowed_updates=["message"])
 
 
