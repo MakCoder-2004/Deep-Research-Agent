@@ -83,6 +83,16 @@ def test_plan_defaults() -> None:
     assert settings.page_cache_news_seconds == 3600
 
 
+def test_safe_extraction_defaults_and_limits() -> None:
+    settings = _make_settings()
+    assert settings.max_redirects == 3
+    assert settings.max_response_bytes == 2_000_000
+    assert settings.extraction_connect_timeout_seconds == 5.0
+    assert settings.extraction_read_timeout_seconds == 20.0
+    assert settings.respect_robots_txt is True
+    assert settings.jina_reader_enabled is False
+
+
 def test_search_concurrency_limits_parse_and_validate() -> None:
     settings = _make_settings(
         SEARCH_TOOL_CONCURRENCY=2,

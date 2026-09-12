@@ -286,6 +286,11 @@ class SourceDocument(BaseModel):
     quotations: list[str] = Field(default_factory=list)
     fetch_ms: int = Field(default=0, ge=0)
     extraction_tool: str = "beautifulsoup"
+    requested_url: HttpUrl | None = None
+    status_code: int | None = Field(default=None, ge=100, le=599)
+    content_type: str | None = None
+    bytes_read: int = Field(default=0, ge=0)
+    fallback_used: bool = False
 
     @model_validator(mode="after")
     def _require_tz_aware(self) -> SourceDocument:

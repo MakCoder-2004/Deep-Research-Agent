@@ -230,6 +230,28 @@ class Settings(BaseSettings):
     )
     page_cache_news_seconds: int = Field(default=3600, alias="PAGE_CACHE_NEWS_SECONDS", ge=60)
 
+    # Safe extraction (M4)
+    extraction_connect_timeout_seconds: float = Field(
+        default=5.0, alias="EXTRACTION_CONNECT_TIMEOUT_SECONDS", gt=0
+    )
+    extraction_read_timeout_seconds: float = Field(
+        default=20.0, alias="EXTRACTION_READ_TIMEOUT_SECONDS", gt=0
+    )
+    extraction_write_timeout_seconds: float = Field(
+        default=5.0, alias="EXTRACTION_WRITE_TIMEOUT_SECONDS", gt=0
+    )
+    extraction_pool_timeout_seconds: float = Field(
+        default=5.0, alias="EXTRACTION_POOL_TIMEOUT_SECONDS", gt=0
+    )
+    max_redirects: int = Field(default=3, alias="MAX_REDIRECTS", ge=0, le=10)
+    max_response_bytes: int = Field(
+        default=2_000_000, alias="MAX_RESPONSE_BYTES", ge=1_024, le=50_000_000
+    )
+    respect_robots_txt: bool = Field(default=True, alias="RESPECT_ROBOTS_TXT")
+    jina_reader_enabled: bool = Field(default=False, alias="JINA_READER_ENABLED")
+    jina_reader_base_url: str = Field(default="https://r.jina.ai/", alias="JINA_READER_BASE_URL")
+    jina_reader_api_key: SecretStr = Field(default=SecretStr(""), alias="JINA_READER_API_KEY")
+
     # Provider credentials (injected at runtime, never logged)
     groq_api_key: SecretStr = Field(default=SecretStr(""), alias="GROQ_API_KEY")
     openrouter_api_key: SecretStr = Field(default=SecretStr(""), alias="OPENROUTER_API_KEY")
@@ -273,7 +295,7 @@ class Settings(BaseSettings):
     langsmith_environment: Literal["development", "staging", "production"] = Field(
         default="development", alias="LANGSMITH_ENVIRONMENT"
     )
-    langsmith_trace_content: bool = Field(default=True, alias="LANGSMITH_TRACE_CONTENT")
+    langsmith_trace_content: bool = Field(default=False, alias="LANGSMITH_TRACE_CONTENT")
     langsmith_trace_sensitive_content: bool = Field(
         default=False, alias="LANGSMITH_TRACE_SENSITIVE_CONTENT"
     )

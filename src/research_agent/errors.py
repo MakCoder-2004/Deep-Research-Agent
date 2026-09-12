@@ -16,6 +16,14 @@ class ErrorCategory(StrEnum):
     BUDGET_EXHAUSTED = "budget_exhausted"
     CANCELLED = "cancelled"
     UNKNOWN = "unknown"
+    SSRF = "ssrf"
+    DNS = "dns"
+    REDIRECT = "redirect"
+    SIZE = "size"
+    MIME = "mime"
+    ROBOTS = "robots"
+    EXTRACTION = "extraction"
+    HTTP = "http"
 
 
 _RETRYABLE = frozenset({ErrorCategory.TRANSIENT, ErrorCategory.TIMEOUT, ErrorCategory.UNAVAILABLE})
@@ -82,3 +90,23 @@ class ClarificationRequiredError(AgentError):
             category=ErrorCategory.INVALID_REQUEST,
             source="analyzer",
         )
+
+
+class ExtractionError(AgentError):
+    """Normalized failure raised by the safe URL extraction boundary."""
+
+    def __init__(
+        self,
+        message: str,
+        *,
+        category: ErrorCategory = ErrorCategory.UNKNOWN,
+        url: str = "",
+        http_status: int | None = None,
+    ) -> None:
+        super().__init__(
+            message,
+            category=category,
+            source="extraction",
+            http_status=http_status,
+        )
+        self.url = url
