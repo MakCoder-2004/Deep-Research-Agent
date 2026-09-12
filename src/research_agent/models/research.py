@@ -13,6 +13,7 @@ from pydantic import (
     Field,
     FiniteFloat,
     HttpUrl,
+    field_validator,
     model_validator,
 )
 
@@ -27,6 +28,7 @@ from research_agent.models import (
     require_tz_aware,
 )
 from research_agent.models.reports import canonicalize_url
+from research_agent.models.urls import normalize_source_url
 
 
 class ResearchPlan(BaseModel):
@@ -36,6 +38,10 @@ class ResearchPlan(BaseModel):
 
     query: str = Field(min_length=1)
     language: Language = Language.MIXED
+    requested_language: Language | None = Field(
+        default=None,
+        validation_alias=AliasChoices("requested_language", "output_language"),
+    )
     domain: Domain = Domain.GENERAL
     locality: str = Field(default="global")
     jurisdictions: list[str] = Field(default_factory=list)
@@ -47,9 +53,48 @@ class ResearchPlan(BaseModel):
     tools_selected: list[str] = Field(default_factory=list)
     source_categories: list[str] = Field(default_factory=list)
     source_budget: int = Field(default=8, ge=1, le=15)
-    time_budget_seconds: int = Field(default=300, ge=30)
+    token_budget: int = Field(default=20_000, ge=1_000, le=100_000)
+    time_budget_seconds: int = Field(default=300, ge=30, le=600)
+    query_budget: int = Field(default=6, ge=1, le=6)
+    variant_budget: int = Field(default=6, ge=1, le=6)
+    task_budget: int = Field(default=12, ge=1, le=50)
+    source_url: HttpUrl | None = None
     needs_clarification: bool = False
     clarification_question: str | None = None
+
+    @field_validator("source_url", mode="before")
+    @classmethod
+    def _normalize_source_url(cls, value: object) -> object:
+        return normalize_source_url(value)
+
+    @model_validator(mode="after")
+    def _normalize_policy_lists(self) -> ResearchPlan:
+        """Keep hand-created plans within the same deterministic limits."""
+
+        def unique(values: Iterable[str], limit: int) -> list[str]:
+            output: list[str] = []
+            seen: set[str] = set()
+            for raw in values:
+                value = " ".join(str(raw).strip().split())
+                key = value.casefold()
+                if value and key not in seen:
+                    output.append(value)
+                    seen.add(key)
+                if len(output) >= limit:
+                    break
+            return output
+
+        self.subquestions = unique(self.subquestions, self.query_budget)
+        self.query_variants = unique(self.query_variants, self.variant_budget)
+        self.tools_selected = unique(self.tools_selected, self.task_budget)
+        if self.requested_language is Language.MIXED:
+            self.requested_language = None
+        return self
+
+    @property
+    def output_language(self) -> Language:
+        """Return the requested output language, or detected language by default."""
+        return self.requested_language or self.language
 
 
 class SearchTask(BaseModel):
@@ -62,6 +107,12 @@ class SearchTask(BaseModel):
     query: str = Field(min_length=1)
     language: Language = Language.MIXED
     filters: dict[str, str] = Field(default_factory=dict)
+    source_url: HttpUrl | None = None
+
+    @field_validator("source_url", mode="before")
+    @classmethod
+    def _normalize_source_url(cls, value: object) -> object:
+        return normalize_source_url(value)
 
 
 class SearchHit(BaseModel):

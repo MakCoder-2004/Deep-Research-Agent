@@ -186,7 +186,8 @@ async def test_failed_and_unknown_tools_do_not_cancel_independent_requests() -> 
 @pytest.mark.asyncio
 async def test_url_route_and_task_execution_aliases() -> None:
     plan = ResearchPlan(query="Read https://example.org/page", domain=Domain.GENERAL)
-    assert [task.tool_name for task in route_plan(plan)] == ["official_domains", "tavily"]
+    assert plan.source_url is None
+    assert route_plan(plan) == []
     tool = FakeTool("mapped", [_hit("https://mapped.example/result", "Mapped")])
     router = ToolRouter({"alias": tool})
     result = await router.execute_tasks([_task("alias")], job_id="job-alias")

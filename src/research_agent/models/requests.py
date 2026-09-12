@@ -6,9 +6,18 @@ from datetime import UTC, datetime
 from typing import Any
 from uuid import UUID, uuid4
 
-from pydantic import BaseModel, ConfigDict, Field, HttpUrl, model_validator
+from pydantic import (
+    AliasChoices,
+    BaseModel,
+    ConfigDict,
+    Field,
+    HttpUrl,
+    field_validator,
+    model_validator,
+)
 
 from research_agent.models import Depth, Domain, JobState, Language, RiskLevel, require_tz_aware
+from research_agent.models.urls import normalize_source_url
 
 FORBIDDEN_REPORT_FIELDS = frozenset(
     {
@@ -44,6 +53,28 @@ class ResearchRequest(BaseModel):
     query: str = Field(min_length=1, max_length=4000)
     language: Language = Language.MIXED
     source_url: HttpUrl | None = None
+    requested_language: Language | None = Field(
+        default=None,
+        validation_alias=AliasChoices("requested_language", "output_language"),
+    )
+
+    @field_validator("source_url", mode="before")
+    @classmethod
+    def _normalize_source_url(cls, value: object) -> object:
+        return normalize_source_url(value)
+
+    @model_validator(mode="after")
+    def _normalize_requested_language(self) -> ResearchRequest:
+        if self.requested_language is Language.MIXED:
+            self.requested_language = None
+        return self
+
+    @property
+    def output_language(self) -> Language | None:
+        """Expose the requested output language under a descriptive name."""
+        if self.requested_language is not None:
+            return self.requested_language
+        return None if self.language is Language.MIXED else self.language
 
 
 class ResearchJob(BaseModel):
@@ -55,6 +86,7 @@ class ResearchJob(BaseModel):
     user_id: int = Field(ge=1)
     query: str = Field(min_length=1, max_length=4000)
     language: Language = Language.MIXED
+    source_url: HttpUrl | None = None
     domain: Domain = Domain.GENERAL
     depth: Depth = Depth.STANDARD
     risk_level: RiskLevel = RiskLevel.NORMAL
@@ -64,6 +96,11 @@ class ResearchJob(BaseModel):
     error: str | None = None
     created_at: datetime = Field(default_factory=lambda: datetime.now(UTC))
     updated_at: datetime = Field(default_factory=lambda: datetime.now(UTC))
+
+    @field_validator("source_url", mode="before")
+    @classmethod
+    def _normalize_source_url(cls, value: object) -> object:
+        return normalize_source_url(value)
 
     @model_validator(mode="after")
     def _require_tz_aware(self) -> ResearchJob:

@@ -17,10 +17,17 @@ Covers PLAN section 9:
 from __future__ import annotations
 
 import re
+from typing import TYPE_CHECKING
+
+from pydantic import HttpUrl
 
 from research_agent.models import Depth, Domain, Language, RiskLevel
 from research_agent.models.requests import ResearchRequest
 from research_agent.models.research import ResearchPlan
+from research_agent.models.urls import normalize_source_url
+
+if TYPE_CHECKING:
+    from research_agent.config import Settings
 
 __all__ = [
     "analyze_query",
@@ -352,7 +359,9 @@ _MENA_ALIASES: dict[str, frozenset[str]] = {
     "Bahrain": frozenset({"bahrain", "bahraini", "المنامة", "البحرين"}),
     "Oman": frozenset({"oman", "omani", "muscat", "عمان", "مسقط"}),
     "Yemen": frozenset({"yemen", "yemeni", "sanaa", "اليمن", "صنعاء"}),
-    "Jordan": frozenset({"jordan", "jordanian", "amman", "الأردن", "عمان", "الأردني"}),
+    # The unvocalized Arabic name عمان is also used for Oman; do not map it
+    # to Jordan and create an ambiguous jurisdiction list.
+    "Jordan": frozenset({"jordan", "jordanian", "amman", "عمّان", "الأردن", "الأردني"}),
     "Lebanon": frozenset({"lebanon", "lebanese", "beirut", "لبنان", "بيروت"}),
     "Syria": frozenset({"syria", "syrian", "damascus", "سوريا", "دمشق"}),
     "Iraq": frozenset({"iraq", "iraqi", "baghdad", "العراق", "بغداد"}),
@@ -384,43 +393,41 @@ _MENA_ALIASES: dict[str, frozenset[str]] = {
 }
 
 _DOMAIN_TOOLS: dict[Domain, list[str]] = {
-    Domain.GENERAL: ["tavily", "brave_search", "wikipedia"],
-    Domain.ACADEMIC: ["semantic_scholar", "crossref", "arxiv", "tavily"],
-    Domain.MEDICAL: ["pubmed", "europe_pmc", "semantic_scholar", "tavily"],
+    # Keep optional fallbacks after the primary tools.  ``brave_search`` uses
+    # the news channel filter for news plans; no second adapter is needed.
+    Domain.GENERAL: ["tavily", "brave_search", "exa", "searxng", "ddgs"],
+    Domain.ACADEMIC: [
+        "semantic_scholar",
+        "crossref",
+        "arxiv",
+        "openalex",
+        "tavily",
+    ],
+    Domain.MEDICAL: [
+        "pubmed",
+        "europe_pmc",
+        "official_domains",
+        "semantic_scholar",
+        "crossref",
+        "openalex",
+        "tavily",
+    ],
     Domain.NEWS: ["gdelt", "brave_search", "tavily"],
-    Domain.TECHNICAL: ["github", "stack_exchange", "tavily", "wikipedia"],
-    Domain.MENA_LOCAL: ["brave_search", "tavily", "gdelt", "wikipedia"],
+    Domain.TECHNICAL: ["official_domains", "github", "stack_exchange", "tavily", "brave_search"],
+    Domain.MENA_LOCAL: ["brave_search", "tavily", "gdelt", "official_domains"],
     Domain.LEGAL: ["official_domains", "tavily", "brave_search"],
     Domain.FINANCIAL: ["official_domains", "tavily", "brave_search"],
 }
 
 _DOMAIN_CATEGORIES: dict[Domain, list[str]] = {
-    Domain.GENERAL: ["web", "wiki"],
-    Domain.ACADEMIC: ["academic", "paper", "web"],
-    Domain.MEDICAL: ["medical", "academic", "official"],
-    Domain.NEWS: ["news", "web"],
-    Domain.TECHNICAL: ["technical", "repository", "web"],
-    Domain.MENA_LOCAL: ["news", "web", "official"],
-    Domain.LEGAL: ["official", "web", "news"],
-    Domain.FINANCIAL: ["official", "web", "news"],
-}
-
-_DEPTH_SOURCE_BUDGET: dict[Depth, int] = {
-    Depth.QUICK: 5,
-    Depth.STANDARD: 8,
-    Depth.DEEP: 12,
-}
-
-_DEPTH_TIME_BUDGET: dict[Depth, int] = {
-    Depth.QUICK: 120,
-    Depth.STANDARD: 240,
-    Depth.DEEP: 300,
-}
-
-_DEPTH_MAX_TOOLS: dict[Depth, int] = {
-    Depth.QUICK: 2,
-    Depth.STANDARD: 4,
-    Depth.DEEP: 6,
+    Domain.GENERAL: ["web", "web", "web", "web", "web"],
+    Domain.ACADEMIC: ["academic", "academic", "academic", "academic", "web"],
+    Domain.MEDICAL: ["medical", "medical", "official", "academic", "academic", "academic", "web"],
+    Domain.NEWS: ["news", "news", "news"],
+    Domain.TECHNICAL: ["official", "technical", "technical", "web", "web"],
+    Domain.MENA_LOCAL: ["web", "web", "news", "official"],
+    Domain.LEGAL: ["official", "reputable", "news"],
+    Domain.FINANCIAL: ["official", "reputable", "news"],
 }
 
 _EN_TO_AR_HINTS: dict[str, str] = {
@@ -435,8 +442,12 @@ _EN_TO_AR_HINTS: dict[str, str] = {
     "investment": "استثمار",
     "education": "تعليم",
     "technology": "تقنية",
-    "climate": "مناخ",
     "energy": "طاقة",
+    "latest": "آخر",
+    "updates": "تحديثات",
+    "climate": "المناخ",
+    "policy": "سياسة",
+    "sources": "مصادر",
 }
 
 _AR_TO_EN_HINTS: dict[str, str] = {
@@ -454,6 +465,14 @@ _AR_TO_EN_HINTS: dict[str, str] = {
     "تقنية": "technology",
     "مناخ": "climate",
     "طاقة": "energy",
+    "الاقتصاد": "economy",
+    "آخر": "latest",
+    "الأخبار": "news",
+    "المناخ": "climate",
+    "سياسة": "policy",
+    "مصادر": "sources",
+    "حديثة": "recent",
+    "حديث": "recent",
 }
 
 _CLARIFICATION_QUESTION = (
@@ -589,16 +608,9 @@ def select_depth(
     if domain == Domain.ACADEMIC:
         return Depth.DEEP
     if domain == Domain.MENA_LOCAL or locality == "mena":
-        # Regional research needs broader bilingual coverage; deep when
-        # multi-part, comparative, contested, fresh, or non-trivial in size.
-        if (
-            len(parts) >= 2
-            or len(words) > 12
-            or freshness
-            or _contains_keyword(lowered, _CONTESTED_KEYWORDS | _COMPARISON_KEYWORDS)
-            or lowered.count("?") >= 1
-        ):
-            return Depth.DEEP
+        # Regional work needs bilingual and local-source coverage even when
+        # the wording is otherwise short.
+        return Depth.DEEP
     if len(parts) >= 3 or lowered.count("?") >= 2:
         return Depth.DEEP
     if len(words) > 40 or len(text) > 300:
@@ -619,8 +631,10 @@ def select_depth(
     return Depth.STANDARD
 
 
-def build_subquestions(query: str, language: Language, *, max_items: int = 4) -> list[str]:
+def build_subquestions(query: str, language: Language, *, max_items: int = 6) -> list[str]:
     """Generate focused deterministic subquestions (M3.4)."""
+    if max_items < 1:
+        return []
     cleaned = " ".join(query.strip().split())
     parts = _split_parts(cleaned)
     if len(parts) >= 2:
@@ -646,7 +660,7 @@ def build_subquestions(query: str, language: Language, *, max_items: int = 4) ->
     seen: set[str] = set()
     out: list[str] = []
     for item in expansions:
-        key = item.lower()
+        key = item.casefold()
         if item and key not in seen:
             seen.add(key)
             out.append(item)
@@ -680,43 +694,72 @@ def build_query_variants(
     subquestions: list[str],
     domain: Domain,
     locality: str,
+    *,
+    max_items: int = 6,
+    requested_language: Language | None = None,
 ) -> list[str]:
     """Build deduplicated search variants, bilingual when useful (M3.4)."""
+    if max_items < 1:
+        return []
     cleaned = " ".join(query.strip().split())
     candidates: list[str] = [cleaned, *subquestions]
     seen: set[str] = set()
-    variants: list[str] = []
+    base_variants: list[str] = []
     for candidate in candidates:
         normalized = " ".join(candidate.split())
-        key = normalized.lower()
+        key = normalized.casefold()
         if normalized and key not in seen:
             seen.add(key)
-            variants.append(normalized)
-        if len(variants) >= 6:
-            break
+            base_variants.append(normalized)
     needs_bilingual = (
-        domain == Domain.MENA_LOCAL or locality == "mena" or language == Language.MIXED
+        domain == Domain.MENA_LOCAL
+        or locality == "mena"
+        or language == Language.MIXED
+        or requested_language is not None
+        and requested_language is not language
     )
-    if needs_bilingual and variants:
-        blob = " ".join(variants)
+    required: list[str] = []
+    if needs_bilingual and base_variants:
+        blob = " ".join(base_variants)
         has_arabic = _ARABIC_RE.search(blob) is not None
         has_latin = _LATIN_RE.search(blob) is not None
-        if not has_arabic and len(variants) < 6:
+        if not has_arabic:
             hint = _synthesize_bilingual_hint(cleaned, "ar")
-            if hint.lower() not in seen:
-                variants.append(hint)
-        elif not has_latin and len(variants) < 6:
+            if hint.casefold() not in seen:
+                required.append(hint)
+        if not has_latin:
             hint = _synthesize_bilingual_hint(cleaned, "en")
-            if hint.lower() not in seen:
-                variants.append(hint)
-    return variants[:6]
+            if hint.casefold() not in seen and hint.casefold() not in {
+                item.casefold() for item in required
+            }:
+                required.append(hint)
+    return [*base_variants[: max_items - len(required)], *required][:max_items]
 
 
-def select_tools(domain: Domain, depth: Depth) -> tuple[list[str], list[str]]:
+def _load_settings(settings: Settings | None) -> Settings:
+    if settings is not None:
+        return settings
+    from research_agent.config import Settings as RuntimeSettings
+
+    return RuntimeSettings()
+
+
+def select_tools(
+    domain: Domain,
+    depth: Depth,
+    *,
+    settings: Settings | None = None,
+) -> tuple[list[str], list[str]]:
     """Select tools and source categories within the depth budget (M3.5)."""
+    config = _load_settings(settings)
+    max_tools = {
+        Depth.QUICK: config.quick_max_tools,
+        Depth.STANDARD: config.standard_max_tools,
+        Depth.DEEP: config.deep_max_tools,
+    }[depth]
     tools = list(_DOMAIN_TOOLS.get(domain, _DOMAIN_TOOLS[Domain.GENERAL]))
     categories = list(_DOMAIN_CATEGORIES.get(domain, _DOMAIN_CATEGORIES[Domain.GENERAL]))
-    return (tools[: _DEPTH_MAX_TOOLS[depth]], categories)
+    return (tools[:max_tools], categories)
 
 
 def is_ambiguous(query: str) -> bool:
@@ -735,41 +778,102 @@ def is_ambiguous(query: str) -> bool:
     return False
 
 
-def analyze_query(query: str) -> ResearchPlan:
+def _source_url_from_text(text: str) -> str | None:
+    match = _URL_RE.search(text)
+    if match is None:
+        return None
+    value = normalize_source_url(match.group(0))
+    return value if isinstance(value, str) and value else None
+
+
+def _budget_values(depth: Depth, settings: Settings) -> dict[str, int]:
+    source_by_depth = {
+        Depth.QUICK: settings.quick_source_budget,
+        Depth.STANDARD: settings.standard_source_budget,
+        Depth.DEEP: settings.deep_source_budget,
+    }
+    token_by_depth = {
+        Depth.QUICK: settings.quick_token_budget,
+        Depth.STANDARD: settings.standard_token_budget,
+        Depth.DEEP: settings.deep_token_budget,
+    }
+    time_by_depth = {
+        Depth.QUICK: settings.quick_time_budget_seconds,
+        Depth.STANDARD: settings.standard_time_budget_seconds,
+        Depth.DEEP: settings.deep_time_budget_seconds,
+    }
+    return {
+        # A configured cap wins when it is intentionally below a PLAN range.
+        "source": min(source_by_depth[depth], settings.sources_per_job, settings.source_budget),
+        "token": min(token_by_depth[depth], settings.token_budget),
+        "time": min(
+            time_by_depth[depth], settings.time_budget_seconds, settings.job_timeout_seconds
+        ),
+        "query": min(settings.search_subqueries_per_job, settings.query_budget, 6),
+        "variant": min(settings.search_variants_per_job, settings.variant_budget, 6),
+        "task": min(settings.search_tasks_per_job, settings.task_budget),
+    }
+
+
+def _url_plan(
+    cleaned: str,
+    source_url: str,
+    settings: Settings,
+    requested_language: Language | None,
+) -> ResearchPlan:
+    context = " ".join(_URL_RE.sub("", cleaned).split()).strip(" -:;")
+    language = detect_language(context) if context else Language.MIXED
+    domain = classify_domain(context) if context else Domain.GENERAL
+    locality, jurisdictions = detect_locality(context)
+    if jurisdictions and domain == Domain.GENERAL:
+        domain = Domain.MENA_LOCAL
+    freshness = requires_freshness(context)
+    risk = assess_risk(domain, context)
+    depth = select_depth(context, domain, risk, freshness, locality)
+    budgets = _budget_values(depth, settings)
+    return ResearchPlan(
+        # Preserve the user's context, but do not append the URL a second time.
+        query=cleaned,
+        language=language,
+        requested_language=requested_language,
+        domain=domain,
+        locality=locality,
+        jurisdictions=jurisdictions,
+        requires_freshness=freshness,
+        risk_level=risk,
+        depth=depth,
+        subquestions=[cleaned],
+        query_variants=[cleaned],
+        tools_selected=[],
+        source_categories=["direct_url"],
+        source_budget=budgets["source"],
+        token_budget=budgets["token"],
+        time_budget_seconds=budgets["time"],
+        query_budget=budgets["query"],
+        variant_budget=budgets["variant"],
+        task_budget=budgets["task"],
+        source_url=HttpUrl(source_url),
+    )
+
+
+def analyze_query(
+    query: str,
+    *,
+    settings: Settings | None = None,
+    requested_language: Language | None = None,
+    source_url: object | None = None,
+) -> ResearchPlan:
     """Analyze a raw query string into a validated ResearchPlan (M3.7)."""
     cleaned = " ".join(query.strip().split())
     if not cleaned:
         raise ValueError("Query must not be empty.")
-    if _URL_RE.search(cleaned) is not None:
-        # Provided-URL research: keep the URL as the topic and prefer direct fetch.
-        language = detect_language(_URL_RE.sub("", cleaned))
-        domain = Domain.GENERAL
-        locality, jurisdictions = detect_locality(cleaned)
-        freshness = False
-        risk = RiskLevel.NORMAL
-        depth = Depth.STANDARD
-        subquestions = [cleaned]
-        variants = [cleaned]
-        tools = ["official_domains", "tavily"]
-        categories = ["web", "official"]
-        return ResearchPlan(
-            query=cleaned,
-            language=language,
-            domain=domain,
-            locality=locality,
-            jurisdictions=jurisdictions,
-            requires_freshness=freshness,
-            risk_level=risk,
-            depth=depth,
-            subquestions=subquestions,
-            query_variants=variants,
-            tools_selected=tools,
-            source_categories=categories,
-            source_budget=_DEPTH_SOURCE_BUDGET[depth],
-            time_budget_seconds=_DEPTH_TIME_BUDGET[depth],
-            needs_clarification=False,
-            clarification_question=None,
-        )
+    config = _load_settings(settings)
+    requested = None if requested_language is Language.MIXED else requested_language
+    structured_url = normalize_source_url(source_url) if source_url is not None else None
+    if not isinstance(structured_url, str) or not structured_url:
+        structured_url = _source_url_from_text(cleaned)
+    if structured_url is not None:
+        return _url_plan(cleaned, structured_url, config, requested)
 
     language = detect_language(cleaned)
     domain = classify_domain(cleaned)
@@ -780,33 +884,28 @@ def analyze_query(query: str) -> ResearchPlan:
     freshness = requires_freshness(cleaned)
     risk = assess_risk(domain, cleaned)
     depth = select_depth(cleaned, domain, risk, freshness, locality)
-    subquestions = build_subquestions(cleaned, language)
-    variants = build_query_variants(cleaned, language, subquestions, domain, locality)
-    tools_selected, categories = select_tools(domain, depth)
+    budgets = _budget_values(depth, config)
+    subquestions = build_subquestions(cleaned, language, max_items=budgets["query"])
+    variants = build_query_variants(
+        cleaned,
+        language,
+        subquestions,
+        domain,
+        locality,
+        max_items=budgets["variant"],
+        requested_language=requested,
+    )
+    tools_selected, categories = select_tools(domain, depth, settings=config)
+    tools_selected = tools_selected[: min(len(tools_selected), budgets["task"], budgets["source"])]
 
-    if is_ambiguous(cleaned):
-        return ResearchPlan(
-            query=cleaned,
-            language=language,
-            domain=domain,
-            locality=locality,
-            jurisdictions=jurisdictions,
-            requires_freshness=freshness,
-            risk_level=risk,
-            depth=depth,
-            subquestions=[cleaned] if not subquestions else subquestions[:1],
-            query_variants=[cleaned] if not variants else variants[:1],
-            tools_selected=tools_selected,
-            source_categories=categories,
-            source_budget=_DEPTH_SOURCE_BUDGET[depth],
-            time_budget_seconds=_DEPTH_TIME_BUDGET[depth],
-            needs_clarification=True,
-            clarification_question=_CLARIFICATION_QUESTION,
-        )
-
+    needs_clarification = is_ambiguous(cleaned)
+    if needs_clarification:
+        subquestions = [cleaned]
+        variants = [cleaned]
     return ResearchPlan(
         query=cleaned,
         language=language,
+        requested_language=requested,
         domain=domain,
         locality=locality,
         jurisdictions=jurisdictions,
@@ -817,24 +916,31 @@ def analyze_query(query: str) -> ResearchPlan:
         query_variants=variants,
         tools_selected=tools_selected,
         source_categories=categories,
-        source_budget=_DEPTH_SOURCE_BUDGET[depth],
-        time_budget_seconds=_DEPTH_TIME_BUDGET[depth],
-        needs_clarification=False,
-        clarification_question=None,
+        source_budget=budgets["source"],
+        token_budget=budgets["token"],
+        time_budget_seconds=budgets["time"],
+        query_budget=budgets["query"],
+        variant_budget=budgets["variant"],
+        task_budget=budgets["task"],
+        needs_clarification=needs_clarification,
+        clarification_question=_CLARIFICATION_QUESTION if needs_clarification else None,
     )
 
 
-def analyze_request(request: ResearchRequest) -> ResearchPlan:
+def analyze_request(
+    request: ResearchRequest,
+    *,
+    settings: Settings | None = None,
+) -> ResearchPlan:
     """Analyze a validated ResearchRequest into a validated ResearchPlan."""
-    text = request.query.strip()
-    if request.source_url is not None:
-        text = f"{text} {request.source_url}".strip()
-    plan = analyze_query(text)
-    # Preserve the caller-declared language hint only when detection saw English
-    # but the session explicitly prefers Arabic (or vice versa); detection wins
-    # for mixed content so bilingual expansion is not lost.
-    if plan.language == Language.ENGLISH and request.language == Language.ARABIC:
-        plan = plan.model_copy(update={"language": Language.ARABIC})
-    elif plan.language == Language.ARABIC and request.language == Language.ENGLISH:
-        plan = plan.model_copy(update={"language": Language.ENGLISH})
-    return plan
+    requested = request.requested_language
+    if requested is None and request.language is not Language.MIXED:
+        requested = request.language
+    # Keep source_url structured instead of concatenating it into the search
+    # query.  This avoids duplicated URLs for URL-only gateway requests.
+    return analyze_query(
+        request.query,
+        settings=settings,
+        requested_language=requested,
+        source_url=request.source_url,
+    )

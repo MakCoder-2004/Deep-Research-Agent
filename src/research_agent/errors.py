@@ -69,3 +69,15 @@ class AgentError(Exception):
         self.source = source
         self.http_status = http_status
         self.retry_after = retry_after
+
+
+class ClarificationRequiredError(AgentError):
+    """Raised when execution is attempted before an ambiguous request is clarified."""
+
+    def __init__(self, question: str) -> None:
+        self.question = question
+        super().__init__(
+            question,
+            category=ErrorCategory.INVALID_REQUEST,
+            source="analyzer",
+        )

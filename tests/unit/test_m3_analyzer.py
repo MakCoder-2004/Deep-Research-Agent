@@ -118,4 +118,5 @@ def test_urls_are_not_blocked_by_clarification_gate() -> None:
 
     assert is_ambiguous(plan.query) is False
     assert plan.needs_clarification is False
-    assert plan.tools_selected == ["official_domains", "tavily"]
+    assert str(plan.source_url) == "https://example.org/research"
+    assert plan.tools_selected == []

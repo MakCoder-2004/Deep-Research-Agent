@@ -145,10 +145,36 @@ class Settings(BaseSettings):
     deep_requests_per_user_per_day: int = Field(
         default=3, alias="DEEP_REQUESTS_PER_USER_PER_DAY", ge=0, le=100
     )
-    search_subqueries_per_job: int = Field(
-        default=6, alias="SEARCH_SUBQUERIES_PER_JOB", ge=1, le=20
+    search_subqueries_per_job: int = Field(default=6, alias="SEARCH_SUBQUERIES_PER_JOB", ge=1, le=6)
+    search_variants_per_job: int = Field(default=6, alias="SEARCH_VARIANTS_PER_JOB", ge=1, le=6)
+    search_tasks_per_job: int = Field(default=12, alias="SEARCH_TASKS_PER_JOB", ge=1, le=50)
+    sources_per_job: int = Field(default=12, alias="SOURCES_PER_JOB", ge=1, le=15)
+    source_budget: int = Field(default=12, alias="SOURCE_BUDGET", ge=1, le=15)
+    query_budget: int = Field(default=6, alias="QUERY_BUDGET", ge=1, le=6)
+    variant_budget: int = Field(default=6, alias="VARIANT_BUDGET", ge=1, le=6)
+    task_budget: int = Field(default=12, alias="TASK_BUDGET", ge=1, le=50)
+    token_budget: int = Field(default=40_000, alias="TOKEN_BUDGET", ge=1_000, le=100_000)
+    time_budget_seconds: int = Field(default=300, alias="TIME_BUDGET_SECONDS", ge=30, le=600)
+    quick_source_budget: int = Field(default=5, alias="QUICK_SOURCE_BUDGET", ge=3, le=5)
+    standard_source_budget: int = Field(default=8, alias="STANDARD_SOURCE_BUDGET", ge=5, le=10)
+    deep_source_budget: int = Field(default=12, alias="DEEP_SOURCE_BUDGET", ge=8, le=15)
+    quick_token_budget: int = Field(default=8_000, alias="QUICK_TOKEN_BUDGET", ge=1_000, le=100_000)
+    standard_token_budget: int = Field(
+        default=20_000, alias="STANDARD_TOKEN_BUDGET", ge=1_000, le=100_000
     )
-    sources_per_job: int = Field(default=12, alias="SOURCES_PER_JOB", ge=1, le=50)
+    deep_token_budget: int = Field(default=40_000, alias="DEEP_TOKEN_BUDGET", ge=1_000, le=100_000)
+    quick_time_budget_seconds: int = Field(
+        default=120, alias="QUICK_TIME_BUDGET_SECONDS", ge=30, le=600
+    )
+    standard_time_budget_seconds: int = Field(
+        default=240, alias="STANDARD_TIME_BUDGET_SECONDS", ge=30, le=600
+    )
+    deep_time_budget_seconds: int = Field(
+        default=300, alias="DEEP_TIME_BUDGET_SECONDS", ge=30, le=600
+    )
+    quick_max_tools: int = Field(default=2, alias="QUICK_MAX_TOOLS", ge=1, le=6)
+    standard_max_tools: int = Field(default=4, alias="STANDARD_MAX_TOOLS", ge=1, le=6)
+    deep_max_tools: int = Field(default=6, alias="DEEP_MAX_TOOLS", ge=1, le=6)
     chars_per_source: int = Field(default=20000, alias="CHARS_PER_SOURCE", ge=1000, le=100000)
     reader_context_chars: int = Field(
         default=40000, alias="READER_CONTEXT_CHARS", ge=4000, le=500000

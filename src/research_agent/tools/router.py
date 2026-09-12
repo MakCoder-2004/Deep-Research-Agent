@@ -14,9 +14,10 @@ from typing import TYPE_CHECKING, Any, Protocol, cast
 
 from pydantic import ValidationError
 
-from research_agent.errors import ErrorCategory
+from research_agent.errors import ClarificationRequiredError, ErrorCategory
 from research_agent.models.reports import canonicalize_url
 from research_agent.models.research import ResearchPlan, SearchHit, SearchTask
+from research_agent.models.urls import normalize_source_url
 from research_agent.observability.redaction import redact_mapping, redact_text
 from research_agent.tools._common import timeout_for_task
 from research_agent.tools.base import ResearchTool, ToolError
@@ -45,27 +46,31 @@ __all__ = [
 SOURCE_PRIORITIES: dict[str, tuple[str, ...]] = {
     "general": ("tavily", "brave_search", "exa", "searxng", "ddgs"),
     "academic": ("semantic_scholar", "crossref", "arxiv", "openalex", "tavily"),
-    "medical": ("pubmed", "europe_pmc", "official_domains", "semantic_scholar", "tavily"),
+    "medical": (
+        "pubmed",
+        "europe_pmc",
+        "official_domains",
+        "semantic_scholar",
+        "crossref",
+        "openalex",
+        "tavily",
+    ),
     "news": ("gdelt", "brave_search", "tavily"),
-    "technical": ("official_domains", "github", "stack_exchange", "tavily"),
+    "technical": ("official_domains", "github", "stack_exchange", "tavily", "brave_search"),
     "mena_local": ("brave_search", "tavily", "gdelt", "official_domains"),
     "legal": ("official_domains", "tavily", "brave_search"),
     "financial": ("official_domains", "tavily", "brave_search"),
-    # Direct extraction belongs to M4, so the current analyzer's URL plan is
-    # deliberately represented by the available discovery tools here.
-    "url": ("official_domains", "tavily"),
 }
 
 _DOMAIN_CATEGORIES: dict[str, tuple[str, ...]] = {
-    "general": ("web", "wiki"),
-    "academic": ("academic", "paper", "web"),
-    "medical": ("medical", "academic", "official"),
-    "news": ("news", "web"),
-    "technical": ("technical", "repository", "web"),
-    "mena_local": ("news", "web", "official"),
-    "legal": ("official", "web", "news"),
-    "financial": ("official", "web", "news"),
-    "url": ("official", "web"),
+    "general": ("web", "web", "web", "web", "web"),
+    "academic": ("academic", "academic", "academic", "academic", "web"),
+    "medical": ("medical", "medical", "official", "academic", "academic", "academic", "web"),
+    "news": ("news", "news", "news"),
+    "technical": ("official", "technical", "technical", "web", "web"),
+    "mena_local": ("web", "web", "news", "official"),
+    "legal": ("official", "reputable", "news"),
+    "financial": ("official", "reputable", "news"),
 }
 _URL_RE = re.compile(r"https?://\S+", re.IGNORECASE)
 
@@ -151,11 +156,21 @@ class ToolRunRecorder:
         )
 
 
+def _source_url_for_plan(plan: ResearchPlan) -> str | None:
+    if plan.source_url is not None:
+        return str(plan.source_url)
+    match = _URL_RE.search(plan.query)
+    if match is None:
+        return None
+    value = normalize_source_url(match.group(0))
+    return value if isinstance(value, str) and value else None
+
+
 def _selected_tools(plan: ResearchPlan) -> list[str]:
+    if _source_url_for_plan(plan) is not None:
+        return []
     domain = plan.domain.value
     names = plan.tools_selected or list(SOURCE_PRIORITIES.get(domain, SOURCE_PRIORITIES["general"]))
-    if _URL_RE.search(plan.query) is not None:
-        names = plan.tools_selected or list(SOURCE_PRIORITIES["url"])
     selected: list[str] = []
     seen: set[str] = set()
     for raw_name in names:
@@ -166,19 +181,37 @@ def _selected_tools(plan: ResearchPlan) -> list[str]:
     return selected
 
 
-def route_plan(plan: ResearchPlan, *, expand_variants: bool = False) -> list[SearchTask]:
+def route_plan(
+    plan: ResearchPlan,
+    *,
+    expand_variants: bool = False,
+    raise_on_clarification: bool = False,
+) -> list[SearchTask]:
     """Turn a validated plan into ordered, deterministic search tasks.
 
     One request per selected tool is the default.  Callers that explicitly
-    want every bilingual/subquestion variant can opt into the Cartesian
-    expansion without changing the plan's source priority order.
+    want variants can opt into bounded expansion. URL plans are handed to the
+    extraction milestone through ``ResearchPlan.source_url`` and never become
+    search requests.
     """
 
+    if plan.needs_clarification:
+        if raise_on_clarification:
+            raise ClarificationRequiredError(
+                plan.clarification_question or "Clarification is required before searching."
+            )
+        return []
+    if _source_url_for_plan(plan) is not None:
+        return []
     tools = _selected_tools(plan)
     if not tools:
         return []
-    domain = "url" if _URL_RE.search(plan.query) is not None else plan.domain.value
+    domain = plan.domain.value
     categories = plan.source_categories or list(_DOMAIN_CATEGORIES.get(domain, ("web",)))
+    tools = tools[: min(plan.task_budget, plan.source_budget)]
+    if not tools:
+        return []
+
     variants = [plan.query]
     if expand_variants:
         variants = []
@@ -189,17 +222,23 @@ def route_plan(plan: ResearchPlan, *, expand_variants: bool = False) -> list[Sea
             if value and key not in seen_variants:
                 variants.append(value)
                 seen_variants.add(key)
-    per_tool = max(1, math.ceil(plan.source_budget / len(tools)))
+                if len(variants) >= min(plan.query_budget, plan.variant_budget):
+                    break
+    task_limit = min(plan.task_budget, plan.source_budget)
+    task_count = min(task_limit, len(variants) * len(tools))
+    base_results, extra_results = divmod(plan.source_budget, task_count)
     freshness = "pw" if plan.requires_freshness else ""
     tasks: list[SearchTask] = []
     task_number = 0
     for variant_index, query in enumerate(variants):
         for priority, tool_name in enumerate(tools):
+            if len(tasks) >= task_limit:
+                break
             task_number += 1
             filters = {
                 "source_category": categories[min(priority, len(categories) - 1)],
                 "source_priority": str(priority),
-                "max_results": str(min(10, per_tool)),
+                "max_results": str(min(10, base_results + (task_number <= extra_results))),
             }
             if freshness:
                 filters["freshness"] = freshness
@@ -207,6 +246,18 @@ def route_plan(plan: ResearchPlan, *, expand_variants: bool = False) -> list[Sea
                 filters["locality"] = plan.locality
             if plan.jurisdictions:
                 filters["jurisdictions"] = ",".join(plan.jurisdictions)
+            if plan.domain.value == "news" and tool_name == "brave_search":
+                filters["channel"] = "news"
+            if plan.locality == "mena":
+                filters["region"] = "mena"
+                filters["search_languages"] = "ar,en"
+                filters["search_lang"] = "ar" if re.search(r"[\u0600-\u06ff]", query) else "en"
+                if plan.domain.value == "mena_local" and tool_name == "official_domains":
+                    filters["official_scope"] = "local"
+            if plan.domain.value == "medical" and tool_name == "official_domains":
+                filters["official_scope"] = "who,government"
+            if plan.domain.value in {"legal", "financial"}:
+                filters["source_scope"] = "official,reputable,news"
             if expand_variants:
                 filters["query_variant"] = str(variant_index)
             tasks.append(
@@ -218,6 +269,8 @@ def route_plan(plan: ResearchPlan, *, expand_variants: bool = False) -> list[Sea
                     filters=filters,
                 )
             )
+        if len(tasks) >= task_limit:
+            break
     return tasks
 
 
@@ -426,8 +479,18 @@ class ToolRouter:
         """Return registered tool names in deterministic order."""
         return tuple(sorted(self._tools))
 
-    def route_plan(self, plan: ResearchPlan, *, expand_variants: bool = False) -> list[SearchTask]:
-        return route_plan(plan, expand_variants=expand_variants)
+    def route_plan(
+        self,
+        plan: ResearchPlan,
+        *,
+        expand_variants: bool = False,
+        raise_on_clarification: bool = False,
+    ) -> list[SearchTask]:
+        return route_plan(
+            plan,
+            expand_variants=expand_variants,
+            raise_on_clarification=raise_on_clarification,
+        )
 
     def _provider_for(self, name: str, tool: ResearchTool) -> str:
         return self._tool_providers.get(
@@ -687,8 +750,13 @@ class ToolRouter:
     ) -> ToolExecutionResult:
         """Route and execute one plan using its configured time budget."""
 
+        if plan.needs_clarification:
+            raise ClarificationRequiredError(
+                plan.clarification_question or "Clarification is required before searching."
+            )
+        tasks = self.route_plan(plan, expand_variants=expand_variants)
         return await self.execute(
-            self.route_plan(plan, expand_variants=expand_variants),
+            tasks,
             job_id=job_id,
             deadline=deadline,
             timeout_seconds=(
