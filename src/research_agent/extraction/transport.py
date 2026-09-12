@@ -12,7 +12,6 @@ from typing import Any
 
 import httpcore
 import httpx
-from httpcore._backends.auto import AutoBackend
 
 __all__ = ["PinnedAsyncHTTPTransport", "PinnedNetworkBackend", "pinned_route"]
 
@@ -48,7 +47,7 @@ class PinnedNetworkBackend(httpcore.AsyncNetworkBackend):
     """
 
     def __init__(self) -> None:
-        self._backend = AutoBackend()
+        self._backend = httpcore.AnyIOBackend()
 
     async def connect_tcp(
         self,
