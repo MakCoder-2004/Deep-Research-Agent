@@ -13,3 +13,12 @@ uv run ruff check .
 uv run mypy src
 uv run pytest -q
 ```
+
+## Milestone 4 — Safe Extraction
+
+`research_agent.extraction.SafeExtractor` provides the M3 source handoff for
+bounded HTML documents. It validates HTTP(S) URLs, rejects non-public DNS
+destinations, pins validated addresses for each request, manually revalidates
+redirects, respects `robots.txt`, streams within response limits, and never
+executes page JavaScript. Jina Reader is disabled by default and can only be
+enabled as a fallback for extraction failures through runtime settings.
