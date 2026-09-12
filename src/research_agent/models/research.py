@@ -2,10 +2,19 @@
 
 from __future__ import annotations
 
+from collections.abc import Iterable
 from datetime import UTC, datetime
 from uuid import UUID
 
-from pydantic import BaseModel, ConfigDict, Field, HttpUrl, model_validator
+from pydantic import (
+    AliasChoices,
+    BaseModel,
+    ConfigDict,
+    Field,
+    FiniteFloat,
+    HttpUrl,
+    model_validator,
+)
 
 from research_agent.models import (
     ClaimType,
@@ -17,6 +26,7 @@ from research_agent.models import (
     SourceType,
     require_tz_aware,
 )
+from research_agent.models.reports import canonicalize_url
 
 
 class ResearchPlan(BaseModel):
@@ -88,6 +98,124 @@ class SearchHit(BaseModel):
                 names.append(name)
         self.tool_names = names
         return self
+
+
+class SourceCandidate(BaseModel):
+    """Stable, metadata-complete handoff from retrieval to extraction.
+
+    ``canonical_url`` is the URL used for identity and future fetching.  The
+    ``url`` input/property keeps callers that use the existing ``SearchHit``
+    shape source-compatible without making the serialized contract ambiguous.
+    """
+
+    model_config = ConfigDict(
+        extra="forbid",
+        populate_by_name=True,
+    )
+
+    source_id: int = Field(ge=1)
+    canonical_url: HttpUrl = Field(validation_alias=AliasChoices("canonical_url", "url"))
+    original_url: HttpUrl | None = None
+    aliases: list[HttpUrl] = Field(default_factory=list)
+    title: str = Field(min_length=1)
+    snippet: str = ""
+    publisher: str | None = None
+    published_at: datetime | None = None
+    accessed_at: datetime
+    source_type: SourceType = SourceType.WEB
+    doi: str | None = None
+    content_hash: str | None = None
+    score: FiniteFloat = 0.0
+    tool_name: str = Field(min_length=1)
+    tool_names: list[str] = Field(default_factory=list)
+
+    @property
+    def url(self) -> HttpUrl:
+        """Expose the canonical URL under the existing ``SearchHit`` name."""
+        return self.canonical_url
+
+    @property
+    def id(self) -> int:
+        """Expose the source ID under the report model's conventional name."""
+        return self.source_id
+
+    @model_validator(mode="after")
+    def _validate_contract(self) -> SourceCandidate:
+        if canonicalize_url(self.canonical_url) != str(self.canonical_url):
+            raise ValueError("canonical_url must already be canonicalized.")
+        if self.original_url is None:
+            self.original_url = self.canonical_url
+        alias_values = [str(alias) for alias in self.aliases]
+        if len(alias_values) != len(set(alias_values)):
+            raise ValueError("aliases must not contain duplicates.")
+        if self.doi is not None and not self.doi.strip():
+            raise ValueError("doi must not be blank when provided.")
+        if self.content_hash is not None and not self.content_hash.strip():
+            raise ValueError("content_hash must not be blank when provided.")
+        require_tz_aware(self.accessed_at, "accessed_at")
+        require_tz_aware(self.published_at, "published_at")
+
+        tool_names: list[str] = []
+        for name in [self.tool_name, *self.tool_names]:
+            normalized = name.strip()
+            if not normalized:
+                raise ValueError("tool names must not be blank.")
+            if normalized not in tool_names:
+                tool_names.append(normalized)
+        self.tool_name = tool_names[0]
+        self.tool_names = tool_names
+        return self
+
+    @classmethod
+    def from_search_hit(cls, hit: SearchHit, *, source_id: int) -> SourceCandidate:
+        """Convert one ranked-compatible hit without discarding its metadata."""
+        canonical = canonicalize_url(hit.url)
+        aliases: list[str] = []
+        for alias in hit.aliases:
+            value = str(alias)
+            if value not in aliases:
+                aliases.append(value)
+        return cls(
+            source_id=source_id,
+            canonical_url=HttpUrl(canonical),
+            original_url=hit.url,
+            aliases=[HttpUrl(alias) for alias in aliases],
+            title=hit.title,
+            snippet=hit.snippet,
+            publisher=hit.publisher,
+            published_at=hit.published_at,
+            accessed_at=hit.accessed_at,
+            source_type=hit.source_type,
+            doi=hit.doi,
+            content_hash=hit.content_hash,
+            score=hit.score,
+            tool_name=hit.tool_name,
+            tool_names=hit.tool_names,
+        )
+
+    @classmethod
+    def from_ranked_hits(
+        cls,
+        hits: Iterable[SearchHit],
+        *,
+        first_source_id: int = 1,
+    ) -> list[SourceCandidate]:
+        """Assign deterministic one-based IDs in the supplied ranking order."""
+        if first_source_id < 1:
+            raise ValueError("first_source_id must be positive.")
+        return [
+            cls.from_search_hit(hit, source_id=first_source_id + index)
+            for index, hit in enumerate(hits)
+        ]
+
+
+def source_candidates_from_ranked_hits(
+    hits: Iterable[SearchHit],
+    *,
+    first_source_id: int = 1,
+) -> list[SourceCandidate]:
+    """Convert ranked ``SearchHit`` records into the M4 source contract."""
+    return SourceCandidate.from_ranked_hits(hits, first_source_id=first_source_id)
 
 
 class SourceDocument(BaseModel):
