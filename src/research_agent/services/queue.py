@@ -858,11 +858,14 @@ class BoundedJobQueue:
         """
         from research_agent.telegram.progress import (
             ProgressStage,
+            cleanup_progress,
             get_progress,
+            get_progress_state,
             update_progress,
         )
 
         cancel_event = get_cancel_event(job.job_id)
+        job_lang = "mixed"
         async with open_db(self._db_path) as conn:
             row = await JobRepository().get(conn, job.job_id)
             if row is None:
@@ -877,10 +880,23 @@ class BoundedJobQueue:
                 await set_state(conn, job.job_id, JobState.CANCELLED)
                 return
             try:
+                job_lang = str(row["language"] or "mixed")
+            except Exception:
+                job_lang = "mixed"
+            try:
                 await set_state(conn, job.job_id, JobState.ACTIVE)
             except ValueError:
                 # Cancellation may win between the state read and update.
                 return
+        # Prefer the tracked progress language (handler wiring) over the
+        # persisted job language so AR users keep AR edits.
+        try:
+            tracked = get_progress_state(job.job_id)
+            lang = tracked["lang"] if tracked else job_lang
+        except Exception:
+            lang = job_lang
+        if lang not in ("en", "ar"):
+            lang = "mixed" if lang == "mixed" else "en"
         cancelled = False
         for stage in list(ProgressStage):
             if cancel_event.is_set():
@@ -896,7 +912,7 @@ class BoundedJobQueue:
                             chat_id,
                             message_id,
                             stage,
-                            "en",
+                            lang,
                             job_id=job.job_id,
                         )
                     except Exception as exc:  # noqa: BLE001 - never fail job on edit
@@ -920,3 +936,7 @@ class BoundedJobQueue:
             except ValueError:
                 # Terminal already (e.g. concurrent cancel); keep first state.
                 pass
+        try:
+            cleanup_progress(job.job_id)
+        except Exception:
+            pass

@@ -87,6 +87,10 @@ def _bound_progress_registry() -> None:
 
 def _resolve_stage(stage: ProgressStage | str) -> ProgressStage:
     """Normalize an unknown stage to the safe initial stage."""
+    if isinstance(stage, str):
+        lowered = stage.strip().lower()
+        if lowered in {"critique", "critic", "checking", "check"}:
+            return ProgressStage.CHECKING
     try:
         return ProgressStage(stage)
     except ValueError:
@@ -175,10 +179,12 @@ def format_initial_text(
     lang: str,
 ) -> str:
     """Format the initial progress text with stage, short ID, and queue slot."""
+    from research_agent.telegram.renderer import escape_markdown_v2
+
     key = _resolve_stage(stage)
     resolved = _resolve_lang(lang)
     stage_line = STAGE_TEXT[key][resolved]
-    short_id = job_id[:8]
+    short_id = escape_markdown_v2(job_id[:8])
     if position is not None and position > 0:
         if resolved == "ar":
             return f"{stage_line}\nالمهمة {short_id} في قائمة الانتظار #{position}."
@@ -216,7 +222,9 @@ async def safe_edit(bot: Bot, chat_id: int, message_id: int, text: str) -> bool:
             delay = float(raw_wait)
         except (TypeError, ValueError):
             delay = 1.0
-        delay = min(max(delay, 0.0), 10.0)
+        # Respect the full server-requested backoff (no 10s cap); Telegram
+        # may ask for 30-60s during floods and re-editing early extends bans.
+        delay = max(delay, 0.0)
         logger.warning(
             "progress edit rate-limited, backing off once: %s",
             redact_text(f"{type(exc).__name__}: {exc}"),
@@ -284,9 +292,12 @@ async def update_progress(
     else:
         stage_line = STAGE_TEXT[key].get(resolved, STAGE_TEXT[key]["en"])
         text = stage_line
-    if job_id:
+    ok = await safe_edit(bot, chat_id, message_id, text)
+    # Record only confirmed stages so /status never shows a phantom stage
+    # the user never saw (M2.19-21 fix).
+    if ok and job_id:
         _record_progress_state(job_id, chat_id, message_id, key, resolved, text)
-    return await safe_edit(bot, chat_id, message_id, text)
+    return ok
 
 
 async def publish_progress(
