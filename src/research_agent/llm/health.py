@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import inspect
 import logging
 import time
 from collections.abc import Mapping
@@ -116,6 +117,22 @@ async def check_llm_health(
     return results
 
 
+async def _close_temporary_providers(router: LLMRouter) -> None:
+    """Close clients created by a temporary startup router, if supported."""
+    for provider in router.providers:
+        close = getattr(provider, "aclose", None)
+        if not callable(close):
+            continue
+        try:
+            result = close()
+            if inspect.isawaitable(result):
+                await result
+        except asyncio.CancelledError:
+            raise
+        except Exception:  # noqa: BLE001 - cleanup must not hide startup status
+            logger.debug("llm provider close failed: provider=%s", provider.metadata.name)
+
+
 def resolve_configured_capabilities(
     settings: Settings,
     router: LLMRouter,
@@ -128,20 +145,25 @@ def resolve_configured_capabilities(
             capability = ProviderCapability(capability_name)
         except ValueError:
             continue
+        configured_model = settings.model_map[capability_name]
         candidates: list[LLMProvider] = router.resolve_all(capability)
         chosen: LLMProvider | None = None
         for provider in candidates:
+            # This guard also protects callers that provide a manually-built
+            # router whose metadata does not match the configured runtime model.
+            if provider.metadata.model_id != configured_model:
+                continue
             if health is None:
                 chosen = provider
                 break
             status = health.get(provider.metadata.name)
-            if status is not None and status.available:
+            if (
+                status is not None
+                and status.available
+                and status.model_id == provider.metadata.model_id
+            ):
                 chosen = provider
                 break
-            if status is None:
-                chosen = provider
-                break
-        configured_model = settings.model_map.get(capability_name)
         if chosen is None:
             resolved[capability_name] = CapabilityResolution(
                 capability=capability_name,
@@ -168,13 +190,18 @@ async def check_startup_health(
     timeout_seconds: float = 5.0,
 ) -> StartupHealth:
     """Build (if needed), check, and resolve providers to configured models."""
+    owns_router = router is None
     active = router if router is not None else build_router_from_settings(settings)
-    provider_health = await check_llm_health(active, timeout_seconds=timeout_seconds)
-    # Mark capabilities unavailable when their chosen provider is unhealthy.
-    capabilities = resolve_configured_capabilities(settings, active, provider_health)
-    unavailable = sorted(name for name, cap in capabilities.items() if not cap.available)
-    if unavailable:
-        logger.warning("llm capabilities unresolved: count=%d", len(unavailable))
-    else:
-        logger.info("llm startup health complete: providers=%d", len(provider_health))
-    return StartupHealth(providers=provider_health, capabilities=capabilities)
+    try:
+        provider_health = await check_llm_health(active, timeout_seconds=timeout_seconds)
+        # Mark capabilities unavailable when their chosen provider is unhealthy.
+        capabilities = resolve_configured_capabilities(settings, active, provider_health)
+        unavailable = sorted(name for name, cap in capabilities.items() if not cap.available)
+        if unavailable:
+            logger.warning("llm capabilities unresolved: count=%d", len(unavailable))
+        else:
+            logger.info("llm startup health complete: providers=%d", len(provider_health))
+        return StartupHealth(providers=provider_health, capabilities=capabilities)
+    finally:
+        if owns_router:
+            await _close_temporary_providers(active)

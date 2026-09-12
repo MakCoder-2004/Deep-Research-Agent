@@ -19,6 +19,7 @@ from research_agent.llm.base import (
 )
 from research_agent.llm.providers._common import (
     category_for_status,
+    contains_model_id,
     map_transport_error,
     parse_json_object,
 )
@@ -210,7 +211,13 @@ class CloudflareProvider:
             raise
         except Exception:
             return False
-        return response.status_code == 200
+        if response.status_code != 200:
+            return False
+        try:
+            data = response.json()
+        except ValueError:
+            return False
+        return contains_model_id(data, self._model_id)
 
 
 def _read_result_text(data: object) -> str:

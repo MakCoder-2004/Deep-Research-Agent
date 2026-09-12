@@ -170,6 +170,8 @@ def test_build_router_uses_priority_and_model_map() -> None:
     assert by_name["groq"] == "cfg-fast"
     assert by_name["openrouter"] == "cfg-reason"
     assert by_name["cloudflare"] == "cfg-fast"
+    assert router.resolve(ProviderCapability.FAST_MULTILINGUAL).metadata.model_id == "cfg-fast"
+    assert router.resolve(ProviderCapability.REASONING).metadata.model_id == "cfg-reason"
 
 
 def test_build_router_empty_model_map_yields_empty_model() -> None:
@@ -309,6 +311,14 @@ async def test_groq_health_and_empty() -> None:
     respx.get("https://api.groq.com/openai/v1/models").mock(
         return_value=httpx.Response(200, json={"data": []})
     )
+    assert await GroqProvider(model_id="m", api_key="k").health_check() is False
+    respx.get("https://api.groq.com/openai/v1/models").mock(
+        return_value=httpx.Response(200, json={"data": [{"id": "other"}]})
+    )
+    assert await GroqProvider(model_id="m", api_key="k").health_check() is False
+    respx.get("https://api.groq.com/openai/v1/models").mock(
+        return_value=httpx.Response(200, json={"data": [{"id": "m"}]})
+    )
     assert await GroqProvider(model_id="m", api_key="k").health_check() is True
     respx.get("https://api.groq.com/openai/v1/models").mock(
         return_value=httpx.Response(500, text="err")
@@ -359,7 +369,7 @@ async def test_openrouter_complete_structured_health() -> None:
     assert (await provider.structured("q", _Answer)).city == "Amman"
 
     respx.get("https://openrouter.ai/api/v1/models").mock(
-        return_value=httpx.Response(200, json={"data": []})
+        return_value=httpx.Response(200, json={"data": [{"id": "cfg-reason"}]})
     )
     assert await provider.health_check() is True
     assert await OpenRouterProvider(model_id="", api_key="k").health_check() is False
@@ -418,7 +428,7 @@ async def test_cloudflare_complete_structured_health() -> None:
     assert (await provider.structured("q", _Answer)).city == "Doha"
 
     respx.get("https://api.cloudflare.com/client/v4/accounts/acct/ai/models").mock(
-        return_value=httpx.Response(200, json={"success": True})
+        return_value=httpx.Response(200, json={"success": True, "result": [{"name": "cfg-fast"}]})
     )
     assert await provider.health_check() is True
     await provider.aclose()
@@ -486,7 +496,7 @@ async def test_cloudflare_propagates_cancelled() -> None:
 @respx.mock
 async def test_check_llm_health_maps_providers() -> None:
     respx.get("https://api.groq.com/openai/v1/models").mock(
-        return_value=httpx.Response(200, json={})
+        return_value=httpx.Response(200, json={"data": [{"id": "m1"}]})
     )
     respx.get("https://openrouter.ai/api/v1/models").mock(
         return_value=httpx.Response(500, text="down")
@@ -534,29 +544,33 @@ async def test_check_llm_health_rejects_bad_timeout() -> None:
         await check_llm_health(router, timeout_seconds=0)
 
 
-def test_resolve_configured_capabilities_prefers_healthy() -> None:
+def test_resolve_configured_capabilities_uses_matching_healthy_fallback() -> None:
     settings = _settings(
-        LLM_PROVIDER_PRIORITY="groq,cloudflare",
+        LLM_PROVIDER_PRIORITY="groq,openrouter,cloudflare",
         MODEL_MAP='{"fast_multilingual": "cfg-fast", "reasoning": "cfg-reason"}',
         GROQ_API_KEY="k",
+        OPENROUTER_API_KEY="k",
         CLOUDFLARE_API_KEY="k",
         CLOUDFLARE_ACCOUNT_ID="a",
     )
     router = build_router_from_settings(settings)
     healthy = {
         "groq": __import__("research_agent.llm.health", fromlist=["ProviderHealth"]).ProviderHealth(
-            name="groq", model_id="cfg-fast", available=True
+            name="groq", model_id="cfg-fast", available=False
         ),
+        "openrouter": __import__(
+            "research_agent.llm.health", fromlist=["ProviderHealth"]
+        ).ProviderHealth(name="openrouter", model_id="cfg-reason", available=True),
         "cloudflare": __import__(
             "research_agent.llm.health", fromlist=["ProviderHealth"]
         ).ProviderHealth(name="cloudflare", model_id="cfg-fast", available=True),
     }
     resolved = resolve_configured_capabilities(settings, router, healthy)
-    assert resolved["fast_multilingual"].provider == "groq"
+    assert resolved["fast_multilingual"].provider == "cloudflare"
     assert resolved["fast_multilingual"].model_id == "cfg-fast"
     assert resolved["fast_multilingual"].available is True
-    # Reasoning is not supported by the lightweight fallback alone.
-    assert resolved["reasoning"].provider == "groq"
+    assert resolved["reasoning"].provider == "openrouter"
+    assert resolved["reasoning"].model_id == "cfg-reason"
 
 
 @respx.mock
@@ -568,9 +582,11 @@ async def test_check_startup_health_end_to_end() -> None:
         OPENROUTER_API_KEY="k",
     )
     respx.get("https://api.groq.com/openai/v1/models").mock(
-        return_value=httpx.Response(200, json={})
+        return_value=httpx.Response(200, json={"data": [{"id": "cfg-fast"}]})
     )
-    respx.get("https://openrouter.ai/api/v1/models").mock(return_value=httpx.Response(200, json={}))
+    respx.get("https://openrouter.ai/api/v1/models").mock(
+        return_value=httpx.Response(200, json={"data": [{"id": "cfg-fast"}]})
+    )
     report = await check_startup_health(settings, timeout_seconds=5.0)
     assert report.providers["groq"].available is True
     assert report.capabilities["fast_multilingual"].available is True

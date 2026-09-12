@@ -11,6 +11,7 @@ from research_agent.errors import ErrorCategory
 
 __all__ = [
     "category_for_status",
+    "contains_model_id",
     "extract_json_payload",
     "map_transport_error",
     "parse_json_object",
@@ -57,6 +58,21 @@ def map_transport_error(exc: Exception) -> ErrorCategory:
     if isinstance(exc, httpx.HTTPError):
         return ErrorCategory.TRANSIENT
     return ErrorCategory.UNKNOWN
+
+
+def contains_model_id(data: object, expected: str) -> bool:
+    """Return whether a provider model catalog contains the exact model ID."""
+    if not expected:
+        return False
+    if isinstance(data, dict):
+        for key in ("id", "name", "model", "model_id"):
+            value = data.get(key)
+            if isinstance(value, str) and value == expected:
+                return True
+        return any(contains_model_id(value, expected) for value in data.values())
+    if isinstance(data, list):
+        return any(contains_model_id(value, expected) for value in data)
+    return False
 
 
 def extract_json_payload(text: str) -> str:

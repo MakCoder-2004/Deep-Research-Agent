@@ -9,6 +9,7 @@ import sys
 from aiogram import Dispatcher
 
 from research_agent.config import Settings, validate_at_startup
+from research_agent.llm.health import check_startup_health
 from research_agent.observability.logging import configure_logging
 from research_agent.persistence.database import open_db
 from research_agent.services.queue import BoundedJobQueue, set_default_queue
@@ -59,6 +60,25 @@ async def run_telegram(settings: Settings) -> None:
     """Validate config, init storage, and run Telegram long polling."""
     settings = validate_at_startup(settings)
     configure_logging(secrets=_collect_secrets(settings))
+    try:
+        health = await check_startup_health(settings)
+    except asyncio.CancelledError:
+        raise
+    except Exception as exc:  # noqa: BLE001 - provider health is degraded-safe
+        logger.warning(
+            "llm startup health check failed; continuing in degraded mode: error_type=%s",
+            type(exc).__name__,
+        )
+    else:
+        available_providers = sum(status.available for status in health.providers.values())
+        available_capabilities = sum(status.available for status in health.capabilities.values())
+        logger.info(
+            "llm startup health: providers=%d/%d capabilities=%d/%d",
+            available_providers,
+            len(health.providers),
+            available_capabilities,
+            len(health.capabilities),
+        )
     settings.reports_dir.mkdir(parents=True, exist_ok=True)
     # open_db initializes the schema exactly once for the startup connection.
     async with open_db(settings.database_path):

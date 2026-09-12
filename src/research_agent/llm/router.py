@@ -184,10 +184,17 @@ def build_router_from_settings(
     router = LLMRouter(provider_priority=list(settings.llm_provider_priority))
     for index, raw_name in enumerate(settings.llm_provider_priority):
         name = str(raw_name).strip().lower()
-        capabilities = PROVIDER_CAPABILITIES.get(name, frozenset())
+        model_id = _select_model_id(name, settings.model_map)
+        # A provider instance has one runtime model. Do not advertise a
+        # capability whose configured model would differ from that instance.
+        capabilities = frozenset(
+            capability
+            for capability in PROVIDER_CAPABILITIES.get(name, frozenset())
+            if settings.model_map.get(capability.value) == model_id
+        )
         metadata = ProviderMetadata(
             name=name,
-            model_id=_select_model_id(name, settings.model_map),
+            model_id=model_id,
             capabilities=capabilities,
             priority=index,
         )
