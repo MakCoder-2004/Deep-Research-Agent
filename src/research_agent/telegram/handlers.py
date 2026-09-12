@@ -931,8 +931,10 @@ async def plaintext_handler(
     raw = message.text or ""
     # Captions on media arrive with text=None; surface them instead of non_text.
     # Strip text first so whitespace-only text still falls through to captions.
+    # Require a real string caption (mocks/partials may expose other types).
     caption = getattr(message, "caption", None)
-    query = (raw.strip() or (str(caption) if caption else "")).strip()
+    caption_text = caption.strip() if isinstance(caption, str) else ""
+    query = (raw.strip() or caption_text).strip()
     if not query:
         ctx = build_ctx(message, conn=conn, db_path=db_path)
         lang_code = (
