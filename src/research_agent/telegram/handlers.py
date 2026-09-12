@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import logging
 from collections import OrderedDict
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
@@ -78,6 +79,8 @@ from research_agent.telegram.texts import (
 from research_agent.telegram.validators import classify_input, is_accepted_url
 
 router = Router()
+
+logger = logging.getLogger(__name__)
 
 LangCode = Literal["en", "ar"]
 
@@ -754,16 +757,26 @@ async def report_handler(
         stored = [str(tool) for tool in parsed]
         job_id = str(report["job_id"])
         tool_runs = await ToolRunRepository().list_by_job(db_conn, job_id)
-        if not tool_runs:
-            # No recorded executions: fail closed (omit line) per PLAN 14/25
-            # instead of trusting stored model claims (M5.22/M7.6).
-            return None
+        # Only successful runs count as "used"; failed attempts belong in the
+        # failed-tools line (M5 delivery), not Tools Used.
         recorded: list[str] = []
         for run in tool_runs:
+            try:
+                if not int(run["success"]):
+                    continue
+            except Exception:  # noqa: BLE001 - fail closed on malformed rows
+                logger.debug("report tools: skipping malformed tool run")
+                continue
             name = str(run["tool_name"]).strip()
             if name and name not in recorded:
                 recorded.append(name)
-        return recorded if stored == recorded else None
+        if not recorded:
+            # No recorded executions: fail closed (omit line) per PLAN 14/25
+            # instead of trusting stored model claims (M5.22/M7.6).
+            return None
+        # Order-insensitive: stored claims must match recorded executions as
+        # sets; extras or omissions both fail closed.
+        return recorded if set(stored) == set(recorded) else None
 
     async def _reply_with_conn(db_conn: aiosqlite.Connection) -> None:
         report, sources = await get_report_bundle(db_conn, from_user.id, report_id)

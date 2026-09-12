@@ -151,18 +151,32 @@ def _adjust_hard_cut(text: str, cut: int) -> int:
         cut -= 1
         if cut <= 0:
             return cut
-    # Never split inside an ASCII [digits] citation marker.
+    # Never split inside an ASCII [digits] citation marker, escaped or not.
+    # Escaped markers look like \[12\]: the inner text between [ and ] is
+    # "12\" (trailing backslash), so accept an optional trailing backslash.
+    # Backslash parity decides whether "[" opens an escaped marker (odd run
+    # of preceding backslashes) or a plain one (even run, e.g. "\\[12]").
     open_idx = text.rfind("[", 0, cut)
     if open_idx != -1 and open_idx < cut:
         close_idx = text.find("]", open_idx + 1, cut + 8)
         if close_idx != -1 and open_idx < cut <= close_idx:
             inner = text[open_idx + 1 : close_idx]
-            if inner.isdigit() and len(inner) <= 6:
+            digits = inner[:-1] if inner.endswith("\\") else inner
+            preceding = 0
+            cursor = open_idx - 1
+            while cursor >= 0 and text[cursor] == "\\":
+                preceding += 1
+                cursor -= 1
+            bracket_escaped = preceding % 2 == 1
+            marker_escaped = (
+                bracket_escaped and close_idx + 1 < len(text) and text[close_idx + 1] == "\\"
+            )
+            if digits.isdigit() and len(digits) <= 6 and (not bracket_escaped or marker_escaped):
                 if open_idx == 0:
                     # Marker longer than the budget: keep the limit so the
                     # chunk stays within bounds rather than emitting empty.
                     return cut
-                return open_idx
+                return open_idx - (1 if marker_escaped else 0)
     return cut
 
 
@@ -595,7 +609,7 @@ def validate_before_render(
 
 def _escape_url_for_link(url: str) -> str:
     """Escape a URL for the ``(url)`` part of a MarkdownV2 inline link."""
-    return url.replace("\\", "\\\\").replace(")", "\\)")
+    return url.replace("\\", "\\\\").replace("(", "\\(").replace(")", "\\)")
 
 
 def render_concise_report(
