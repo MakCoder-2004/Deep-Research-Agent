@@ -149,7 +149,6 @@ Tasks are ordered by dependency inside each milestone. Task IDs are stable refer
 ### Search Adapters
 
 - [ ] **M3.12** Implement Tavily as the initial general web search adapter.
-- [ ] **M3.13** Add Brave only when account and card requirements are accepted and configured.
 - [ ] **M3.14** Implement Wikipedia and Wikimedia background search.
 - [ ] **M3.15** Implement Semantic Scholar paper search.
 - [ ] **M3.16** Implement Crossref DOI and publication metadata lookup.
