@@ -1,0 +1,131 @@
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+env:
+  UV_FROZEN: "true"
+
+jobs:
+  checks:
+    name: sync-lint-typecheck-test
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Install pinned Python
+        uses: actions/setup-python@v5
+        with:
+          python-version-file: .python-version
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v5
+        with:
+          enable-cache: true
+
+      - name: Sync locked dependencies (fail on stale lock)
+        run: uv sync --locked --dev
+
+      - name: Ruff format check
+        run: uv run ruff format --check .
+
+      - name: Ruff lint
+        run: uv run ruff check .
+
+      - name: mypy static type check
+        run: uv run mypy
+
+      - name: Unit, integration, and security tests with coverage
+        env:
+          # Guard against accidental live-provider / production-trace usage.
+          GROQ_API_KEY: ""
+          OPENROUTER_API_KEY: ""
+          CLOUDFLARE_API_KEY: ""
+          TAVILY_API_KEY: ""
+          BRAVE_API_KEY: ""
+          LANGSMITH_TRACING: "false"
+          LANGSMITH_API_KEY: ""
+          ENVIRONMENT: development
+        run: uv run pytest -q
+
+  secret-scan:
+    name: secret-scan
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Gitleaks secret scan
+        uses: gitleaks/gitleaks-action@v2
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+  dependency-audit:
+    name: dependency-audit
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Install pinned Python
+        uses: actions/setup-python@v5
+        with:
+          python-version-file: .python-version
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v5
+
+      - name: Sync locked dependencies
+        run: uv sync --locked --dev
+
+      - name: pip-audit locked environment
+        run: uv run --with pip-audit pip-audit --strict
+
+  docker:
+    name: docker-build-smoke
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Check for Dockerfile (M10)
+        id: dockerfile
+        run: |
+          if [ -f Dockerfile ]; then echo "present=true" >> "$GITHUB_OUTPUT"; else echo "present=false" >> "$GITHUB_OUTPUT"; fi
+
+      - name: Set up QEMU for linux/arm64
+        if: steps.dockerfile.outputs.present == 'true'
+        uses: docker/setup-qemu-action@v3
+
+      - name: Set up Docker Buildx
+        if: steps.dockerfile.outputs.present == 'true'
+        uses: docker/setup-buildx-action@v3
+
+      - name: Build linux/arm64 image
+        if: steps.dockerfile.outputs.present == 'true'
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          platforms: linux/arm64
+          push: false
+          load: true
+          tags: deep-research-agent:ci
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: Smoke test image (no secrets, no network providers)
+        if: steps.dockerfile.outputs.present == 'true'
+        run: |
+          docker run --rm deep-research-agent:ci python -c "import research_agent.main"
+
+      - name: Skip notice (no Dockerfile until M10)
+        if: steps.dockerfile.outputs.present != 'true'
+        run: echo "No Dockerfile yet (M10 scope); image build enforced once added."

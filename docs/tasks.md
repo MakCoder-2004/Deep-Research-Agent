@@ -70,7 +70,7 @@ Tasks are ordered by dependency inside each milestone. Task IDs are stable refer
 
 ### Exit Gate
 
-- [x] **M1.GATE** A clean clone installs reproducibly with `uv sync --locked --dev`, foundational checks pass, and no runtime secret is committed.
+- [x] **M1.GATE** A clean clone installs reproducibly with `uv sync --locked --dev`, foundational checks pass, and no runtime secret is committed. (Close-out: ruff+mypy+331 tests green, coverage 84.95%≥80, lock verified exit 0, CI workflow enforces the same on PRs, FK-complete schema with migrations, FTS triggers, tz-consistent models, redacted persistence. M3 may start.)
 
 ## Milestone 2: Telegram Gateway
 
@@ -80,48 +80,48 @@ Tasks are ordered by dependency inside each milestone. Task IDs are stable refer
 
 ### Bot Runtime And Access
 
-- [ ] **M2.1** Create the `aiogram` 3 bot and dispatcher using long polling.
-- [ ] **M2.2** Wire bot startup and shutdown into `src/research_agent/main.py`.
-- [ ] **M2.3** Reject private-chat requests from users not present in the numeric allowlist.
-- [ ] **M2.4** Implement `/whoami` so administrators can obtain a numeric Telegram user ID.
-- [ ] **M2.5** Add a localized unauthorized-user response that reveals no configuration details.
+- [x] **M2.1** Create the `aiogram` 3 bot and dispatcher using long polling.
+- [x] **M2.2** Wire bot startup and shutdown into `src/research_agent/main.py`.
+- [x] **M2.3** Reject private-chat requests from users not present in the numeric allowlist.
+- [x] **M2.4** Implement `/whoami` so administrators can obtain a numeric Telegram user ID.
+- [x] **M2.5** Add a localized unauthorized-user response that reveals no configuration details.
 
 ### Commands And Input
 
-- [ ] **M2.6** Implement `/start`, `/help`, and capability and restriction messaging.
-- [ ] **M2.7** Implement `/research <query>` request creation.
-- [ ] **M2.8** Route plain text through the same path as `/research`.
-- [ ] **M2.9** Accept English, Arabic, mixed-language text, and HTTP(S) URLs.
-- [ ] **M2.10** Implement `/status` with queue position and current stage.
-- [ ] **M2.11** Implement `/cancel` with cooperative cancellation of the active user job.
-- [ ] **M2.12** Implement `/history` and `/report <id>` against local persistence.
-- [ ] **M2.13** Implement `/forget` for temporary session deletion.
-- [ ] **M2.14** Implement `/language` for English and Arabic preferences.
+- [x] **M2.6** Implement `/start`, `/help`, and capability and restriction messaging.
+- [x] **M2.7** Implement `/research <query>` request creation.
+- [x] **M2.8** Route plain text through the same path as `/research`.
+- [x] **M2.9** Accept English, Arabic, mixed-language text, and HTTP(S) URLs.
+- [x] **M2.10** Implement `/status` with queue position and current stage.
+- [x] **M2.11** Implement `/cancel` with cooperative cancellation of the active user job.
+- [x] **M2.12** Implement `/history` and `/report <id>` against local persistence.
+- [x] **M2.13** Implement `/forget` for temporary session deletion.
+- [x] **M2.14** Implement `/language` for English and Arabic preferences.
 
 ### Queue And Progress
 
-- [ ] **M2.15** Implement a bounded asynchronous research-job queue.
-- [ ] **M2.16** Enforce three globally concurrent jobs.
-- [ ] **M2.17** Enforce one active job per user.
-- [ ] **M2.18** Persist queued, active, cancelled, completed, and failed job states.
-- [ ] **M2.19** Publish the initial progress message when a job starts.
-- [ ] **M2.20** Edit the same message for analysis, source selection, search, reading, critique, and report preparation stages.
-- [ ] **M2.21** Handle Telegram edit and delivery failures without losing the job record.
+- [x] **M2.15** Implement a bounded asynchronous research-job queue.
+- [x] **M2.16** Enforce three globally concurrent jobs.
+- [x] **M2.17** Enforce one active job per user.
+- [x] **M2.18** Persist queued, active, cancelled, completed, and failed job states.
+- [x] **M2.19** Publish the initial progress message when a job starts.
+- [x] **M2.20** Edit the same message for analysis, source selection, search, reading, critique, and report preparation stages.
+- [x] **M2.21** Handle Telegram edit and delivery failures without losing the job record.
 
 ### Rendering And Verification
 
-- [ ] **M2.22** Escape user and report content for Telegram Markdown.
-- [ ] **M2.23** Split oversized responses on paragraph-safe boundaries.
-- [ ] **M2.24** Render concise in-chat reports with readable `[1]` citation markers.
-- [ ] **M2.25** Attach complete long reports as `research-<report-id>.md`.
-- [ ] **M2.26** Add tests for allowlist enforcement and `/whoami`.
-- [ ] **M2.27** Add tests for commands, plain-text routing, language preferences, history, and session deletion.
-- [ ] **M2.28** Add tests for queue limits, cancellation, state persistence, and progress-message editing.
-- [ ] **M2.29** Add tests for Markdown escaping, safe splitting, and file attachment delivery.
+- [x] **M2.22** Escape user and report content for Telegram Markdown.
+- [x] **M2.23** Split oversized responses on paragraph-safe boundaries.
+- [x] **M2.24** Render concise in-chat reports with readable `[1]` citation markers.
+- [x] **M2.25** Attach complete long reports as `research-<report-id>.md`.
+- [x] **M2.26** Add tests for allowlist enforcement and `/whoami`.
+- [x] **M2.27** Add tests for commands, plain-text routing, language preferences, history, and session deletion.
+- [x] **M2.28** Add tests for queue limits, cancellation, state persistence, and progress-message editing.
+- [x] **M2.29** Add tests for Markdown escaping, safe splitting, and file attachment delivery.
 
 ### Exit Gate
 
-- [ ] **M2.GATE** Trusted users can submit, inspect, retrieve, and cancel jobs while unauthorized users cannot start jobs.
+- [x] **M2.GATE** Trusted users can submit, inspect, retrieve, and cancel jobs while unauthorized users cannot start jobs. (Close-out: 331 tests green, ruff+mypy clean, coverage 84.95%≥80, `uv sync --locked --dev` verified, CI workflow present, cancel-success ID + 9-command unauthorized matrix + 3-concurrent behavioral proven, quota reply live, retention swept hourly.)
 
 ## Milestone 3: Retrieval
 

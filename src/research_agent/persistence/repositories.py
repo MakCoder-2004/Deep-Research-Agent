@@ -3,14 +3,18 @@
 from __future__ import annotations
 
 import json
+import logging
 from collections.abc import Mapping
 from datetime import UTC, datetime, timedelta
+from pathlib import Path
 from typing import Any
 
 import aiosqlite
 
 from research_agent.models import Depth, Domain, JobState, Language, RiskLevel
 from research_agent.models.reports import Source
+
+logger = logging.getLogger(__name__)
 
 
 def _now_iso() -> str:
@@ -36,6 +40,12 @@ def _is_expired(expires_at: str, now: datetime | None = None) -> bool:
     current = now or datetime.now(UTC)
     expires = _parse_iso(expires_at)
     return expires is None or expires <= current
+
+
+def _is_older_than(created_at: str, cutoff: datetime) -> bool:
+    """Return True when a row predates the cutoff (fail closed on garbage)."""
+    created = _parse_iso(created_at)
+    return created is None or created <= cutoff
 
 
 class UserRepository:
@@ -66,7 +76,8 @@ class SessionRepository:
         interactions: list[str],
         max_interactions: int = 6,
     ) -> None:
-        trimmed = interactions[-max_interactions:]
+        limit = max(int(max_interactions), 1)
+        trimmed = interactions[-limit:] if interactions else []
         now = _now_iso()
         await conn.execute(
             """
@@ -84,6 +95,51 @@ class SessionRepository:
         cursor = await conn.execute("SELECT * FROM sessions WHERE user_id = ?", (user_id,))
         return await cursor.fetchone()
 
+    async def get_valid(
+        self,
+        conn: aiosqlite.Connection,
+        user_id: int,
+        *,
+        now: datetime | None = None,
+        ttl_hours: int = 24,
+    ) -> aiosqlite.Row | None:
+        """Return the session only when it has not exceeded TTL (lazy expiry)."""
+        row = await self.get(conn, user_id)
+        if row is None:
+            return None
+        try:
+            updated = _parse_iso(str(row["updated_at"]))
+        except Exception:
+            updated = None
+        if updated is None:
+            return None
+        current = now or datetime.now(UTC)
+        if current - updated > timedelta(hours=ttl_hours):
+            return None
+        return row
+
+    async def append(
+        self,
+        conn: aiosqlite.Connection,
+        user_id: int,
+        language: str,
+        interaction: str,
+        max_interactions: int = 6,
+    ) -> None:
+        """Append one interaction, trimming to the last N (default 6)."""
+        row = await self.get(conn, user_id)
+        existing: list[str] = []
+        if row is not None:
+            try:
+                loaded = json.loads(row["interactions"])
+                if isinstance(loaded, list):
+                    existing = [str(x) for x in loaded]
+            except Exception:  # noqa: S110, BLE001 - start fresh on corrupt data
+                logger.debug("session append: corrupt interactions reset")
+                existing = []
+        existing.append(interaction)
+        await self.save(conn, user_id, language, existing, max_interactions)
+
     async def delete(self, conn: aiosqlite.Connection, user_id: int) -> None:
         await conn.execute("DELETE FROM sessions WHERE user_id = ?", (user_id,))
 
@@ -96,18 +152,41 @@ class SessionRepository:
         max_interactions: int = 6,
     ) -> None:
         current = now or datetime.now(UTC)
-        cutoff = (current - timedelta(hours=ttl_hours)).isoformat()
-        await conn.execute("DELETE FROM sessions WHERE updated_at < ?", (cutoff,))
-        cursor = await conn.execute("SELECT user_id, interactions FROM sessions")
+        # Parsed comparison (not lexicographic) so Z/offset/naive values behave.
+        cursor = await conn.execute("SELECT user_id, interactions, updated_at FROM sessions")
         rows = await cursor.fetchall()
         for row in rows:
-            interactions: list[str] = json.loads(row["interactions"])
-            if len(interactions) > max_interactions:
-                trimmed = interactions[-max_interactions:]
-                await conn.execute(
-                    "UPDATE sessions SET interactions = ? WHERE user_id = ?",
-                    (json.dumps(trimmed), row["user_id"]),
+            try:
+                updated = _parse_iso(str(row["updated_at"]))
+            except Exception:  # noqa: S110, BLE001 - treat unreadable as expired below
+                logger.debug("session prune: unreadable updated_at")
+                updated = None
+            if updated is None or current - updated > timedelta(hours=ttl_hours):
+                try:
+                    await conn.execute("DELETE FROM sessions WHERE user_id = ?", (row["user_id"],))
+                except Exception:  # noqa: S112, BLE001 - prune must continue
+                    logger.debug("session prune: delete failed")
+                    continue
+                continue
+            try:
+                loaded = json.loads(row["interactions"])
+                interactions: list[str] = (
+                    [str(x) for x in loaded] if isinstance(loaded, list) else []
                 )
+            except Exception:  # noqa: S112, BLE001 - skip corrupt row, keep others
+                logger.debug("session prune: corrupt interactions skipped")
+                continue
+            limit = max(int(max_interactions), 1)
+            if len(interactions) > limit:
+                trimmed = interactions[-limit:]
+                try:
+                    await conn.execute(
+                        "UPDATE sessions SET interactions = ? WHERE user_id = ?",
+                        (json.dumps(trimmed), row["user_id"]),
+                    )
+                except Exception:  # noqa: S112, BLE001 - prune must continue
+                    logger.debug("session prune: trim failed")
+                    continue
 
 
 class JobRepository:
@@ -123,13 +202,25 @@ class JobRepository:
         depth: Depth | str = Depth.STANDARD,
         risk_level: RiskLevel | str = RiskLevel.NORMAL,
         state: JobState | str = JobState.QUEUED,
+        source_url: str | None = None,
     ) -> None:
         now = _now_iso()
+        # A job implies a known user: auto-create the parent so the
+        # users FK holds even when callers enqueue before /start.
+        # OR IGNORE preserves an existing language preference.
+        await conn.execute(
+            """
+            INSERT OR IGNORE INTO users (user_id, language, created_at, updated_at)
+            VALUES (?, 'en', ?, ?)
+            """,
+            (user_id, now, now),
+        )
         await conn.execute(
             """
             INSERT INTO jobs (job_id, user_id, query, language, domain, depth,
-                              risk_level, state, repair_count, created_at, updated_at)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, 0, ?, ?)
+                              risk_level, state, repair_count, source_url,
+                              created_at, updated_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, 0, ?, ?, ?)
             """,
             (
                 job_id,
@@ -140,6 +231,7 @@ class JobRepository:
                 Depth(depth).value,
                 RiskLevel(risk_level).value,
                 JobState(state).value,
+                source_url,
                 now,
                 now,
             ),
@@ -154,10 +246,20 @@ class JobRepository:
         error: str | None = None,
         trace_id: str | None = None,
     ) -> None:
-        await conn.execute(
-            "UPDATE jobs SET state = ?, error = ?, trace_id = ?, updated_at = ? WHERE job_id = ?",
-            (JobState(state).value, error, trace_id, _now_iso(), job_id),
-        )
+        from research_agent.observability.redaction import redact_text
+
+        safe_error = redact_text(error) if error else None
+        if trace_id is not None:
+            await conn.execute(
+                "UPDATE jobs SET state=?, error=?, trace_id=?, updated_at=? WHERE job_id=?",
+                (JobState(state).value, safe_error, trace_id, _now_iso(), job_id),
+            )
+        else:
+            # Preserve existing trace_id (PLAN 25:1042) when caller has none.
+            await conn.execute(
+                "UPDATE jobs SET state = ?, error = ?, updated_at = ? WHERE job_id = ?",
+                (JobState(state).value, safe_error, _now_iso(), job_id),
+            )
 
     async def get(self, conn: aiosqlite.Connection, job_id: str) -> aiosqlite.Row | None:
         cursor = await conn.execute("SELECT * FROM jobs WHERE job_id = ?", (job_id,))
@@ -185,10 +287,8 @@ class ReportRepository:
             """,
             (report_id, job_id, topic, summary, markdown_path, json.dumps(tools_used), now),
         )
-        await conn.execute(
-            "INSERT INTO report_fts (report_id, topic, summary) VALUES (?, ?, ?)",
-            (report_id, topic, summary),
-        )
+        # FTS sync is owned by the trg_reports_fts_insert/update triggers so
+        # raw SQL and repository writes cannot diverge (no manual insert here).
 
     async def get(self, conn: aiosqlite.Connection, report_id: str) -> aiosqlite.Row | None:
         cursor = await conn.execute("SELECT * FROM reports WHERE report_id = ?", (report_id,))
@@ -197,7 +297,12 @@ class ReportRepository:
     async def search(
         self, conn: aiosqlite.Connection, query: str, limit: int = 10
     ) -> list[aiosqlite.Row]:
-        """Full-text search over report topics and summaries, best match first."""
+        """Full-text search over report topics and summaries, best match first.
+
+        The query is passed as a quoted FTS5 phrase so user input containing
+        operators (``-``, ``OR``, ``*``, ...) cannot break the MATCH syntax.
+        """
+        phrase = '"' + query.replace('"', '""') + '"'
         cursor = await conn.execute(
             """
             SELECT r.* FROM report_fts
@@ -206,7 +311,7 @@ class ReportRepository:
             ORDER BY bm25(report_fts)
             LIMIT ?
             """,
-            (query, limit),
+            (phrase, limit),
         )
         return list(await cursor.fetchall())
 
@@ -216,15 +321,36 @@ class ReportRepository:
         *,
         retention_days: int = 90,
         now: datetime | None = None,
+        reports_dir: Path | str | None = None,
     ) -> int:
         current = now or datetime.now(UTC)
-        cutoff = (current - timedelta(days=retention_days)).isoformat()
-        cursor = await conn.execute("SELECT report_id FROM reports WHERE created_at < ?", (cutoff,))
-        expired = [row["report_id"] for row in await cursor.fetchall()]
-        for report_id in expired:
+        cutoff = current - timedelta(days=retention_days)
+        # Parsed comparison (not lexicographic) so Z/offset/naive values
+        # behave; unparseable timestamps fail closed (treated as expired).
+        cursor = await conn.execute("SELECT report_id, markdown_path, created_at FROM reports")
+        rows = await cursor.fetchall()
+        expired = [row for row in rows if _is_older_than(str(row["created_at"]), cutoff)]
+        for row in expired:
+            report_id = row["report_id"]
+            try:
+                md = str(row["markdown_path"]) if row["markdown_path"] else ""
+            except Exception:  # noqa: S110, BLE001 - prune must continue
+                logger.debug("prune: unreadable markdown_path for %s", report_id)
+                md = ""
             await conn.execute("DELETE FROM sources WHERE report_id = ?", (report_id,))
             await conn.execute("DELETE FROM report_fts WHERE report_id = ?", (report_id,))
             await conn.execute("DELETE FROM reports WHERE report_id = ?", (report_id,))
+            if md:
+                try:
+                    p = Path(md)
+                    base = Path(reports_dir) if reports_dir else None
+                    # Only delete confined research-*.md files to avoid traversal.
+                    if p.name.startswith("research-") and p.suffix == ".md":
+                        target = (base / p.name) if base else p
+                        if target.is_file():  # noqa: ASYNC240 - rare prune path
+                            target.unlink()
+                except Exception:  # noqa: S110, BLE001 - file cleanup best-effort
+                    logger.debug("prune: markdown cleanup failed for %s", report_id)
         return len(expired)
 
 

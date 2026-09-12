@@ -1,9 +1,19 @@
 # Secrets and local environment
 .env
 .env.*
+!.env.example
 
 # Local data (mounted at runtime, never baked into image)
 data/
+*.db
+*.db-wal
+*.db-shm
+*.pem
+*.key
+
+# Virtual envs (never bake host venv)
+.venv/
+venv/
 
 # Tests and caches
 tests/
@@ -14,6 +24,8 @@ __pycache__/
 *.pyc
 htmlcov/
 .coverage
+.coverage.*
+coverage.xml
 
 # Build artifacts
 dist/

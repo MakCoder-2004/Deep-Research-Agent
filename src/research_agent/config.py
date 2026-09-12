@@ -6,19 +6,46 @@ Telegram access uses numeric user IDs, not usernames.
 
 from __future__ import annotations
 
+import re
 from pathlib import Path
 from typing import Annotated, Any, Literal
 
-from pydantic import BeforeValidator, Field, SecretStr, field_validator
+from pydantic import BeforeValidator, Field, SecretStr, field_validator, model_validator
 from pydantic_settings import BaseSettings, NoDecode, SettingsConfigDict
 
 KNOWN_LLM_PROVIDERS = frozenset({"groq", "openrouter", "cloudflare"})
 
+KNOWN_MODEL_CAPABILITIES = frozenset(
+    {
+        "fast_multilingual",
+        "long_context",
+        "reasoning",
+        "structured_output",
+        "arabic_capable",
+        "tool_calling",
+    }
+)
+
+_ID_RE = re.compile(r"[0-9]+")
+_SPLIT_RE = re.compile(r"[,\s;]+")
+
 
 def _split_list(value: str) -> list[str]:
     """Split a comma/semicolon/whitespace-separated environment value."""
-    normalized = value.replace(";", ",").replace(" ", ",")
-    return [part.strip() for part in normalized.split(",") if part.strip()]
+    return [part.strip() for part in _SPLIT_RE.split(value) if part.strip()]
+
+
+def _normalize_priority(items: list[str]) -> list[str]:
+    """Lowercase, strip, and dedupe provider names preserving order."""
+    seen: set[str] = set()
+    out: list[str] = []
+    for raw in items:
+        name = str(raw).strip().lower()
+        if not name or name in seen:
+            continue
+        seen.add(name)
+        out.append(name)
+    return out
 
 
 def _parse_allowed_user_ids(value: Any) -> set[int]:
@@ -39,16 +66,24 @@ def _parse_allowed_user_ids(value: Any) -> set[int]:
     for item in items:
         text = str(item).strip()
         # Telegram user IDs are positive integers: reject usernames as well as
-        # signed, zero, or otherwise non-numeric values.
-        if not text.isdigit() or int(text) <= 0:
+        # signed, zero, or otherwise non-numeric values. ASCII digits only
+        # (isdigit() would accept unicode digits/superscripts).
+        if not _ID_RE.fullmatch(text):
             raise ValueError(
                 f"Invalid Telegram user ID {text!r}: must be a positive numeric ID, not a username."
             )
-        parsed.add(int(text))
+        num = int(text)
+        if num <= 0 or num > 2**63 - 1:
+            raise ValueError(
+                f"Invalid Telegram user ID {text!r}: must be a positive numeric ID, not a username."
+            )
+        parsed.add(num)
     return parsed
 
 
 AllowedUserIds = Annotated[set[int], BeforeValidator(_parse_allowed_user_ids), NoDecode]
+
+ProviderPriority = Annotated[list[str], NoDecode]
 
 
 class Settings(BaseSettings):
@@ -75,18 +110,24 @@ class Settings(BaseSettings):
     session_max_interactions: int = Field(default=6, alias="SESSION_MAX_INTERACTIONS", ge=1)
 
     # Budgets and limits (PLAN section 17 defaults)
-    max_concurrent_jobs: int = Field(default=3, alias="MAX_CONCURRENT_JOBS", ge=1)
-    max_active_per_user: int = Field(default=1, alias="MAX_ACTIVE_PER_USER", ge=1)
-    requests_per_user_per_day: int = Field(default=10, alias="REQUESTS_PER_USER_PER_DAY", ge=1)
-    deep_requests_per_user_per_day: int = Field(
-        default=3, alias="DEEP_REQUESTS_PER_USER_PER_DAY", ge=0
+    max_concurrent_jobs: int = Field(default=3, alias="MAX_CONCURRENT_JOBS", ge=1, le=10)
+    max_active_per_user: int = Field(default=1, alias="MAX_ACTIVE_PER_USER", ge=1, le=5)
+    requests_per_user_per_day: int = Field(
+        default=10, alias="REQUESTS_PER_USER_PER_DAY", ge=1, le=1000
     )
-    search_subqueries_per_job: int = Field(default=6, alias="SEARCH_SUBQUERIES_PER_JOB", ge=1)
-    sources_per_job: int = Field(default=12, alias="SOURCES_PER_JOB", ge=1)
-    chars_per_source: int = Field(default=20000, alias="CHARS_PER_SOURCE", ge=1000)
-    reader_context_chars: int = Field(default=40000, alias="READER_CONTEXT_CHARS", ge=4000)
+    deep_requests_per_user_per_day: int = Field(
+        default=3, alias="DEEP_REQUESTS_PER_USER_PER_DAY", ge=0, le=100
+    )
+    search_subqueries_per_job: int = Field(
+        default=6, alias="SEARCH_SUBQUERIES_PER_JOB", ge=1, le=20
+    )
+    sources_per_job: int = Field(default=12, alias="SOURCES_PER_JOB", ge=1, le=50)
+    chars_per_source: int = Field(default=20000, alias="CHARS_PER_SOURCE", ge=1000, le=100000)
+    reader_context_chars: int = Field(
+        default=40000, alias="READER_CONTEXT_CHARS", ge=4000, le=500000
+    )
     repair_cycles: int = Field(default=1, alias="REPAIR_CYCLES", ge=0, le=1)
-    job_timeout_seconds: int = Field(default=300, alias="JOB_TIMEOUT_SECONDS", ge=30)
+    job_timeout_seconds: int = Field(default=300, alias="JOB_TIMEOUT_SECONDS", ge=30, le=600)
     search_cache_general_seconds: int = Field(
         default=6 * 3600, alias="SEARCH_CACHE_GENERAL_SECONDS", ge=60
     )
@@ -102,14 +143,15 @@ class Settings(BaseSettings):
     groq_api_key: SecretStr = Field(default=SecretStr(""), alias="GROQ_API_KEY")
     openrouter_api_key: SecretStr = Field(default=SecretStr(""), alias="OPENROUTER_API_KEY")
     cloudflare_api_key: SecretStr = Field(default=SecretStr(""), alias="CLOUDFLARE_API_KEY")
-    cloudflare_account_id: str = Field(default="", alias="CLOUDFLARE_ACCOUNT_ID")
+    cloudflare_account_id: SecretStr = Field(default=SecretStr(""), alias="CLOUDFLARE_ACCOUNT_ID")
     tavily_api_key: SecretStr = Field(default=SecretStr(""), alias="TAVILY_API_KEY")
     brave_api_key: SecretStr = Field(default=SecretStr(""), alias="BRAVE_API_KEY")
 
     # Capability -> model resolution stays in configuration, not source constants.
-    llm_provider_priority: list[str] = Field(
+    llm_provider_priority: ProviderPriority = Field(
         default_factory=lambda: ["groq", "openrouter", "cloudflare"],
         alias="LLM_PROVIDER_PRIORITY",
+        min_length=1,
     )
     model_map: dict[str, str] = Field(default_factory=dict, alias="MODEL_MAP")
 
@@ -121,7 +163,9 @@ class Settings(BaseSettings):
     langsmith_endpoint: str = Field(
         default="https://api.smith.langchain.com", alias="LANGSMITH_ENDPOINT"
     )
-    langsmith_environment: str = Field(default="development", alias="LANGSMITH_ENVIRONMENT")
+    langsmith_environment: Literal["development", "staging", "production"] = Field(
+        default="development", alias="LANGSMITH_ENVIRONMENT"
+    )
     langsmith_trace_content: bool = Field(default=True, alias="LANGSMITH_TRACE_CONTENT")
     langsmith_trace_sensitive_content: bool = Field(
         default=False, alias="LANGSMITH_TRACE_SENSITIVE_CONTENT"
@@ -132,7 +176,9 @@ class Settings(BaseSettings):
     @classmethod
     def _split_priority(cls, value: Any) -> Any:
         if isinstance(value, str):
-            return _split_list(value)
+            return _normalize_priority(_split_list(value))
+        if isinstance(value, (list, tuple, set)):
+            return _normalize_priority([str(v) for v in value])
         return value
 
     @field_validator("model_map", mode="before")
@@ -141,8 +187,8 @@ class Settings(BaseSettings):
         if value is None or value == "":
             return {}
         if isinstance(value, dict):
-            return value
-        if isinstance(value, str):
+            parsed = value
+        elif isinstance(value, str):
             import json
 
             try:
@@ -151,8 +197,25 @@ class Settings(BaseSettings):
                 raise ValueError("MODEL_MAP must be a JSON object.") from exc
             if not isinstance(parsed, dict):
                 raise ValueError("MODEL_MAP must be a JSON object.")
-            return parsed
-        return value
+        else:
+            raise ValueError("MODEL_MAP must be a JSON object.")
+        out: dict[str, str] = {}
+        for key, val in parsed.items():
+            if not isinstance(key, str) or not key.strip():
+                raise ValueError("MODEL_MAP keys must be non-empty strings.")
+            if not isinstance(val, str) or not val.strip():
+                raise ValueError("MODEL_MAP values must be non-empty strings.")
+            out[key.strip()] = val.strip()
+        unknown_caps = sorted(k for k in out if k not in KNOWN_MODEL_CAPABILITIES)
+        if unknown_caps:
+            raise ValueError(f"Unknown MODEL_MAP capabilities: {unknown_caps}.")
+        return out
+
+    @model_validator(mode="after")
+    def _check_context_budgets(self) -> Settings:
+        if self.reader_context_chars < self.chars_per_source:
+            raise ValueError("READER_CONTEXT_CHARS must be >= CHARS_PER_SOURCE.")
+        return self
 
 
 def validate_at_startup(settings_or_cls: Any = Settings) -> Settings:
@@ -184,6 +247,12 @@ def validate_at_startup(settings_or_cls: Any = Settings) -> Settings:
                 "At least one API key for the configured LLM_PROVIDER_PRIORITY "
                 "is required in production."
             )
+        if (
+            "cloudflare" in settings.llm_provider_priority
+            and provider_keys.get("cloudflare")
+            and not settings.cloudflare_account_id.get_secret_value()
+        ):
+            raise ValueError("CLOUDFLARE_ACCOUNT_ID is required when CLOUDFLARE_API_KEY is set.")
     if settings.langsmith_tracing and not settings.langsmith_api_key.get_secret_value():
         raise ValueError("LANGSMITH_API_KEY is required when LANGSMITH_TRACING is true.")
     return settings

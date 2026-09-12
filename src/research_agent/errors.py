@@ -13,7 +13,43 @@ class ErrorCategory(StrEnum):
     TIMEOUT = "timeout"
     UNAVAILABLE = "unavailable"
     CONTENT_FILTERED = "content_filtered"
+    BUDGET_EXHAUSTED = "budget_exhausted"
     UNKNOWN = "unknown"
+
+
+_RETRYABLE = frozenset({ErrorCategory.TRANSIENT, ErrorCategory.TIMEOUT, ErrorCategory.UNAVAILABLE})
+_COOLDOWN_ELIGIBLE = frozenset(
+    {ErrorCategory.RATE_LIMITED, ErrorCategory.TRANSIENT, ErrorCategory.UNAVAILABLE}
+)
+_FALLBACK_ELIGIBLE = frozenset(
+    {
+        ErrorCategory.TRANSIENT,
+        ErrorCategory.RATE_LIMITED,
+        ErrorCategory.TIMEOUT,
+        ErrorCategory.UNAVAILABLE,
+        ErrorCategory.BUDGET_EXHAUSTED,
+    }
+)
+
+
+def is_retryable(category: ErrorCategory) -> bool:
+    """Return True for transient failures worth a bounded retry (M9.16)."""
+    return category in _RETRYABLE
+
+
+def needs_cooldown(category: ErrorCategory) -> bool:
+    """Return True when the provider needs a cooldown after 429/5xx (M9.17)."""
+    return category in _COOLDOWN_ELIGIBLE
+
+
+def is_fallback_eligible(category: ErrorCategory) -> bool:
+    """Return True when routing should try the next provider/tool (M9.14)."""
+    return category in _FALLBACK_ELIGIBLE
+
+
+def to_trace_error_type(category: ErrorCategory) -> str:
+    """Sanitized error_type for LangSmith metadata (M6.8). Never includes secrets."""
+    return category.value
 
 
 class AgentError(Exception):
@@ -25,7 +61,11 @@ class AgentError(Exception):
         *,
         category: ErrorCategory = ErrorCategory.UNKNOWN,
         source: str = "",
+        http_status: int | None = None,
+        retry_after: float | None = None,
     ) -> None:
         super().__init__(message)
         self.category = category
         self.source = source
+        self.http_status = http_status
+        self.retry_after = retry_after
