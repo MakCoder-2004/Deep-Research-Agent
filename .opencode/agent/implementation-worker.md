@@ -45,6 +45,8 @@ permission:
     langchain-middleware: allow
   webfetch: deny
   websearch: deny
+  "docs-langchain_*": deny
+  "reference-langchain_*": deny
   lsp: deny
 ---
 
@@ -54,4 +56,6 @@ Implement only the requested change. Read assigned files and direct dependencies
 
 Preserve unrelated changes exactly. Never edit `AGENTS.md`, `.env` files, or `.git`; never switch branches or commit. Use the edit tool for changes, not shell commands. Run only the focused checks in the packet within the read and output budgets.
 
-Return a concise result with changed paths, checks run and outcomes, acceptance criteria status, and any unresolved risk or blocker. If a check cannot run, say why rather than substituting a broad test suite.
+Return a result of at most 300 words with changed paths, checks run and outcomes,
+acceptance criteria status, and any unresolved risk or blocker. If a check cannot
+run, say why rather than substituting a broad test suite.

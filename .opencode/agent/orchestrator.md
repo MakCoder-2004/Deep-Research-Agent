@@ -36,6 +36,12 @@ For every non-trivial task, prepare a context packet before delegation. The pack
 - Read budget
 - Output budget
 
+Use these defaults unless the task packet justifies a smaller budget: context-scout
+may make at most 8 targeted reads or 2,000 lines and returns at most 500 words;
+implementation-worker may make at most 12 targeted reads or 5,000 lines and
+returns at most 300 words; reviewer may make at most 10 targeted reads or 3,000
+lines and returns at most 600 words. These are ceilings, not targets.
+
 Treat the packet as the worker's boundary. Do not delegate without it. For a complex task (cross-area, unfamiliar, ambiguous, or more than one file), run `context-scout` first. Give it the packet and ask for one compact context brief. Reuse that same brief for all parallel workers; add only worker-specific path and acceptance details.
 
 Use `glob` and `grep` to locate relevant files, then targeted `read` ranges. Never ask a worker to read an entire document, the entire `PLAN.md`, `tasks.md`, or the repository. Do not load skills broadly. A worker may use only a specifically allowed, directly relevant skill when the packet says it is needed.
