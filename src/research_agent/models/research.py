@@ -5,7 +5,7 @@ from __future__ import annotations
 from datetime import UTC, datetime
 from uuid import UUID
 
-from pydantic import BaseModel, ConfigDict, Field, HttpUrl
+from pydantic import BaseModel, ConfigDict, Field, HttpUrl, model_validator
 
 from research_agent.models import (
     ClaimType,
@@ -15,6 +15,7 @@ from research_agent.models import (
     Language,
     RiskLevel,
     SourceType,
+    require_tz_aware,
 )
 
 
@@ -68,6 +69,12 @@ class SearchHit(BaseModel):
     tool_name: str = Field(min_length=1)
     score: float = 0.0
 
+    @model_validator(mode="after")
+    def _require_tz_aware(self) -> SearchHit:
+        require_tz_aware(self.accessed_at, "accessed_at")
+        require_tz_aware(self.published_at, "published_at")
+        return self
+
 
 class SourceDocument(BaseModel):
     """Bounded clean document extracted from a URL."""
@@ -86,6 +93,11 @@ class SourceDocument(BaseModel):
     quotations: list[str] = Field(default_factory=list)
     fetch_ms: int = Field(default=0, ge=0)
     extraction_tool: str = "beautifulsoup"
+
+    @model_validator(mode="after")
+    def _require_tz_aware(self) -> SourceDocument:
+        require_tz_aware(self.published_at, "published_at")
+        return self
 
 
 class EvidenceClaim(BaseModel):

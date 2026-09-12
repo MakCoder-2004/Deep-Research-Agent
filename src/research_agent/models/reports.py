@@ -8,13 +8,16 @@ from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
 
 from pydantic import BaseModel, ConfigDict, Field, HttpUrl, model_validator
 
-from research_agent.models import SourceType
+from research_agent.models import SourceType, require_tz_aware
 from research_agent.models.requests import reject_forbidden_report_fields
 
 TRACKING_PARAM_NAMES = frozenset(
     {
         "fbclid",
+        "fb_action_ids",
+        "fb_action_types",
         "gclid",
+        "gclsrc",
         "gbraid",
         "wbraid",
         "dclid",
@@ -22,11 +25,18 @@ TRACKING_PARAM_NAMES = frozenset(
         "msclkid",
         "mc_cid",
         "mc_eid",
+        "mkt_tok",
+        "sc_campaign",
+        "spm",
+        "ref",
+        "ref_src",
+        "pf_rd_p",
+        "pf_rd_r",
+        "wickedid",
         "_hsenc",
         "_hsmi",
         "hsctatracking",
         "igshid",
-        "fb_action_ids",
         "_ga",
         "_gl",
         "vero_id",
@@ -36,7 +46,7 @@ TRACKING_PARAM_NAMES = frozenset(
     }
 )
 
-_TRACKING_PREFIXES = ("utm_", "pk_", "piwik_", "matomo", "vero_")
+_TRACKING_PREFIXES = ("utm_", "pk_", "piwik_", "matomo", "vero_", "spm_")
 
 
 def canonicalize_url(url: str | HttpUrl) -> str:
@@ -69,9 +79,13 @@ def canonicalize_url(url: str | HttpUrl) -> str:
         port = None
     netloc = host if port is None else f"{host}:{port}"
     import posixpath
+    import re as _re
 
     path = parts.path or "/"
-    # Decode percent-escapes for dot-segment resolution, then re-encode minimal.
+    # Decode percent-encoded dots before dot-segment resolution so that
+    # "/a/%2e%2e/b" normalizes like "/a/../b" and cannot bypass dedup.
+    # Only dots are decoded (not %2F etc.) to avoid merging distinct paths.
+    path = _re.sub(r"%2e", ".", path, flags=_re.IGNORECASE)
     path = posixpath.normpath(path)
     if not path.startswith("/"):
         path = "/" + path
@@ -128,10 +142,8 @@ class Source(BaseModel):
 
     @model_validator(mode="after")
     def _require_tz_aware(self) -> Source:
-        if self.accessed_at.tzinfo is None:
-            raise ValueError("accessed_at must be timezone-aware.")
-        if self.published_at is not None and self.published_at.tzinfo is None:
-            raise ValueError("published_at must be timezone-aware when set.")
+        require_tz_aware(self.accessed_at, "accessed_at")
+        require_tz_aware(self.published_at, "published_at")
         return self
 
 
@@ -177,6 +189,8 @@ class ResearchReport(BaseModel):
         cited_in_listed_order = [source_id for source_id in source_ids if source_id in seen_set]
         if cited_in_listed_order != seen:
             raise ValueError("Sources must be ordered by first citation appearance.")
+        # Trailing uncited sources are allowed as background material; an
+        # uncited source followed by a cited one is rejected below.
         first_uncited = next(
             (index for index, source_id in enumerate(source_ids) if source_id not in seen_set),
             len(source_ids),

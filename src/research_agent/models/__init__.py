@@ -2,7 +2,19 @@
 
 from __future__ import annotations
 
+from datetime import datetime
 from enum import StrEnum
+
+
+def require_tz_aware(value: datetime | None, field_name: str) -> datetime | None:
+    """Return the datetime, rejecting naive values that lack tzinfo.
+
+    SQLite parsing helpers attach UTC explicitly, so a naive datetime here
+    always indicates a caller bug rather than a storage artifact.
+    """
+    if value is not None and value.tzinfo is None:
+        raise ValueError(f"{field_name} must be timezone-aware.")
+    return value
 
 
 class Language(StrEnum):

@@ -6,11 +6,22 @@ from datetime import UTC, datetime
 from typing import Any
 from uuid import UUID, uuid4
 
-from pydantic import BaseModel, ConfigDict, Field, HttpUrl
+from pydantic import BaseModel, ConfigDict, Field, HttpUrl, model_validator
 
-from research_agent.models import Depth, Domain, JobState, Language, RiskLevel
+from research_agent.models import Depth, Domain, JobState, Language, RiskLevel, require_tz_aware
 
-FORBIDDEN_REPORT_FIELDS = frozenset({"prompt", "hidden_prompt", "chain_of_thought", "cot"})
+FORBIDDEN_REPORT_FIELDS = frozenset(
+    {
+        "prompt",
+        "system_prompt",
+        "hidden_prompt",
+        "chain_of_thought",
+        "cot",
+        "reasoning",
+        "thought",
+        "internal_reasoning",
+    }
+)
 
 
 def reject_forbidden_report_fields(data: Any) -> Any:
@@ -54,6 +65,12 @@ class ResearchJob(BaseModel):
     created_at: datetime = Field(default_factory=lambda: datetime.now(UTC))
     updated_at: datetime = Field(default_factory=lambda: datetime.now(UTC))
 
+    @model_validator(mode="after")
+    def _require_tz_aware(self) -> ResearchJob:
+        require_tz_aware(self.created_at, "created_at")
+        require_tz_aware(self.updated_at, "updated_at")
+        return self
+
 
 class SessionContext(BaseModel):
     """Temporary conversation state (24h / last 6 interactions)."""
@@ -64,3 +81,8 @@ class SessionContext(BaseModel):
     language: Language = Language.ENGLISH
     interactions: list[str] = Field(default_factory=list, max_length=6)
     updated_at: datetime = Field(default_factory=lambda: datetime.now(UTC))
+
+    @model_validator(mode="after")
+    def _require_tz_aware(self) -> SessionContext:
+        require_tz_aware(self.updated_at, "updated_at")
+        return self
