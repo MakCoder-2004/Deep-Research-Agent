@@ -8,9 +8,11 @@ from datetime import UTC, datetime
 from typing import cast
 
 import pytest
+from pydantic import ValidationError
 
+from research_agent.config import Settings
 from research_agent.errors import ErrorCategory
-from research_agent.models import Domain, Language, SourceType
+from research_agent.models import AttemptOutcome, Domain, Language, SourceType
 from research_agent.models.research import ResearchPlan, SearchHit, SearchTask
 from research_agent.persistence.database import connect, init_schema
 from research_agent.persistence.repositories import JobRepository, ToolRunRepository
@@ -25,9 +27,15 @@ from research_agent.tools.base import ToolError
 from research_agent.tools.router import ToolAttempt, ToolRouter, normalize_hits, route_plan
 
 
-def _task(name: str, query: str = "climate policy", **filters: str) -> SearchTask:
+def _task(
+    name: str,
+    query: str = "climate policy",
+    *,
+    task_id: str | None = None,
+    **filters: str,
+) -> SearchTask:
     return SearchTask(
-        task_id=f"task-{name}-{len(filters)}",
+        task_id=task_id or f"task-{name}-{len(filters)}",
         tool_name=name,
         query=query,
         language=Language.ENGLISH,
@@ -93,10 +101,13 @@ class FakeTool:
 
 
 class FakeRecorder:
-    def __init__(self) -> None:
+    def __init__(self, *, delay: float = 0.0) -> None:
         self.attempts: list[ToolAttempt] = []
+        self.delay = delay
 
     async def record(self, attempt: ToolAttempt) -> None:
+        if self.delay:
+            await asyncio.sleep(self.delay)
         self.attempts.append(attempt)
 
 
@@ -166,7 +177,7 @@ async def test_failed_and_unknown_tools_do_not_cancel_independent_requests() -> 
             tool_name="bad",
         ),
     )
-    recorder = FakeRecorder()
+    recorder = FakeRecorder(delay=0.01)
     result = await ToolRouter([good, bad], recorder=recorder).execute(
         [_task("good"), _task("bad"), _task("missing")], job_id="job-2"
     )
@@ -261,6 +272,215 @@ async def test_deadline_records_timeout_and_skips_malformed_individual_hits() ->
     assert timed.attempts[0].result_count == 0
 
 
+@pytest.mark.asyncio
+async def test_execution_hard_caps_tasks_queries_and_results_from_plan() -> None:
+    class UnboundedTool(FakeTool):
+        async def search(self, task: SearchTask) -> list[SearchHit]:
+            self.calls = getattr(self, "calls", [])
+            self.calls.append(task)
+            return [
+                _hit(f"https://results.example/{index}", f"Result {index}") for index in range(20)
+            ]
+
+    tool = UnboundedTool("bounded", [])
+    plan = ResearchPlan(
+        query="bounded query",
+        source_budget=3,
+        query_budget=1,
+        variant_budget=1,
+        task_budget=20,
+    )
+    tasks = [
+        SearchTask(
+            task_id=f"bounded-{index}",
+            tool_name="bounded",
+            query="bounded query",
+            language=Language.ENGLISH,
+            filters={"max_results": "10"},
+        )
+        for index in range(20)
+    ]
+
+    result = await ToolRouter([tool]).execute(tasks, plan=plan, job_id="bounded-job")
+
+    assert len(tool.calls) == 3
+    assert len(result.hits) == 3
+    assert sum(attempt.result_count for attempt in result.attempts) == 3
+    assert [attempt.task_index for attempt in result.attempts] == [0, 1, 2]
+
+
+@pytest.mark.asyncio
+async def test_execution_uses_settings_caps_for_untrusted_direct_tasks() -> None:
+    settings = Settings(
+        _env_file=None,
+        SOURCES_PER_JOB=2,
+        SOURCE_BUDGET=2,
+        SEARCH_SUBQUERIES_PER_JOB=1,
+        SEARCH_VARIANTS_PER_JOB=1,
+        SEARCH_TASKS_PER_JOB=5,
+        TASK_BUDGET=5,
+    )
+    tool = FakeTool(
+        "settings-bounded",
+        [_hit("https://settings.example/a", "A"), _hit("https://settings.example/b", "B")],
+    )
+    tasks = [
+        SearchTask(
+            task_id=f"settings-{index}",
+            tool_name="settings-bounded",
+            query="same settings query",
+            language=Language.ENGLISH,
+        )
+        for index in range(20)
+    ]
+
+    result = await ToolRouter([tool], settings=settings).execute(tasks)
+
+    assert len(result.attempts) == 2
+    assert len(tool.result) == 2
+    assert len(result.hits) == 2
+
+
+@pytest.mark.asyncio
+async def test_settings_provider_limit_is_shared_across_tools() -> None:
+    settings = Settings(_env_file=None, SEARCH_PROVIDER_CONCURRENCY=1, SEARCH_TOOL_CONCURRENCY=2)
+    first = FakeTool(
+        "settings-first",
+        [_hit("https://settings.example/one", "One")],
+        delay=0.03,
+        provider="shared",
+    )
+    second = FakeTool(
+        "settings-second",
+        [_hit("https://settings.example/two", "Two")],
+        delay=0.03,
+        provider="shared",
+    )
+    started = time.monotonic()
+
+    await ToolRouter([first, second], settings=settings).execute(
+        [_task("settings-first"), _task("settings-second")]
+    )
+
+    assert time.monotonic() - started >= 0.05
+    assert first.max_active == second.max_active == 1
+
+
+@pytest.mark.asyncio
+async def test_cancellation_stops_workers_and_records_all_cancelled_attempts() -> None:
+    class BlockingTool:
+        name = "blocking"
+        provider = "blocking-provider"
+
+        def __init__(self) -> None:
+            self.started = asyncio.Event()
+            self.cancelled = 0
+
+        async def search(self, task: SearchTask) -> list[SearchHit]:
+            self.started.set()
+            try:
+                await asyncio.Event().wait()
+            except asyncio.CancelledError:
+                self.cancelled += 1
+                raise
+
+        async def health_check(self) -> bool:
+            return True
+
+    tool = BlockingTool()
+    recorder = FakeRecorder(delay=0.01)
+    execution = asyncio.create_task(
+        ToolRouter([tool], recorder=recorder).execute(
+            [
+                _task("blocking", query="one", task_id="blocking-one"),
+                _task("blocking", query="two", task_id="blocking-two"),
+            ],
+            job_id="cancel-job",
+        )
+    )
+    await asyncio.wait_for(tool.started.wait(), timeout=1)
+    execution.cancel()
+
+    with pytest.raises(asyncio.CancelledError):
+        await execution
+    assert tool.cancelled == 1
+    assert len(recorder.attempts) == 2
+    assert all(attempt.outcome is AttemptOutcome.CANCELLED for attempt in recorder.attempts)
+    assert all(attempt.cancelled for attempt in recorder.attempts)
+
+
+@pytest.mark.asyncio
+async def test_malformed_top_level_payload_is_a_failed_attempt() -> None:
+    malformed = FakeTool("malformed", {"results": []})
+
+    result = await ToolRouter([malformed]).execute([_task("malformed")])
+
+    assert result.hits == []
+    assert len(result.attempts) == 1
+    assert result.attempts[0].success is False
+    assert result.attempts[0].outcome is AttemptOutcome.FAILURE
+    assert result.attempts[0].error_category is ErrorCategory.INVALID_REQUEST
+
+
+@pytest.mark.asyncio
+async def test_tool_error_attempt_keeps_http_retry_metadata() -> None:
+    limited = FakeTool(
+        "limited",
+        [],
+        failure=ToolError(
+            "rate limited",
+            category=ErrorCategory.RATE_LIMITED,
+            tool_name="limited",
+            http_status=429,
+            retry_after=2.5,
+        ),
+    )
+
+    result = await ToolRouter([limited]).execute([_task("limited")])
+
+    attempt = result.attempts[0]
+    assert attempt.outcome is AttemptOutcome.FAILURE
+    assert attempt.http_status == 429
+    assert attempt.retry_after == 2.5
+
+
+@pytest.mark.asyncio
+async def test_recorder_failure_is_not_silently_discarded() -> None:
+    class FailingRecorder:
+        def __init__(self) -> None:
+            self.calls = 0
+
+        async def record(self, attempt: ToolAttempt) -> None:
+            self.calls += 1
+            raise RuntimeError("recorder unavailable")
+
+    recorder = FailingRecorder()
+    tasks = [
+        _task("record-fail", query="one", task_id="record-fail-one"),
+        _task("record-fail", query="two", task_id="record-fail-two"),
+    ]
+
+    with pytest.raises(RuntimeError, match="recorder unavailable"):
+        await ToolRouter([FakeTool("record-fail", [])], recorder=recorder).execute(tasks)
+    assert recorder.calls == 2
+
+
+def test_tool_attempt_validates_outcomes_and_nonnegative_measurements() -> None:
+    with pytest.raises(ValidationError):
+        ToolAttempt(tool_name="tool", success=True, duration_ms=-1)
+    with pytest.raises(ValidationError):
+        ToolAttempt(tool_name="tool", success=False, error_category="not-a-category")
+    with pytest.raises(ValidationError):
+        ToolAttempt(
+            tool_name="tool",
+            success=False,
+            outcome=AttemptOutcome.CANCELLED,
+            cancelled=False,
+        )
+    timeout = ToolAttempt(tool_name="tool", success=False, error_category=ErrorCategory.TIMEOUT)
+    assert timeout.outcome is AttemptOutcome.TIMEOUT
+
+
 def test_normalization_preserves_metadata_and_skips_invalid_url() -> None:
     accessed = datetime(2026, 1, 2, tzinfo=UTC)
     hits = normalize_hits(
@@ -285,7 +505,7 @@ def test_normalization_preserves_metadata_and_skips_invalid_url() -> None:
     assert hits[0].published_at is not None
     assert hits[0].accessed_at == accessed
     assert hits[0].source_type is SourceType.PAPER
-    assert hits[0].tool_name == "source-adapter"
+    assert hits[0].tool_name == "fallback-tool"
 
 
 def test_deduplication_merges_identity_keys_and_provenance() -> None:

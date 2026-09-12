@@ -14,6 +14,7 @@ class ErrorCategory(StrEnum):
     UNAVAILABLE = "unavailable"
     CONTENT_FILTERED = "content_filtered"
     BUDGET_EXHAUSTED = "budget_exhausted"
+    CANCELLED = "cancelled"
     UNKNOWN = "unknown"
 
 

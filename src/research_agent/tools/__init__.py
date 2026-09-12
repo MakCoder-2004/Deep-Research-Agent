@@ -1,6 +1,7 @@
 """Research tool interfaces."""
 
 from research_agent.errors import ErrorCategory
+from research_agent.models import AttemptOutcome
 from research_agent.tools.academic import ArxivTool, CrossrefTool, OpenAlexTool, SemanticScholarTool
 from research_agent.tools.base import ResearchTool, ToolError
 from research_agent.tools.medical import EuropePMCTool, EuropePmcTool, PubMedTool
@@ -31,6 +32,7 @@ from research_agent.tools.wiki import WikipediaTool
 __all__ = [
     "ArxivTool",
     "AttemptRecorder",
+    "AttemptOutcome",
     "BraveTool",
     "CrossrefTool",
     "DdgsTool",

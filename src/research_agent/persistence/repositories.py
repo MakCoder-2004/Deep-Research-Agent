@@ -414,43 +414,77 @@ class ToolRunRepository:
         task_id: str = "",
         tool_name: str,
         success: bool,
+        outcome: str | None = None,
         duration_ms: int = 0,
         result_count: int = 0,
         error_category: str | None = None,
         error_message: str | None = None,
         quota_metadata: Mapping[str, Any] | None = None,
+        http_status: int | None = None,
+        retry_after: float | None = None,
+        cancelled: bool = False,
+        task_index: int = 0,
     ) -> None:
-        from research_agent.observability.redaction import redact_mapping, redact_text
+        # Validate the public persistence boundary with the same model used by
+        # the execution recorder, including legacy callers that omit outcome.
+        from research_agent.errors import ErrorCategory
+        from research_agent.models import AttemptOutcome
+        from research_agent.tools.router import ToolAttempt
 
-        safe_error = redact_text(error_message)[:500] if error_message else None
+        attempt = ToolAttempt(
+            job_id=str(job_id),
+            task_id=str(task_id),
+            tool_name=str(tool_name),
+            success=success,
+            outcome=AttemptOutcome(outcome) if outcome is not None else None,
+            duration_ms=duration_ms,
+            result_count=result_count,
+            error_category=ErrorCategory(error_category) if error_category is not None else None,
+            error_message=error_message,
+            quota_metadata=dict(quota_metadata or {}),
+            http_status=http_status,
+            retry_after=retry_after,
+            cancelled=cancelled,
+            task_index=task_index,
+        )
+        from research_agent.observability.redaction import redact_mapping
+
         safe_quota = (
-            json.dumps(redact_mapping(dict(quota_metadata)), sort_keys=True, default=str)
-            if quota_metadata
+            json.dumps(redact_mapping(attempt.quota_metadata), sort_keys=True, default=str)
+            if attempt.quota_metadata
             else None
         )
         await conn.execute(
             """
-            INSERT INTO tool_runs (job_id, task_id, tool_name, success, duration_ms,
-                                   result_count, error_category, error_message,
-                                   quota_metadata, created_at)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            INSERT INTO tool_runs (job_id, task_id, task_index, tool_name, success,
+                                   outcome, cancelled, duration_ms, result_count,
+                                   error_category, error_message, http_status,
+                                   retry_after, quota_metadata, created_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
-                job_id,
-                task_id,
-                tool_name,
-                int(success),
-                duration_ms,
-                result_count,
-                error_category,
-                safe_error,
+                attempt.job_id,
+                attempt.task_id,
+                attempt.task_index,
+                attempt.tool_name,
+                int(attempt.success),
+                attempt.outcome.value if attempt.outcome is not None else "failure",
+                int(attempt.cancelled),
+                attempt.duration_ms,
+                attempt.result_count,
+                attempt.error_category.value if attempt.error_category else None,
+                attempt.error_message,
+                attempt.http_status,
+                attempt.retry_after,
                 safe_quota,
                 _now_iso(),
             ),
         )
 
     async def list_by_job(self, conn: aiosqlite.Connection, job_id: str) -> list[aiosqlite.Row]:
-        cursor = await conn.execute("SELECT * FROM tool_runs WHERE job_id = ?", (job_id,))
+        cursor = await conn.execute(
+            "SELECT * FROM tool_runs WHERE job_id = ? ORDER BY task_index, id", (job_id,)
+        )
         return list(await cursor.fetchall())
 
 

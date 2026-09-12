@@ -7,8 +7,11 @@ from datetime import UTC, datetime, timedelta, timezone
 from pathlib import Path
 
 import aiosqlite
+import pytest
+from pydantic import ValidationError
 
-from research_agent.models import Depth, Domain, JobState, Language, RiskLevel
+from research_agent.errors import ErrorCategory
+from research_agent.models import AttemptOutcome, Depth, Domain, JobState, Language, RiskLevel
 from research_agent.models.reports import Source
 from research_agent.persistence.database import connect, init_schema
 from research_agent.persistence.repositories import (
@@ -21,6 +24,7 @@ from research_agent.persistence.repositories import (
     ToolRunRepository,
     UserRepository,
 )
+from research_agent.tools.router import ToolAttempt
 
 
 async def _memory_db() -> aiosqlite.Connection:
@@ -188,6 +192,120 @@ async def test_tool_provider_cache_repositories() -> None:
         await cache.set(conn, "k2", "v2", past)
         assert await cache.get(conn, "k2") is None
         assert await cache.delete_expired(conn) >= 1
+    finally:
+        await conn.close()
+
+
+async def test_tool_attempt_persistence_records_outcomes_metadata_and_order() -> None:
+    conn = await _memory_db()
+    try:
+        await JobRepository().create(conn, job_id="attempt-job", user_id=1, query="q")
+        repository = ToolRunRepository()
+        await repository.record(
+            conn,
+            job_id="attempt-job",
+            task_id="second",
+            task_index=1,
+            tool_name="tool-two",
+            success=False,
+            outcome=AttemptOutcome.TIMEOUT,
+            error_category=ErrorCategory.TIMEOUT,
+            duration_ms=12,
+            result_count=0,
+            http_status=429,
+            retry_after=3.5,
+        )
+        await repository.record(
+            conn,
+            job_id="attempt-job",
+            task_id="first",
+            task_index=0,
+            tool_name="tool-one",
+            success=True,
+            outcome=AttemptOutcome.SUCCESS,
+            duration_ms=4,
+            result_count=2,
+        )
+        await conn.commit()
+
+        rows = await repository.list_by_job(conn, "attempt-job")
+        assert [row["task_id"] for row in rows] == ["first", "second"]
+        assert rows[1]["outcome"] == "timeout"
+        assert rows[1]["http_status"] == 429
+        assert rows[1]["retry_after"] == 3.5
+    finally:
+        await conn.close()
+
+
+async def test_tool_attempt_and_repository_reject_invalid_measurements() -> None:
+    with pytest.raises(ValidationError):
+        ToolAttempt(tool_name="tool", success=True, result_count=-1)
+
+    conn = await _memory_db()
+    try:
+        await JobRepository().create(conn, job_id="invalid-attempt", user_id=1, query="q")
+        with pytest.raises(ValidationError):
+            await ToolRunRepository().record(
+                conn,
+                job_id="invalid-attempt",
+                tool_name="tool",
+                success=True,
+                duration_ms=-1,
+            )
+    finally:
+        await conn.close()
+
+
+async def test_legacy_tool_runs_gain_outcome_and_metadata_columns() -> None:
+    conn = await connect(":memory:")
+    try:
+        await conn.execute(
+            """
+            CREATE TABLE jobs (
+                job_id TEXT PRIMARY KEY,
+                user_id INTEGER NOT NULL,
+                query TEXT NOT NULL,
+                language TEXT NOT NULL,
+                domain TEXT NOT NULL,
+                depth TEXT NOT NULL,
+                risk_level TEXT NOT NULL,
+                state TEXT NOT NULL,
+                repair_count INTEGER NOT NULL,
+                trace_id TEXT,
+                error TEXT,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL
+            )
+            """
+        )
+        await conn.execute(
+            """
+            CREATE TABLE tool_runs (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                job_id TEXT NOT NULL,
+                tool_name TEXT NOT NULL,
+                success INTEGER NOT NULL,
+                duration_ms INTEGER NOT NULL DEFAULT 0,
+                result_count INTEGER NOT NULL DEFAULT 0,
+                error_category TEXT,
+                quota_metadata TEXT,
+                created_at TEXT NOT NULL
+            )
+            """
+        )
+        await conn.execute(
+            """
+            INSERT INTO tool_runs
+                (job_id, tool_name, success, error_category, created_at)
+            VALUES ('legacy-job', 'legacy-tool', 0, 'timeout', '2026-01-01T00:00:00+00:00')
+            """
+        )
+        await init_schema(conn)
+
+        cursor = await conn.execute("SELECT outcome, cancelled FROM tool_runs")
+        row = await cursor.fetchone()
+        assert row is not None
+        assert (row["outcome"], row["cancelled"]) == ("timeout", 0)
     finally:
         await conn.close()
 

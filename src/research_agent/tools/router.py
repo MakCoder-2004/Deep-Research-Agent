@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import asyncio
 import inspect
+import itertools
+import logging
 import math
 import re
 import time
@@ -12,23 +14,34 @@ from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from typing import TYPE_CHECKING, Any, Protocol, cast
 
-from pydantic import ValidationError
+from pydantic import (
+    BaseModel,
+    ConfigDict,
+    Field,
+    FiniteFloat,
+    ValidationError,
+    field_validator,
+    model_validator,
+)
 
 from research_agent.errors import ClarificationRequiredError, ErrorCategory
+from research_agent.models import AttemptOutcome
 from research_agent.models.reports import canonicalize_url
 from research_agent.models.research import ResearchPlan, SearchHit, SearchTask
 from research_agent.models.urls import normalize_source_url
 from research_agent.observability.redaction import redact_mapping, redact_text
-from research_agent.tools._common import timeout_for_task
+from research_agent.tools._common import max_results_from_filters, timeout_for_task
 from research_agent.tools.base import ResearchTool, ToolError
 
 if TYPE_CHECKING:
     import aiosqlite
 
+    from research_agent.config import Settings
     from research_agent.persistence.repositories import ToolRunRepository
 
 __all__ = [
     "AttemptRecorder",
+    "AttemptOutcome",
     "SOURCE_PRIORITIES",
     "ToolAttempt",
     "ToolExecutionResult",
@@ -38,6 +51,8 @@ __all__ = [
     "normalize_hits",
     "route_plan",
 ]
+
+logger = logging.getLogger(__name__)
 
 
 # Keep this table aligned with PLAN section 8.  A plan's explicit selection is
@@ -75,20 +90,70 @@ _DOMAIN_CATEGORIES: dict[str, tuple[str, ...]] = {
 _URL_RE = re.compile(r"https?://\S+", re.IGNORECASE)
 
 
-@dataclass(frozen=True)
-class ToolAttempt:
+class ToolAttempt(BaseModel):
     """Sanitized accounting record for one attempted tool request."""
 
-    job_id: str
-    task_id: str
-    tool_name: str
+    model_config = ConfigDict(extra="forbid")
+
+    job_id: str = ""
+    task_id: str = ""
+    tool_name: str = Field(min_length=1)
     success: bool
-    duration_ms: int = 0
-    result_count: int = 0
-    error_category: str | None = None
+    outcome: AttemptOutcome | None = None
+    duration_ms: int = Field(default=0, ge=0)
+    result_count: int = Field(default=0, ge=0)
+    error_category: ErrorCategory | None = None
     error_message: str | None = None
-    quota_metadata: dict[str, object] = field(default_factory=dict)
+    quota_metadata: dict[str, object] = Field(default_factory=dict)
+    http_status: int | None = Field(default=None, ge=100, le=599)
+    retry_after: FiniteFloat | None = Field(default=None, ge=0)
     cancelled: bool = False
+    task_index: int = Field(default=0, ge=0)
+
+    @field_validator("error_message")
+    @classmethod
+    def _sanitize_message(cls, value: str | None) -> str | None:
+        if value is None:
+            return None
+        safe = redact_text(value).strip()[:500]
+        return safe or None
+
+    @model_validator(mode="after")
+    def _validate_outcome(self) -> ToolAttempt:
+        if self.outcome is None:
+            if self.cancelled or self.error_category is ErrorCategory.CANCELLED:
+                self.outcome = AttemptOutcome.CANCELLED
+                self.cancelled = True
+                self.error_category = ErrorCategory.CANCELLED
+            elif self.success:
+                self.outcome = AttemptOutcome.SUCCESS
+            elif self.error_category is ErrorCategory.TIMEOUT:
+                self.outcome = AttemptOutcome.TIMEOUT
+            else:
+                self.outcome = AttemptOutcome.FAILURE
+
+        if self.outcome is AttemptOutcome.SUCCESS:
+            if not self.success or self.cancelled or self.error_category is not None:
+                raise ValueError("successful attempts must have success=True and cancelled=False")
+        elif self.outcome is AttemptOutcome.CANCELLED:
+            if self.success or not self.cancelled:
+                raise ValueError("cancelled attempts must have success=False and cancelled=True")
+            if self.error_category not in (None, ErrorCategory.CANCELLED):
+                raise ValueError("cancelled attempts must use the cancelled error category")
+            self.error_category = ErrorCategory.CANCELLED
+        else:
+            if self.success or self.cancelled:
+                raise ValueError("failed attempts must have success=False and cancelled=False")
+            if self.outcome is AttemptOutcome.TIMEOUT and self.error_category not in (
+                None,
+                ErrorCategory.TIMEOUT,
+            ):
+                raise ValueError("timeout attempts must use the timeout error category")
+            if self.outcome is AttemptOutcome.TIMEOUT:
+                self.error_category = ErrorCategory.TIMEOUT
+            elif self.error_category in (ErrorCategory.TIMEOUT, ErrorCategory.CANCELLED):
+                raise ValueError("failure attempts must use a failure error category")
+        return self
 
 
 @dataclass
@@ -148,11 +213,16 @@ class ToolRunRecorder:
             task_id=attempt.task_id,
             tool_name=attempt.tool_name,
             success=attempt.success,
+            outcome=attempt.outcome,
             duration_ms=attempt.duration_ms,
             result_count=attempt.result_count,
             error_category=attempt.error_category,
             error_message=attempt.error_message,
             quota_metadata=attempt.quota_metadata,
+            http_status=attempt.http_status,
+            retry_after=attempt.retry_after,
+            cancelled=attempt.cancelled,
+            task_index=attempt.task_index,
         )
 
 
@@ -290,8 +360,8 @@ def normalize_hit(raw: object, tool_name: str) -> SearchHit | None:
     """Safely coerce one adapter result, skipping malformed results.
 
     Canonicalization happens before Pydantic validation so an invalid URL never
-    reaches the normalized result set.  Existing metadata is copied rather
-    than replaced; only missing aliases such as ``content`` are filled in.
+    reaches the normalized result set. Existing metadata is copied rather than
+    replaced, except provenance, which is assigned by the executing router.
     """
 
     if isinstance(raw, SearchHit):
@@ -312,19 +382,13 @@ def normalize_hit(raw: object, tool_name: str) -> SearchHit | None:
     title = data.get("title")
     if not isinstance(title, str) or not title.strip():
         return None
-    existing_tool = data.get("tool_name")
-    if not isinstance(existing_tool, str) or not existing_tool.strip():
-        data["tool_name"] = tool_name
-    else:
-        data["tool_name"] = existing_tool.strip()
-
-    raw_tool_names = data.get("tool_names", [])
-    tool_names: list[str] = []
-    if isinstance(raw_tool_names, (list, tuple, set)):
-        tool_names = [str(name).strip() for name in raw_tool_names if str(name).strip()]
-    if str(data["tool_name"]).strip() not in tool_names:
-        tool_names.insert(0, str(data["tool_name"]).strip())
-    data["tool_names"] = tool_names
+    executing_tool = tool_name.strip().lower()
+    if not executing_tool:
+        return None
+    # Adapter payloads are untrusted data.  Provenance comes from the router,
+    # never from a payload-provided tool_name/tool_names value.
+    data["tool_name"] = executing_tool
+    data["tool_names"] = [executing_tool]
 
     raw_aliases = data.get("aliases", [])
     aliases: list[str] = []
@@ -347,15 +411,27 @@ def normalize_hit(raw: object, tool_name: str) -> SearchHit | None:
         return None
 
 
-def normalize_hits(raw: object, tool_name: str) -> list[SearchHit]:
-    """Normalize all valid items in one adapter response."""
+def normalize_hits(
+    raw: object,
+    tool_name: str,
+    *,
+    max_results: int = 10,
+) -> list[SearchHit]:
+    """Normalize a bounded adapter response, rejecting malformed top-level data."""
+
+    if max_results < 1:
+        raise ValueError("max_results must be positive.")
 
     if isinstance(raw, SearchHit):
         items: Iterable[object] = (raw,)
     elif isinstance(raw, (list, tuple)):
-        items = raw
+        items = itertools.islice(raw, max_results)
     else:
-        return []
+        raise ToolError(
+            "Tool returned an unexpected payload.",
+            category=ErrorCategory.INVALID_REQUEST,
+            tool_name=tool_name,
+        )
     return [
         normalized for item in items if (normalized := normalize_hit(item, tool_name)) is not None
     ]
@@ -371,7 +447,28 @@ def _error_category(exc: BaseException) -> str:
     if isinstance(category, ErrorCategory):
         return category.value
     value = str(category).strip().lower()
-    return value or ErrorCategory.UNKNOWN.value
+    try:
+        return ErrorCategory(value).value
+    except ValueError:
+        return ErrorCategory.UNKNOWN.value
+
+
+def _http_metadata(exc: BaseException) -> tuple[int | None, float | None]:
+    status = getattr(exc, "http_status", None)
+    retry_after = getattr(exc, "retry_after", None)
+    try:
+        status_value = int(status) if status is not None else None
+    except (TypeError, ValueError):
+        status_value = None
+    if status_value is not None and not 100 <= status_value <= 599:
+        status_value = None
+    try:
+        retry_value = float(retry_after) if retry_after is not None else None
+    except (TypeError, ValueError):
+        retry_value = None
+    if retry_value is not None and (not math.isfinite(retry_value) or retry_value < 0):
+        retry_value = None
+    return status_value, retry_value
 
 
 def _quota_metadata(tool: object) -> dict[str, object]:
@@ -381,6 +478,31 @@ def _quota_metadata(tool: object) -> dict[str, object]:
             redacted = redact_mapping({str(key): item for key, item in value.items()})
             return {str(key): item for key, item in redacted.items()}
     return {}
+
+
+@dataclass(frozen=True)
+class _ExecutionCaps:
+    """Effective execution caps after applying plan and runtime settings."""
+
+    tasks: int
+    queries: int
+    variants: int
+    results: int
+    candidates: int
+
+
+def _bounded_min(default: int, *values: object) -> int:
+    limits = [default]
+    for value in values:
+        if not isinstance(value, (int, float, str)):
+            continue
+        try:
+            integer = int(value)
+        except (TypeError, ValueError):
+            continue
+        if integer > 0:
+            limits.append(integer)
+    return min(limits)
 
 
 def _recorder_call(recorder: object, attempt: ToolAttempt) -> Awaitable[object] | object:
@@ -398,21 +520,28 @@ def _recorder_call(recorder: object, attempt: ToolAttempt) -> Awaitable[object] 
     )
     if not keyword_style:
         return cast(Awaitable[object] | object, target(attempt))
-    return cast(
-        Awaitable[object] | object,
-        target(
-            job_id=attempt.job_id,
-            task_id=attempt.task_id,
-            tool_name=attempt.tool_name,
-            success=attempt.success,
-            duration_ms=attempt.duration_ms,
-            result_count=attempt.result_count,
-            error_category=attempt.error_category,
-            error_message=attempt.error_message,
-            quota_metadata=attempt.quota_metadata,
-            cancelled=attempt.cancelled,
+    values: dict[str, object] = {
+        "job_id": attempt.job_id,
+        "task_id": attempt.task_id,
+        "tool_name": attempt.tool_name,
+        "success": attempt.success,
+        "outcome": attempt.outcome.value if attempt.outcome is not None else None,
+        "duration_ms": attempt.duration_ms,
+        "result_count": attempt.result_count,
+        "error_category": (
+            attempt.error_category.value if attempt.error_category is not None else None
         ),
-    )
+        "error_message": attempt.error_message,
+        "quota_metadata": attempt.quota_metadata,
+        "http_status": attempt.http_status,
+        "retry_after": attempt.retry_after,
+        "cancelled": attempt.cancelled,
+        "task_index": attempt.task_index,
+    }
+    if not any(parameter.kind is inspect.Parameter.VAR_KEYWORD for parameter in parameters):
+        accepted = {parameter.name for parameter in parameters}
+        values = {name: value for name, value in values.items() if name in accepted}
+    return cast(Awaitable[object] | object, target(**values))
 
 
 class ToolRouter:
@@ -422,6 +551,7 @@ class ToolRouter:
         self,
         tools: Mapping[str, ResearchTool] | Iterable[ResearchTool] = (),
         *,
+        settings: Settings | None = None,
         tool_limits: Mapping[str, int] | None = None,
         provider_limits: Mapping[str, int] | None = None,
         tool_providers: Mapping[str, str] | None = None,
@@ -449,8 +579,17 @@ class ToolRouter:
                 name = str(getattr(tool, "name", "")).strip().lower()
                 if name:
                     self._tools[name] = tool
-        self._tool_limits = self._validate_limits(tool_limits, "tool")
-        self._provider_limits = self._validate_limits(provider_limits, "provider")
+        self._settings = settings
+        configured_tool_limits = getattr(settings, "search_tool_limits", {})
+        configured_provider_limits = getattr(settings, "search_provider_limits", {})
+        self._tool_limits = self._validate_limits(
+            {**configured_tool_limits, **(tool_limits or {})}, "tool"
+        )
+        self._provider_limits = self._validate_limits(
+            {**configured_provider_limits, **(provider_limits or {})}, "provider"
+        )
+        self._default_tool_limit = int(getattr(settings, "search_tool_concurrency", 1))
+        self._default_provider_limit = int(getattr(settings, "search_provider_concurrency", 1))
         self._tool_providers = {
             str(name).strip().lower(): str(provider).strip().lower()
             for name, provider in (tool_providers or {}).items()
@@ -469,8 +608,8 @@ class ToolRouter:
         for raw_name, raw_limit in (values or {}).items():
             name = str(raw_name).strip().lower()
             limit = int(raw_limit)
-            if not name or limit < 1:
-                raise ValueError(f"{label} concurrency limits must be positive.")
+            if not name or limit < 1 or limit > 100:
+                raise ValueError(f"{label} concurrency limits must be between 1 and 100.")
             result[name] = limit
         return result
 
@@ -493,9 +632,47 @@ class ToolRouter:
         )
 
     def _provider_for(self, name: str, tool: ResearchTool) -> str:
-        return self._tool_providers.get(
-            name,
-            str(getattr(tool, "provider", name)).strip().lower() or name,
+        configured = self._tool_providers.get(name)
+        if configured is not None:
+            return configured
+        provider = str(getattr(tool, "provider", "")).strip().lower()
+        return provider or name
+
+    def _execution_caps(self, plan: ResearchPlan | None) -> _ExecutionCaps:
+        settings = self._settings
+        plan_source = plan.source_budget if plan is not None else 8
+        plan_tasks = plan.task_budget if plan is not None else 12
+        plan_queries = plan.query_budget if plan is not None else 6
+        plan_variants = plan.variant_budget if plan is not None else 6
+        source_budget = _bounded_min(
+            plan_source,
+            getattr(settings, "source_budget", None),
+        )
+        candidate_budget = _bounded_min(
+            source_budget,
+            getattr(settings, "sources_per_job", None),
+        )
+        task_budget = _bounded_min(
+            plan_tasks,
+            source_budget,
+            candidate_budget,
+            getattr(settings, "search_tasks_per_job", None),
+            getattr(settings, "task_budget", None),
+        )
+        return _ExecutionCaps(
+            tasks=task_budget,
+            queries=_bounded_min(
+                plan_queries,
+                getattr(settings, "search_subqueries_per_job", None),
+                getattr(settings, "query_budget", None),
+            ),
+            variants=_bounded_min(
+                plan_variants,
+                getattr(settings, "search_variants_per_job", None),
+                getattr(settings, "variant_budget", None),
+            ),
+            results=source_budget,
+            candidates=candidate_budget,
         )
 
     def _semaphore(
@@ -512,12 +689,28 @@ class ToolRouter:
             store[key] = asyncio.Semaphore(limit)
         return store[key]
 
-    async def _limited_search(self, task: SearchTask, tool: ResearchTool) -> object:
+    async def _limited_search(
+        self,
+        task: SearchTask,
+        tool: ResearchTool,
+        *,
+        global_deadline: float | None = None,
+    ) -> object:
         name = task.tool_name.strip().lower()
         provider = self._provider_for(name, tool)
         semaphores = [
-            self._semaphore(self._tool_semaphores, name, self._tool_limits, 1),
-            self._semaphore(self._provider_semaphores, provider, self._provider_limits, None),
+            self._semaphore(
+                self._tool_semaphores,
+                name,
+                self._tool_limits,
+                self._default_tool_limit,
+            ),
+            self._semaphore(
+                self._provider_semaphores,
+                provider,
+                self._provider_limits,
+                self._default_provider_limit,
+            ),
         ]
         acquired: list[asyncio.Semaphore] = []
         try:
@@ -525,6 +718,14 @@ class ToolRouter:
                 if semaphore is not None:
                     await semaphore.acquire()
                     acquired.append(semaphore)
+            if global_deadline is not None:
+                remaining = global_deadline - time.monotonic()
+                remaining = min(remaining, timeout_for_task(task, float("inf")))
+                if remaining <= 0:
+                    raise TimeoutError("Tool request deadline exceeded.")
+                filters = dict(task.filters)
+                filters["request_timeout_seconds"] = f"{remaining:.6f}"
+                task = task.model_copy(update={"filters": filters})
             return await tool.search(task)
         finally:
             for semaphore in reversed(acquired):
@@ -552,22 +753,107 @@ class ToolRouter:
             timeout = min(timeout, global_deadline - time.monotonic())
         return timeout
 
+    @staticmethod
+    def _task_with_limits(
+        task: SearchTask, *, result_limit: int, timeout: float | None
+    ) -> SearchTask:
+        filters = dict(task.filters)
+        filters["max_results"] = str(result_limit)
+        if timeout is not None and math.isfinite(timeout):
+            filters["request_timeout_seconds"] = f"{max(0.0, timeout):.6f}"
+        return task.model_copy(update={"filters": filters})
+
+    @staticmethod
+    def _task_key(value: str) -> str:
+        return " ".join(value.strip().split()).casefold()
+
+    def _bounded_tasks(self, tasks: Sequence[SearchTask], caps: _ExecutionCaps) -> list[SearchTask]:
+        """Admit a bounded, deterministic subset of an otherwise untrusted plan."""
+        selected: list[SearchTask] = []
+        seen_task_ids: set[str] = set()
+        seen_queries: set[str] = set()
+        seen_variants: set[str] = set()
+        for task in itertools.islice(tasks, caps.tasks):
+            if not isinstance(task, SearchTask):
+                raise TypeError("tasks must contain SearchTask instances")
+            task_id = task.task_id.strip()
+            query_key = self._task_key(task.query)
+            if task_id in seen_task_ids or not query_key:
+                continue
+            if query_key not in seen_queries and len(seen_queries) >= caps.queries:
+                continue
+            if query_key not in seen_variants and len(seen_variants) >= caps.variants:
+                continue
+            seen_task_ids.add(task_id)
+            seen_queries.add(query_key)
+            seen_variants.add(query_key)
+            selected.append(task)
+        return selected
+
+    @staticmethod
+    def _result_quotas(tasks: Sequence[SearchTask], caps: _ExecutionCaps) -> list[int]:
+        """Split the candidate budget deterministically before concurrent execution."""
+        remaining = min(caps.results, caps.candidates)
+        quotas: list[int] = []
+        for index, task in enumerate(tasks):
+            requests_left = len(tasks) - index
+            requested = max_results_from_filters(task.filters, default=5, maximum=10)
+            fair_share = max(1, (remaining + requests_left - 1) // requests_left)
+            quota = min(requested, fair_share)
+            quotas.append(quota)
+            remaining -= quota
+        return quotas
+
     async def _record_attempt(self, attempt: ToolAttempt) -> None:
         if self._recorder is None:
             return
-        try:
-            result = _recorder_call(self._recorder, attempt)
-            if inspect.isawaitable(result):
-                await cast(Awaitable[object], result)
-        except asyncio.CancelledError:
-            raise
-        except Exception as exc:  # noqa: BLE001 - persistence is optional
-            # Do not allow metrics storage to turn a usable partial search into
-            # a failed job, and do not log an unredacted provider exception.
-            safe_message = redact_text(str(exc))[:200]
-            import logging
+        result = _recorder_call(self._recorder, attempt)
+        if inspect.isawaitable(result):
+            await cast(Awaitable[object], result)
 
-            logging.getLogger(__name__).warning("tool attempt recording failed: %s", safe_message)
+    async def _record_attempt_durably(self, attempt: ToolAttempt, completed: list[bool]) -> None:
+        """Finish a recorder write before propagating cancellation to its caller."""
+        if self._recorder is None:
+            completed[0] = True
+            return
+        recording = asyncio.create_task(self._record_attempt(attempt))
+        try:
+            await asyncio.shield(recording)
+        except asyncio.CancelledError:
+            try:
+                await recording
+            except asyncio.CancelledError:
+                pass
+            except Exception as exc:  # noqa: BLE001 - preserve outer cancellation
+                logger.warning("tool attempt recording failed: %s", redact_text(str(exc))[:200])
+            else:
+                completed[0] = True
+            raise
+        completed[0] = True
+
+    async def _record_attempts(
+        self,
+        attempts: Sequence[ToolAttempt],
+        recorded: set[int],
+    ) -> Exception | None:
+        """Record all attempts in task order and return, rather than hide, failures."""
+        first_error: Exception | None = None
+        for index, attempt in enumerate(attempts):
+            if index in recorded:
+                continue
+            completed = [False]
+            try:
+                await self._record_attempt_durably(attempt, completed)
+            except asyncio.CancelledError:
+                if completed[0]:
+                    recorded.add(index)
+                raise
+            except Exception as exc:  # noqa: BLE001 - continue recording later attempts
+                if first_error is None:
+                    first_error = exc
+                continue
+            recorded.add(index)
+        return first_error
 
     async def _execute_one(
         self,
@@ -575,6 +861,7 @@ class ToolRouter:
         index: int,
         job_id: str,
         global_deadline: float | None,
+        result_limit: int,
         attempts: list[ToolAttempt | None],
         task_hits: list[list[SearchHit]],
         deadline_expired: list[bool],
@@ -582,76 +869,199 @@ class ToolRouter:
         started = time.monotonic()
         success = False
         cancelled = False
-        error_category: str | None = None
+        outcome: AttemptOutcome | None = None
+        error_category: ErrorCategory | None = None
         error_message: str | None = None
+        http_status: int | None = None
+        retry_after: float | None = None
         hits: list[SearchHit] = []
-        tool = self._tools.get(task.tool_name.strip().lower())
+        tool_name = task.tool_name.strip().lower()
+        tool = self._tools.get(tool_name)
         try:
             if tool is None:
                 raise ToolError(
                     f"Tool {task.tool_name!r} is not registered.",
                     category=ErrorCategory.UNAVAILABLE,
-                    tool_name=task.tool_name,
+                    tool_name=tool_name,
                 )
             timeout = self._task_timeout(task, global_deadline)
             if timeout is not None and timeout <= 0:
                 raise TimeoutError("Tool request deadline exceeded.")
+            execution_task = self._task_with_limits(
+                task,
+                result_limit=result_limit,
+                timeout=timeout,
+            )
             if timeout is None or math.isinf(timeout):
-                raw = await self._limited_search(task, tool)
+                raw = await self._limited_search(
+                    execution_task, tool, global_deadline=global_deadline
+                )
             else:
                 async with asyncio.timeout(timeout):
-                    raw = await self._limited_search(task, tool)
-            hits = normalize_hits(raw, task.tool_name)
+                    raw = await self._limited_search(
+                        execution_task, tool, global_deadline=global_deadline
+                    )
+            hits = normalize_hits(raw, tool_name, max_results=result_limit)
             success = True
+            outcome = AttemptOutcome.SUCCESS
         except asyncio.CancelledError:
             if deadline_expired[0]:
-                error_category = ErrorCategory.TIMEOUT.value
+                outcome = AttemptOutcome.TIMEOUT
+                error_category = ErrorCategory.TIMEOUT
                 error_message = "Tool request deadline exceeded."
             else:
                 cancelled = True
-                error_category = "cancelled"
+                outcome = AttemptOutcome.CANCELLED
+                error_category = ErrorCategory.CANCELLED
                 error_message = "Tool request cancelled."
             raise
         except TimeoutError:
-            error_category = ErrorCategory.TIMEOUT.value
+            outcome = AttemptOutcome.TIMEOUT
+            error_category = ErrorCategory.TIMEOUT
             error_message = "Tool request deadline exceeded."
         except ToolError as exc:
-            error_category = _error_category(exc)
+            error_category = ErrorCategory(_error_category(exc))
             error_message = _sanitize_error(exc)
+            http_status, retry_after = _http_metadata(exc)
+            outcome = (
+                AttemptOutcome.TIMEOUT
+                if error_category is ErrorCategory.TIMEOUT
+                else AttemptOutcome.FAILURE
+            )
         except Exception as exc:  # noqa: BLE001 - one bad tool must not cancel peers
-            error_category = _error_category(exc)
+            error_category = ErrorCategory(_error_category(exc))
             error_message = _sanitize_error(exc)
+            http_status, retry_after = _http_metadata(exc)
+            outcome = (
+                AttemptOutcome.TIMEOUT
+                if error_category is ErrorCategory.TIMEOUT
+                else AttemptOutcome.FAILURE
+            )
         finally:
             task_hits[index] = hits
             attempt = ToolAttempt(
                 job_id=job_id,
                 task_id=task.task_id,
-                tool_name=task.tool_name,
+                tool_name=tool_name,
                 success=success,
+                outcome=outcome,
                 duration_ms=max(0, round((time.monotonic() - started) * 1000)),
                 result_count=len(hits),
                 error_category=error_category,
                 error_message=error_message,
                 quota_metadata=_quota_metadata(tool) if tool is not None else {},
                 cancelled=cancelled,
+                http_status=http_status,
+                retry_after=retry_after,
+                task_index=index,
             )
             attempts[index] = attempt
-            try:
-                await asyncio.shield(self._record_attempt(attempt))
-            except asyncio.CancelledError:
-                # Preserve the tool cancellation semantics after best-effort
-                # persistence.  The attempt was already placed in ``attempts``.
-                if not cancelled:
-                    raise
-            except Exception as exc:  # noqa: BLE001 - preserve tool cancellation semantics
-                # _record_attempt already handles ordinary recorder failures;
-                # this guard also protects unusual awaitable implementations.
-                if not cancelled:
-                    import logging
 
-                    logging.getLogger(__name__).debug(
-                        "tool attempt finalization failed: %s", redact_text(str(exc))[:200]
-                    )
+    async def _wait_workers(
+        self,
+        workers: Sequence[asyncio.Task[None]],
+        *,
+        global_deadline: float | None,
+        deadline_expired: list[bool],
+        execution_cancelled: list[bool],
+    ) -> list[object]:
+        """Wait for workers, stopping the whole fan-out on cancellation or deadline."""
+        pending: set[asyncio.Task[None]] = set(workers)
+        while pending:
+            timeout = None
+            if global_deadline is not None:
+                timeout = max(0.0, global_deadline - time.monotonic())
+            done, pending = await asyncio.wait(
+                pending,
+                timeout=timeout,
+                return_when=asyncio.FIRST_COMPLETED,
+            )
+            if not done:
+                deadline_expired[0] = True
+                for worker in pending:
+                    worker.cancel()
+                break
+            stopped = False
+            for worker in done:
+                if worker.cancelled():
+                    execution_cancelled[0] = True
+                    stopped = True
+                    continue
+                if worker.exception() is not None:
+                    stopped = True
+            if stopped:
+                for worker in pending:
+                    worker.cancel()
+                break
+        return list(await asyncio.gather(*workers, return_exceptions=True))
+
+    @staticmethod
+    async def _cancel_workers(workers: Sequence[asyncio.Task[None]]) -> None:
+        for worker in workers:
+            if not worker.done():
+                worker.cancel()
+        await asyncio.gather(*workers, return_exceptions=True)
+
+    @staticmethod
+    def _fill_missing_attempts(
+        tasks: Sequence[SearchTask],
+        attempts: list[ToolAttempt | None],
+        task_hits: list[list[SearchHit]],
+        *,
+        job_id: str,
+        deadline_expired: bool,
+        execution_cancelled: bool,
+    ) -> None:
+        """Account for workers cancelled before their coroutine body started."""
+        for index, task in enumerate(tasks):
+            if attempts[index] is not None:
+                continue
+            if deadline_expired:
+                current_outcome = AttemptOutcome.TIMEOUT
+                category = ErrorCategory.TIMEOUT
+                message = "Tool request deadline exceeded."
+                current_cancelled = False
+            elif execution_cancelled:
+                current_outcome = AttemptOutcome.CANCELLED
+                category = ErrorCategory.CANCELLED
+                message = "Tool request cancelled."
+                current_cancelled = True
+            else:
+                current_outcome = AttemptOutcome.FAILURE
+                category = ErrorCategory.UNKNOWN
+                message = "Tool worker stopped before execution."
+                current_cancelled = False
+            attempts[index] = ToolAttempt(
+                job_id=job_id,
+                task_id=task.task_id,
+                tool_name=task.tool_name.strip().lower(),
+                success=False,
+                outcome=current_outcome,
+                duration_ms=0,
+                result_count=0,
+                error_category=category,
+                error_message=message,
+                cancelled=current_cancelled,
+                task_index=index,
+            )
+            task_hits[index] = []
+
+    @staticmethod
+    def _execution_result(
+        tasks: Sequence[SearchTask],
+        task_hits: Sequence[list[SearchHit]],
+        attempts: Sequence[ToolAttempt | None],
+    ) -> ToolExecutionResult:
+        accepted_hits: list[SearchHit] = []
+        result_by_task: dict[str, list[SearchHit]] = {}
+        for task, hits in zip(tasks, task_hits, strict=True):
+            result_by_task[task.task_id] = list(hits)
+            accepted_hits.extend(hits)
+        return ToolExecutionResult(
+            hits=accepted_hits,
+            attempts=[attempt for attempt in attempts if attempt is not None],
+            task_hits=result_by_task,
+        )
 
     async def execute(
         self,
@@ -660,21 +1070,27 @@ class ToolRouter:
         job_id: str = "",
         deadline: datetime | float | None = None,
         timeout_seconds: float | None = None,
+        plan: ResearchPlan | None = None,
     ) -> ToolExecutionResult:
         """Execute tasks concurrently while isolating individual failures."""
 
         if timeout_seconds is not None and timeout_seconds <= 0:
             raise ValueError("timeout_seconds must be positive or None.")
+        if plan is not None and (plan.needs_clarification or plan.source_url is not None):
+            return ToolExecutionResult()
         global_seconds = self._deadline_seconds(deadline)
         if timeout_seconds is not None:
             global_seconds = (
                 timeout_seconds if global_seconds is None else min(global_seconds, timeout_seconds)
             )
         global_deadline = time.monotonic() + global_seconds if global_seconds is not None else None
-        task_list = list(tasks)
+        caps = self._execution_caps(plan)
+        task_list = self._bounded_tasks(tasks, caps)
         attempts: list[ToolAttempt | None] = [None] * len(task_list)
         task_hits: list[list[SearchHit]] = [[] for _ in task_list]
         deadline_expired = [False]
+        execution_cancelled = [False]
+        quotas = self._result_quotas(task_list, caps)
         workers = [
             asyncio.create_task(
                 self._execute_one(
@@ -682,6 +1098,7 @@ class ToolRouter:
                     index,
                     job_id,
                     global_deadline,
+                    quotas[index],
                     attempts,
                     task_hits,
                     deadline_expired,
@@ -690,37 +1107,69 @@ class ToolRouter:
             for index, task in enumerate(task_list)
         ]
         gathered: list[object] = []
-        if workers:
+        recorded: set[int] = set()
+        try:
+            if workers:
+                gathered = await self._wait_workers(
+                    workers,
+                    global_deadline=global_deadline,
+                    deadline_expired=deadline_expired,
+                    execution_cancelled=execution_cancelled,
+                )
+            self._fill_missing_attempts(
+                task_list,
+                attempts,
+                task_hits,
+                job_id=job_id,
+                deadline_expired=deadline_expired[0],
+                execution_cancelled=execution_cancelled[0],
+            )
+        except asyncio.CancelledError:
+            execution_cancelled[0] = True
+            await self._cancel_workers(workers)
+            self._fill_missing_attempts(
+                task_list,
+                attempts,
+                task_hits,
+                job_id=job_id,
+                deadline_expired=False,
+                execution_cancelled=True,
+            )
             try:
-                if global_seconds is None or math.isinf(global_seconds):
-                    gathered = list(await asyncio.gather(*workers, return_exceptions=True))
-                else:
-                    _, pending = await asyncio.wait(workers, timeout=max(0.0, global_seconds))
-                    if pending:
-                        deadline_expired[0] = True
-                        for worker in pending:
-                            worker.cancel()
-                    gathered = list(await asyncio.gather(*workers, return_exceptions=True))
+                record_error = await self._record_attempts(
+                    [attempt for attempt in attempts if attempt is not None], recorded
+                )
+            except asyncio.CancelledError as recorder_cancelled:
+                logger.warning("tool attempt recording was cancelled: %s", recorder_cancelled)
+            else:
+                if record_error is not None:
+                    logger.warning(
+                        "tool attempt recording failed during cancellation: %s",
+                        redact_text(str(record_error))[:200],
+                    )
+            raise
+
+        ordered_attempts = [attempt for attempt in attempts if attempt is not None]
+        try:
+            record_error = await self._record_attempts(ordered_attempts, recorded)
+        except asyncio.CancelledError:
+            # Workers have finished; complete any remaining durable writes before
+            # allowing the caller's cancellation to leave this method.
+            try:
+                await self._record_attempts(ordered_attempts, recorded)
             except asyncio.CancelledError:
-                for worker in workers:
-                    worker.cancel()
-                await asyncio.gather(*workers, return_exceptions=True)
-                raise
-        if not deadline_expired[0]:
-            for outcome in gathered:
-                if isinstance(outcome, asyncio.CancelledError):
-                    raise outcome
-        accepted_hits: list[SearchHit] = []
-        result_by_task: dict[str, list[SearchHit]] = {}
-        for task, hits in zip(task_list, task_hits, strict=True):
-            result_by_task[task.task_id] = list(hits)
-            accepted_hits.extend(hits)
-        recorded_attempts = [attempt for attempt in attempts if attempt is not None]
-        return ToolExecutionResult(
-            hits=accepted_hits,
-            attempts=recorded_attempts,
-            task_hits=result_by_task,
-        )
+                pass
+            raise
+        if record_error is not None:
+            raise record_error
+        if execution_cancelled[0] and not deadline_expired[0]:
+            raise asyncio.CancelledError
+        for outcome in gathered:
+            if isinstance(outcome, BaseException) and not isinstance(
+                outcome, asyncio.CancelledError
+            ):
+                raise outcome
+        return self._execution_result(task_list, task_hits, attempts)
 
     async def execute_tasks(
         self,
@@ -729,6 +1178,7 @@ class ToolRouter:
         job_id: str = "",
         deadline: datetime | float | None = None,
         timeout_seconds: float | None = None,
+        plan: ResearchPlan | None = None,
     ) -> ToolExecutionResult:
         """Alias for :meth:`execute` for callers using the task-oriented name."""
 
@@ -737,6 +1187,7 @@ class ToolRouter:
             job_id=job_id,
             deadline=deadline,
             timeout_seconds=timeout_seconds,
+            plan=plan,
         )
 
     async def execute_plan(
@@ -764,4 +1215,5 @@ class ToolRouter:
                 if timeout_seconds is None and deadline is None
                 else timeout_seconds
             ),
+            plan=plan,
         )

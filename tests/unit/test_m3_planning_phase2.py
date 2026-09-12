@@ -106,6 +106,26 @@ async def test_execute_plan_rejects_clarification_before_creating_tasks() -> Non
         await ToolRouter().execute_plan(analyze_query("help"))
 
 
+@pytest.mark.asyncio
+async def test_direct_execution_defensively_skips_clarification_plan() -> None:
+    class MustNotRun:
+        name = "must-not-run"
+
+        async def search(self, task: SearchTask) -> list[object]:
+            raise AssertionError("clarification plan executed a tool")
+
+        async def health_check(self) -> bool:
+            return True
+
+    plan = analyze_query("help")
+    task = SearchTask(task_id="should-not-run", tool_name="must-not-run", query="help")
+
+    result = await ToolRouter([MustNotRun()]).execute([task], plan=plan)
+
+    assert result.hits == []
+    assert result.attempts == []
+
+
 def test_requested_language_does_not_replace_detected_language() -> None:
     request = ResearchRequest(user_id=7, query="What is the climate policy?", language="ar")
 

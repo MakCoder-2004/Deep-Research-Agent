@@ -48,6 +48,36 @@ def _normalize_priority(items: list[str]) -> list[str]:
     return out
 
 
+def _parse_concurrency_limits(value: Any) -> dict[str, int]:
+    """Parse optional per-tool/provider concurrency limits from settings."""
+    if value is None or value == "":
+        return {}
+    if isinstance(value, str):
+        import json
+
+        try:
+            parsed = json.loads(value)
+        except json.JSONDecodeError as exc:
+            raise ValueError("Concurrency limits must be a JSON object.") from exc
+    else:
+        parsed = value
+    if not isinstance(parsed, dict):
+        raise ValueError("Concurrency limits must be a JSON object.")
+    limits: dict[str, int] = {}
+    for raw_name, raw_limit in parsed.items():
+        name = str(raw_name).strip().lower()
+        if not name:
+            raise ValueError("Concurrency limit names must be non-empty strings.")
+        try:
+            limit = int(raw_limit)
+        except (TypeError, ValueError) as exc:
+            raise ValueError(f"Concurrency limit for {name!r} must be an integer.") from exc
+        if limit < 1 or limit > 100:
+            raise ValueError(f"Concurrency limit for {name!r} must be between 1 and 100.")
+        limits[name] = limit
+    return limits
+
+
 def _parse_allowed_user_ids(value: Any) -> set[int]:
     """Parse TELEGRAM_ALLOWED_USER_IDS into a set of numeric Telegram IDs."""
     if value is None or value == "":
@@ -153,6 +183,14 @@ class Settings(BaseSettings):
     query_budget: int = Field(default=6, alias="QUERY_BUDGET", ge=1, le=6)
     variant_budget: int = Field(default=6, alias="VARIANT_BUDGET", ge=1, le=6)
     task_budget: int = Field(default=12, alias="TASK_BUDGET", ge=1, le=50)
+    search_tool_concurrency: int = Field(default=1, alias="SEARCH_TOOL_CONCURRENCY", ge=1, le=100)
+    search_provider_concurrency: int = Field(
+        default=1, alias="SEARCH_PROVIDER_CONCURRENCY", ge=1, le=100
+    )
+    search_tool_limits: dict[str, int] = Field(default_factory=dict, alias="SEARCH_TOOL_LIMITS")
+    search_provider_limits: dict[str, int] = Field(
+        default_factory=dict, alias="SEARCH_PROVIDER_LIMITS"
+    )
     token_budget: int = Field(default=40_000, alias="TOKEN_BUDGET", ge=1_000, le=100_000)
     time_budget_seconds: int = Field(default=300, alias="TIME_BUDGET_SECONDS", ge=30, le=600)
     quick_source_budget: int = Field(default=5, alias="QUICK_SOURCE_BUDGET", ge=3, le=5)
@@ -279,6 +317,11 @@ class Settings(BaseSettings):
         if unknown_caps:
             raise ValueError(f"Unknown MODEL_MAP capabilities: {unknown_caps}.")
         return out
+
+    @field_validator("search_tool_limits", "search_provider_limits", mode="before")
+    @classmethod
+    def _parse_search_limits(cls, value: Any) -> Any:
+        return _parse_concurrency_limits(value)
 
     @model_validator(mode="after")
     def _check_context_budgets(self) -> Settings:
