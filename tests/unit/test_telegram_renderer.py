@@ -77,8 +77,8 @@ def test_escape_does_not_double_escape() -> None:
 
 
 def test_render_citation_marker() -> None:
-    assert render_citation_marker(1) == "[1]"
-    assert render_citation_marker(12) == "[12]"
+    assert render_citation_marker(1) == "\\[1\\]"
+    assert render_citation_marker(12) == "\\[12\\]"
     with pytest.raises(ValueError):
         render_citation_marker(0)
 
@@ -206,8 +206,7 @@ def test_concise_en_contains_markers_tools_partial() -> None:
     )
     assert text.startswith("⚠️ Partial report")
     assert "*Solar\\_batteries\\* v1\\.0*" in text
-    assert "[1]" in text and "[2]" in text
-    assert "\\[1\\]" not in text
+    assert r"\[1\]" in text and r"\[2\]" in text
     assert "Key findings:" in text
     assert "Sources:" in text
     assert "Tools:" in text
@@ -274,7 +273,7 @@ def test_report_local_source_ref_wins_over_database_id() -> None:
             }
         ],
     )
-    assert r"[1] [Report\-local source]" in text
+    assert r"[1] [Report\-local source]" in text or r"\[1\] [Report\-local source]" in text
     assert "[42]" not in text
 
 
@@ -294,11 +293,10 @@ def test_concise_ar_ltr_markers() -> None:
     text = render_concise_report(topic, findings, sources, "ar")
     assert "أبرز النتائج:" in text
     assert "المصادر:" in text
-    assert "[1]" in text
-    assert "\\[1\\]" not in text
+    assert r"\[1\]" in text
     assert "بطاريات\\_الطاقة" in text
     # ASCII markers stay LTR inside RTL text.
-    assert re.search(r"\[1\]", text) is not None
+    assert re.search(r"\\\[1\\\]", text) is not None
 
 
 def test_report_filename_valid_and_traversal() -> None:

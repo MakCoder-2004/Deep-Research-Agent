@@ -215,8 +215,8 @@ async def test_report_handler_uses_report_local_source_refs(tmp_path: Path) -> N
         message = _msg(111, "/report rep-second", "en")
         await report_handler(message, conn=conn, reports_dir=reports_dir)
         kwargs = message.answer_document.call_args[1]
-        assert kwargs["caption"].find("[1]") >= 0
-        assert "[2]" not in kwargs["caption"]
+        assert kwargs["caption"].find("\\[1\\]") >= 0
+        assert "\\[2\\]" not in kwargs["caption"]
 
 
 async def test_report_handler_missing_file_sends_text(tmp_path: Path) -> None:

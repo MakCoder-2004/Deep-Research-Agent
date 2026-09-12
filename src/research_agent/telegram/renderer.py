@@ -124,10 +124,14 @@ def escape_markdown_v2(text: str) -> str:
 
 
 def render_citation_marker(n: int) -> str:
-    """Return an ASCII citation marker ``[n]`` readable in LTR and RTL text."""
+    """Return an escaped citation marker ``\\[n\\]`` for MarkdownV2.
+
+    Telegram MarkdownV2 requires ``[``/``]`` to be escaped; ``\\[1\\]``
+    renders as ``[1]`` so readability is preserved while parsing succeeds.
+    """
     if n < 1:
         raise ValueError("Citation marker index must be >= 1.")
-    return f"[{n}]"
+    return f"\\[{n}\\]"
 
 
 def _adjust_hard_cut(text: str, cut: int) -> int:
@@ -183,6 +187,13 @@ def _markdown_protected_spans(text: str) -> list[tuple[int, int]]:
     index = 0
     while index < len(text):
         if text[index] == "\\":
+            # Escaped citation marker \[n\] — keep whole.
+            citation = re.match(r"\\\[\d+\\\]", text[index:])
+            if citation is not None:
+                end = index + len(citation.group(0))
+                spans.append((index, end))
+                index = end
+                continue
             index += 2
             continue
         if text[index] == "[":
@@ -222,10 +233,13 @@ def _flatten_oversized_span(text: str, start: int, end: int) -> str:
             label = span[1:label_end]
             destination = span[label_end + 2 : -1]
             return escape_markdown_v2(f"{label} ({destination})")
-    if span.startswith("[") and span.endswith("]"):
+    if span.startswith("\\[") and span.endswith("\\]"):
         # A very small split limit may not fit a citation marker. Keep its
-        # number visible without emitting an unmatched Markdown delimiter.
-        return escape_markdown_v2(span[1:-1])
+        # escaped form (renders as [n]) without emitting unmatched delimiters.
+        return span
+    if span.startswith("[") and span.endswith("]"):
+        # Legacy plain marker: escape it so MarkdownV2 stays valid.
+        return escape_markdown_v2(span)
     return escape_markdown_v2(span)
 
 
@@ -602,10 +616,11 @@ def render_concise_report(
     :class:`ValueError` is raised.
 
     All user/model text (topic, statements, titles, tools, disclaimer) is
-    escaped with :func:`escape_markdown_v2`. ASCII ``[n]`` citation markers
-    are inserted after escaping so they stay plain and readable in both LTR
-    English and RTL Arabic. Formatting asterisks for the bold topic are the
-    only unescaped MarkdownV2 controls added by this function.
+    escaped with :func:`escape_markdown_v2`. Escaped ``\\[n\\]`` citation
+    markers (rendering as ``[n]``) are inserted after escaping so they stay
+    readable in both LTR English and RTL Arabic while parsing as valid
+    MarkdownV2. Formatting asterisks for the bold topic are the only other
+    unescaped MarkdownV2 controls added by this function.
 
     ``partial`` adds a partial-coverage banner. Failed tools are rendered only
     for partial reports because only coverage-affecting failures belong in the
@@ -614,7 +629,7 @@ def render_concise_report(
     validated = validate_before_render(topic, findings, sources, tools_used)
     failed = [tool for tool in tools_failed if tool.strip()] if partial and tools_failed else []
     normalized = _normalize_report_lang(lang)
-    esc_topic = escape_markdown_v2(validated.topic)
+    esc_topic = escape_markdown_v2(" ".join(str(validated.topic).split()))
     lines: list[str] = []
     if partial:
         if normalized == "ar":
@@ -628,16 +643,18 @@ def render_concise_report(
     for finding in validated.key_findings:
         stmt = escape_markdown_v2(finding.statement)
         markers = " ".join(render_citation_marker(c) for c in finding.citation_ids)
-        lines.append(f"• {stmt} {markers}")
+        # LRM keeps trailing ASCII markers ordered after RTL statements.
+        sep = " \u200e" if normalized == "ar" else " "
+        lines.append(f"• {stmt}{sep}{markers}")
     lines.append("")
     lines.append("المصادر:" if normalized == "ar" else "Sources:")
     for src in validated.sources:
         marker = src.id
-        title_raw = src.title
+        title_raw = " ".join(str(src.title).split())
         url_raw = str(src.url)
         esc_title = escape_markdown_v2(title_raw) if title_raw else escape_markdown_v2(url_raw)
         safe_url = _escape_url_for_link(url_raw)
-        lines.append(f"[{marker}] [{esc_title}]({safe_url})")
+        lines.append(f"\\[{marker}\\] [{esc_title}]({safe_url})")
     if validated.tools_used:
         esc_tools = ", ".join(escape_markdown_v2(str(tool)) for tool in validated.tools_used)
         lines.append("")
