@@ -15,32 +15,73 @@ TRACKING_PARAM_NAMES = frozenset(
     {
         "fbclid",
         "gclid",
+        "gbraid",
+        "wbraid",
+        "dclid",
+        "yclid",
         "msclkid",
         "mc_cid",
         "mc_eid",
         "_hsenc",
         "_hsmi",
+        "hsctatracking",
         "igshid",
+        "fb_action_ids",
+        "_ga",
+        "_gl",
+        "vero_id",
+        "zanpid",
+        "scid",
+        "srsltid",
     }
 )
 
+_TRACKING_PREFIXES = ("utm_", "pk_", "piwik_", "matomo", "vero_")
+
 
 def canonicalize_url(url: str | HttpUrl) -> str:
-    """Canonicalize a URL for deduplication and uniqueness checks."""
-    parts = urlsplit(str(url))
+    """Canonicalize a URL for deduplication and uniqueness checks.
+
+    Drops userinfo (dedup by host), lowercases scheme/host, strips default
+    ports, IDNA-encodes unicode hosts, normalizes dot-segments, sorts query
+    pairs, strips tracking params and fragments. Raises ValueError for
+    non-http(s) or malformed inputs so M3 dedup never silently merges.
+    """
+    raw = str(url).strip()
+    parts = urlsplit(raw)
     scheme = parts.scheme.lower()
-    host = parts.hostname.lower() if parts.hostname else ""
-    port = parts.port
+    if scheme not in ("http", "https"):
+        raise ValueError(f"Unsupported URL scheme for canonicalization: {scheme!r}.")
+    if not parts.hostname:
+        raise ValueError("URL must have a host for canonicalization.")
+    try:
+        host = parts.hostname.lower().encode("idna").decode("ascii")
+    except (UnicodeError, ValueError):
+        host = parts.hostname.lower()
+    # Preserve IPv6 brackets that hostname strips.
+    if ":" in host and not host.startswith("["):
+        host = f"[{host}]"
+    try:
+        port = parts.port
+    except ValueError as exc:
+        raise ValueError(f"Invalid URL port in {raw!r}.") from exc
     if (scheme == "http" and port == 80) or (scheme == "https" and port == 443):
         port = None
     netloc = host if port is None else f"{host}:{port}"
+    import posixpath
+
     path = parts.path or "/"
+    # Decode percent-escapes for dot-segment resolution, then re-encode minimal.
+    path = posixpath.normpath(path)
+    if not path.startswith("/"):
+        path = "/" + path
     if len(path) > 1 and path.endswith("/"):
         path = path.rstrip("/")
     query_pairs = [
         (key, value)
         for key, value in parse_qsl(parts.query, keep_blank_values=True)
-        if key.lower() not in TRACKING_PARAM_NAMES and not key.lower().startswith("utm_")
+        if key.lower() not in TRACKING_PARAM_NAMES
+        and not any(key.lower().startswith(p) for p in _TRACKING_PREFIXES)
     ]
     query_pairs.sort()
     query = urlencode(query_pairs, doseq=True)
@@ -60,6 +101,12 @@ class Finding(BaseModel):
     def _reject_forbidden_fields(cls, data: Any) -> Any:
         return reject_forbidden_report_fields(data)
 
+    @model_validator(mode="after")
+    def _reject_duplicate_citations(self) -> Finding:
+        if len(set(self.citation_ids)) != len(self.citation_ids):
+            raise ValueError("Citation ids must not contain duplicates.")
+        return self
+
 
 class Source(BaseModel):
     """A cited source listed in the report."""
@@ -78,6 +125,14 @@ class Source(BaseModel):
     @classmethod
     def _reject_forbidden_fields(cls, data: Any) -> Any:
         return reject_forbidden_report_fields(data)
+
+    @model_validator(mode="after")
+    def _require_tz_aware(self) -> Source:
+        if self.accessed_at.tzinfo is None:
+            raise ValueError("accessed_at must be timezone-aware.")
+        if self.published_at is not None and self.published_at.tzinfo is None:
+            raise ValueError("published_at must be timezone-aware when set.")
+        return self
 
 
 class ResearchReport(BaseModel):
