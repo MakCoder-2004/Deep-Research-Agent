@@ -66,7 +66,8 @@ class SessionRepository:
         interactions: list[str],
         max_interactions: int = 6,
     ) -> None:
-        trimmed = interactions[-max_interactions:]
+        limit = max(int(max_interactions), 1)
+        trimmed = interactions[-limit:] if interactions else []
         now = _now_iso()
         await conn.execute(
             """
@@ -84,6 +85,50 @@ class SessionRepository:
         cursor = await conn.execute("SELECT * FROM sessions WHERE user_id = ?", (user_id,))
         return await cursor.fetchone()
 
+    async def get_valid(
+        self,
+        conn: aiosqlite.Connection,
+        user_id: int,
+        *,
+        now: datetime | None = None,
+        ttl_hours: int = 24,
+    ) -> aiosqlite.Row | None:
+        """Return the session only when it has not exceeded TTL (lazy expiry)."""
+        row = await self.get(conn, user_id)
+        if row is None:
+            return None
+        try:
+            updated = _parse_iso(str(row["updated_at"]))
+        except Exception:
+            updated = None
+        if updated is None:
+            return None
+        current = now or datetime.now(UTC)
+        if current - updated > timedelta(hours=ttl_hours):
+            return None
+        return row
+
+    async def append(
+        self,
+        conn: aiosqlite.Connection,
+        user_id: int,
+        language: str,
+        interaction: str,
+        max_interactions: int = 6,
+    ) -> None:
+        """Append one interaction, trimming to the last N (default 6)."""
+        row = await self.get(conn, user_id)
+        existing: list[str] = []
+        if row is not None:
+            try:
+                loaded = json.loads(row["interactions"])
+                if isinstance(loaded, list):
+                    existing = [str(x) for x in loaded]
+            except Exception:
+                existing = []
+        existing.append(interaction)
+        await self.save(conn, user_id, language, existing, max_interactions)
+
     async def delete(self, conn: aiosqlite.Connection, user_id: int) -> None:
         await conn.execute("DELETE FROM sessions WHERE user_id = ?", (user_id,))
 
@@ -96,18 +141,39 @@ class SessionRepository:
         max_interactions: int = 6,
     ) -> None:
         current = now or datetime.now(UTC)
-        cutoff = (current - timedelta(hours=ttl_hours)).isoformat()
-        await conn.execute("DELETE FROM sessions WHERE updated_at < ?", (cutoff,))
-        cursor = await conn.execute("SELECT user_id, interactions FROM sessions")
+        # Parsed comparison (not lexicographic) so Z/offset/naive values behave.
+        cursor = await conn.execute("SELECT user_id, interactions, updated_at FROM sessions")
         rows = await cursor.fetchall()
         for row in rows:
-            interactions: list[str] = json.loads(row["interactions"])
-            if len(interactions) > max_interactions:
-                trimmed = interactions[-max_interactions:]
-                await conn.execute(
-                    "UPDATE sessions SET interactions = ? WHERE user_id = ?",
-                    (json.dumps(trimmed), row["user_id"]),
+            try:
+                updated = _parse_iso(str(row["updated_at"]))
+            except Exception:
+                updated = None
+            if updated is None or current - updated > timedelta(hours=ttl_hours):
+                try:
+                    await conn.execute(
+                        "DELETE FROM sessions WHERE user_id = ?", (row["user_id"],)
+                    )
+                except Exception:
+                    continue
+                continue
+            try:
+                loaded = json.loads(row["interactions"])
+                interactions: list[str] = (
+                    [str(x) for x in loaded] if isinstance(loaded, list) else []
                 )
+            except Exception:
+                continue
+            limit = max(int(max_interactions), 1)
+            if len(interactions) > limit:
+                trimmed = interactions[-limit:]
+                try:
+                    await conn.execute(
+                        "UPDATE sessions SET interactions = ? WHERE user_id = ?",
+                        (json.dumps(trimmed), row["user_id"]),
+                    )
+                except Exception:
+                    continue
 
 
 class JobRepository:
@@ -154,10 +220,20 @@ class JobRepository:
         error: str | None = None,
         trace_id: str | None = None,
     ) -> None:
-        await conn.execute(
-            "UPDATE jobs SET state = ?, error = ?, trace_id = ?, updated_at = ? WHERE job_id = ?",
-            (JobState(state).value, error, trace_id, _now_iso(), job_id),
-        )
+        from research_agent.observability.redaction import redact_text
+
+        safe_error = redact_text(error) if error else None
+        if trace_id is not None:
+            await conn.execute(
+                "UPDATE jobs SET state = ?, error = ?, trace_id = ?, updated_at = ? WHERE job_id = ?",
+                (JobState(state).value, safe_error, trace_id, _now_iso(), job_id),
+            )
+        else:
+            # Preserve existing trace_id (PLAN 25:1042) when caller has none.
+            await conn.execute(
+                "UPDATE jobs SET state = ?, error = ?, updated_at = ? WHERE job_id = ?",
+                (JobState(state).value, safe_error, _now_iso(), job_id),
+            )
 
     async def get(self, conn: aiosqlite.Connection, job_id: str) -> aiosqlite.Row | None:
         cursor = await conn.execute("SELECT * FROM jobs WHERE job_id = ?", (job_id,))
@@ -216,16 +292,37 @@ class ReportRepository:
         *,
         retention_days: int = 90,
         now: datetime | None = None,
+        reports_dir: Path | str | None = None,
     ) -> int:
+        from pathlib import Path as _Path
+
         current = now or datetime.now(UTC)
         cutoff = (current - timedelta(days=retention_days)).isoformat()
-        cursor = await conn.execute("SELECT report_id FROM reports WHERE created_at < ?", (cutoff,))
-        expired = [row["report_id"] for row in await cursor.fetchall()]
-        for report_id in expired:
+        cursor = await conn.execute(
+            "SELECT report_id, markdown_path FROM reports WHERE created_at < ?", (cutoff,)
+        )
+        rows = await cursor.fetchall()
+        for row in rows:
+            report_id = row["report_id"]
+            try:
+                md = str(row["markdown_path"]) if row["markdown_path"] else ""
+            except Exception:
+                md = ""
             await conn.execute("DELETE FROM sources WHERE report_id = ?", (report_id,))
             await conn.execute("DELETE FROM report_fts WHERE report_id = ?", (report_id,))
             await conn.execute("DELETE FROM reports WHERE report_id = ?", (report_id,))
-        return len(expired)
+            if md:
+                try:
+                    p = _Path(md)
+                    base = _Path(reports_dir) if reports_dir else None
+                    # Only delete confined research-*.md files to avoid traversal.
+                    if p.name.startswith("research-") and p.suffix == ".md":
+                        target = (base / p.name) if base else p
+                        if target.is_file():
+                            target.unlink()
+                except Exception:
+                    pass
+        return len(rows)
 
 
 def _normalize_source(source: Source | Mapping[str, Any]) -> dict[str, Any]:
