@@ -6,5 +6,6 @@ from research_agent.llm.base import (
     ProviderError,
     ProviderMetadata,
 )
+from research_agent.errors import ErrorCategory
 
-__all__ = ["LLMProvider", "ProviderCapability", "ProviderError", "ProviderMetadata"]
+__all__ = ["ErrorCategory", "LLMProvider", "ProviderCapability", "ProviderError", "ProviderMetadata"]

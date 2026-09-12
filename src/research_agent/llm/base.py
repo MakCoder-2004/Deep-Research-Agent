@@ -56,8 +56,18 @@ class ProviderMetadata:
     capabilities: frozenset[ProviderCapability] = field(default_factory=frozenset)
     priority: int = 0
 
-    def supports(self, required: frozenset[ProviderCapability] | set[ProviderCapability]) -> bool:
+    def supports(
+        self,
+        required: (
+            ProviderCapability
+            | frozenset[ProviderCapability]
+            | set[ProviderCapability]
+            | list[ProviderCapability]
+        ),
+    ) -> bool:
         """Return True when all required capabilities are advertised."""
+        if isinstance(required, ProviderCapability):
+            return required in self.capabilities
         return frozenset(required) <= self.capabilities
 
 
