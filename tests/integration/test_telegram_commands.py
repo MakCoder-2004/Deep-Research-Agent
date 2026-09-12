@@ -196,8 +196,14 @@ async def test_status_uses_current_progress_stage_and_stored_language(
         job = await enqueue_request(conn, 123, "stage query")
         await set_state(conn, job.job_id, JobState.ACTIVE)
         monkeypatch.setattr(
-            "research_agent.telegram.progress.get_progress",
-            lambda _job_id: (123, 11, "reading"),
+            "research_agent.telegram.progress.get_progress_state",
+            lambda _job_id: {
+                "chat_id": 123,
+                "message_id": 11,
+                "stage": "reading",
+                "lang": "ar",
+                "text": "reading",
+            },
         )
         message = _msg(123, "/status", "en")
         await status_handler(message, conn=conn)
@@ -259,7 +265,13 @@ async def test_url_matrix(tmp_path: Path) -> None:
             else:
                 assert count == 0, f"expected reject for {url}"
                 reply = message.answer.call_args[0][0]
-                assert "invalid" in reply.lower() or "غير صالح" in reply
+                lowered = reply.lower()
+                assert (
+                    "invalid" in lowered
+                    or "غير صالح" in reply
+                    or "too long" in lowered
+                    or "طويل" in reply
+                )
 
 
 async def test_language_set_get_invalid(tmp_path: Path) -> None:

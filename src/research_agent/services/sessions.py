@@ -42,19 +42,24 @@ def normalize_language(value: str | None) -> str | None:
     """Normalize a language argument to 'en' or 'ar'; None when invalid."""
     if value is None:
         return None
-    cleaned = value.strip().lower()
+    cleaned = value.strip().lower().replace("_", "-")
     if not cleaned:
         return None
     if cleaned in _EN_ALIASES:
         return "en"
     if cleaned in _AR_ALIASES:
         return "ar"
+    # Prefix fallback for regional variants (ar-DZ, en-AU, ...).
+    if cleaned.startswith("ar-") or cleaned == "ar":
+        return "ar"
+    if cleaned.startswith("en-") or cleaned == "en":
+        return "en"
     return None
 
 
 async def ensure_user(conn: aiosqlite.Connection, user_id: int, language: str = "en") -> None:
     """Ensure a users row exists (upsert) for Telegram /start."""
-    normalized = language if language in ("en", "ar") else "en"
+    normalized = normalize_language(language) or "en"
     await UserRepository().upsert(conn, user_id, normalized)
     await conn.commit()
 

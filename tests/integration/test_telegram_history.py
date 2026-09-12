@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import json
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock
@@ -133,7 +132,7 @@ async def test_report_found_not_found_forbidden(tmp_path: Path) -> None:
         text = first_call[0][0]
         kwargs = first_call[1]
         assert "Solar topic" in text
-        assert "[1]" in text
+        assert "\\[1\\]" in text
         assert kwargs.get("parse_mode") == "MarkdownV2"
         missing = _msg(111, "/report does-not-exist", "en")
         await report_handler(missing, conn=conn)
@@ -257,6 +256,13 @@ async def test_report_tools_line_present(tmp_path: Path) -> None:
             "Tool summary",
             tools=["tavily_search", "wikipedia_search"],
         )
+        await ToolRunRepository().record(
+            conn, job_id="job-t1", tool_name="tavily_search", success=True
+        )
+        await ToolRunRepository().record(
+            conn, job_id="job-t1", tool_name="wikipedia_search", success=True
+        )
+        await conn.commit()
         message = _msg(111, "/report rep-t1", "en")
         await report_handler(message, conn=conn)
         text = message.answer.call_args_list[0][0][0]
@@ -265,4 +271,3 @@ async def test_report_tools_line_present(tmp_path: Path) -> None:
         assert "wikipedia" in text
         assert "tavily\\_search" in text
         assert "wikipedia\\_search" in text
-        assert json.loads('["tavily_search"]') == ["tavily_search"]

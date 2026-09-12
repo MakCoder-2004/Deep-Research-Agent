@@ -9,15 +9,16 @@ async def list_recent_reports(
     conn: aiosqlite.Connection, user_id: int, limit: int = 5
 ) -> list[aiosqlite.Row]:
     """List the user's most recent reports (owner-scoped JOIN, newest first)."""
+    safe_limit = max(1, min(int(limit), 50))
     cursor = await conn.execute(
         """
         SELECT r.* FROM reports r
         JOIN jobs j ON j.job_id = r.job_id
         WHERE j.user_id = ?
-        ORDER BY r.created_at DESC
+        ORDER BY r.created_at DESC, r.rowid DESC
         LIMIT ?
         """,
-        (user_id, limit),
+        (user_id, safe_limit),
     )
     return list(await cursor.fetchall())
 

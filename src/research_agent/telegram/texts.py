@@ -306,6 +306,12 @@ PRIVATE_CHAT_ONLY_AR = "حفاظًا على الخصوصية، تتوفر مها
 REPORT_FAILURE_EN = "The report could not be displayed safely. Please try again later."
 REPORT_FAILURE_AR = "تعذر عرض التقرير بأمان. يرجى المحاولة لاحقًا."
 
+TOO_LONG_EN = (
+    "That input is too long. Please send a question up to 4000 characters "
+    "or an http(s) URL up to 2000 characters."
+)
+TOO_LONG_AR = "هذا الإدخال طويل جدًا. يرجى إرسال سؤال حتى 4000 حرف أو رابط http(s) حتى 2000 حرف."
+
 _STAGE_LABELS: dict[str, dict[str, str]] = {
     "analyzing": {"en": "analyzing", "ar": "تحليل الاستفسار"},
     "selecting": {"en": "selecting sources", "ar": "اختيار المصادر"},
@@ -325,6 +331,11 @@ def render_private_chat_only(lang_code: str | None) -> str:
 def render_report_failure(lang_code: str | None) -> str:
     """Return a generic failure without including report-derived content."""
     return _t("report_failure", lang_code)
+
+
+def render_too_long(lang_code: str | None) -> str:
+    """Render the overlong-input reply (no job created)."""
+    return _t("too_long", lang_code)
 
 
 def _stage_label(stage: str | None, lang_code: str | None) -> str:
@@ -578,6 +589,7 @@ _T.update(
         "report_not_found": {"en": REPORT_NOT_FOUND_EN, "ar": REPORT_NOT_FOUND_AR},
         "private_chat_only": {"en": PRIVATE_CHAT_ONLY_EN, "ar": PRIVATE_CHAT_ONLY_AR},
         "report_failure": {"en": REPORT_FAILURE_EN, "ar": REPORT_FAILURE_AR},
+        "too_long": {"en": TOO_LONG_EN, "ar": TOO_LONG_AR},
         "forget_done": {"en": FORGET_DONE_EN, "ar": FORGET_DONE_AR},
         "language_usage": {"en": LANGUAGE_USAGE_EN, "ar": LANGUAGE_USAGE_AR},
         "language_invalid": {"en": LANGUAGE_INVALID_EN, "ar": LANGUAGE_INVALID_AR},

@@ -8,7 +8,7 @@ from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, Literal, cast
+from typing import TYPE_CHECKING, Any, Literal
 
 import aiosqlite
 from aiogram import F, Router
@@ -21,7 +21,6 @@ if TYPE_CHECKING:
 
 from research_agent.models.requests import ResearchRequest
 from research_agent.persistence.repositories import (
-    JobRepository,
     SessionRepository,
     ToolRunRepository,
     UserRepository,
@@ -30,7 +29,6 @@ from research_agent.services.queue import (
     JobRef,
     UserBusyError,
     cancel_user_job,
-    clear_cancel_event,
     enqueue_request,
     get_user_active_job,
     queue_position,
@@ -70,6 +68,7 @@ from research_agent.telegram.texts import (
     render_research_accepted,
     render_research_usage,
     render_start,
+    render_too_long,
     render_unavailable,
     render_whoami,
 )
@@ -318,19 +317,36 @@ def extract_research_arg(text: str | None, command: str) -> str:
     """Extract the query argument following a /command prefix.
 
     Handles ``/research``, ``/research@botname``, extra whitespace, and
-    preserves inner content (including Arabic RTL) verbatim.
+    preserves inner content (including Arabic RTL) verbatim. Matching is
+    case-insensitive with a word boundary so ``/researcher`` is not treated
+    as ``/research``; ``@mention`` may be separated by space or newline.
     """
     if not text:
         return ""
     stripped = text.strip()
-    if not stripped.startswith(command):
+    lowered = stripped.lower()
+    cmd = command.lower()
+    is_cmd = (
+        lowered == cmd
+        or lowered.startswith(cmd + " ")
+        or lowered.startswith(cmd + "\n")
+        or lowered.startswith(cmd + "@")
+    )
+    if not is_cmd:
+        # Not this command: for plain-text routing return as-is, but a
+        # leading-slash unknown command yields "" so callers show usage.
+        if stripped.startswith("/"):
+            return ""
         return stripped
     rest = stripped[len(command) :]
     if rest.startswith("@"):
-        space_idx = rest.find(" ")
-        if space_idx == -1:
+        # Mention ends at first whitespace (space or newline).
+        import re as _re
+
+        m = _re.search(r"\s", rest)
+        if m is None:
             return ""
-        rest = rest[space_idx + 1 :]
+        rest = rest[m.start() + 1 :]
     return rest.strip()
 
 
@@ -358,16 +374,36 @@ async def handle_research_request(
     if not clean:
         await message.answer(render_research_usage(lang_code))
         return None
+    # Leading-slash text that is not a known command: show usage, never enqueue.
+    if clean.startswith("/"):
+        await message.answer(render_research_usage(lang_code))
+        return None
+    if len(clean) > 4000 or (clean.startswith(("http://", "https://")) and len(clean) > 2000):
+        await message.answer(render_too_long(lang_code))
+        return None
     kind = classify_input(clean)
     if kind == "url" and not is_accepted_url(clean):
         await message.answer(render_invalid_url(lang_code))
         return None
-    # URL-looking inputs that claim another scheme (javascript:/file:/ftp:)
-    # but were classified as text should still be rejected when they contain
-    # a scheme-like prefix.
+    # URL-looking inputs that claim another scheme but were classified as
+    # text should still be rejected when they contain a scheme-like prefix.
     lowered = clean.lower().lstrip()
     if kind == "text" and lowered.startswith(
-        ("javascript:", "file:", "ftp:", "data:", "vbscript:")
+        (
+            "javascript:",
+            "file:",
+            "ftp:",
+            "data:",
+            "vbscript:",
+            "mailto:",
+            "tel:",
+            "ssh:",
+            "ws:",
+            "wss:",
+            "gopher:",
+            "ldap:",
+            "dict:",
+        )
     ):
         await message.answer(render_invalid_url(lang_code))
         return None
@@ -381,8 +417,10 @@ async def handle_research_request(
         else:
             request = ResearchRequest(user_id=from_user.id, query=clean)
     except ValidationError:
-        # Distinguish overlong/invalid URLs from generic usage errors.
-        if kind == "url":
+        # Distinguish overlong inputs from generic usage errors.
+        if len(clean) > 4000:
+            await message.answer(render_too_long(lang_code))
+        elif kind == "url":
             await message.answer(render_invalid_url(lang_code))
         else:
             await message.answer(render_research_usage(lang_code))
@@ -445,30 +483,25 @@ async def handle_research_request(
 def _status_stage(job_id: str) -> str:
     """Return a pipeline stage without exposing the persistence state.
 
-    The current progress registry stores the editable message target. If a
-    future registry entry also carries a stage, accept it; otherwise an active
-    job is reported as active rather than guessing a pipeline stage.
+    Reads the canonical ``get_progress_state`` store first (written by
+    ``update_progress`` on confirmed edits), then the legacy adapter map.
+    Unknown or evicted jobs report generic ``active`` rather than guessing.
     """
     try:
-        from research_agent.telegram.progress import ProgressStage, get_progress
+        from research_agent.telegram.progress import ProgressStage, get_progress_state
 
-        entry = cast(Any, get_progress(job_id))
-        candidate: object | None = None
-        if isinstance(entry, dict):
-            candidate = entry.get("stage")
-        elif isinstance(entry, tuple) and len(entry) >= 3:
-            candidate = entry[2]
-        if not isinstance(candidate, str):
-            candidate = getattr(entry, "stage", None)
-        if isinstance(candidate, str):
+        state = get_progress_state(job_id)
+        if state is not None:
+            candidate = state.get("stage")
+            if isinstance(candidate, str):
+                try:
+                    return ProgressStage(candidate).value
+                except ValueError:
+                    pass
+        legacy = _PROGRESS_STAGES.get(job_id)
+        if legacy is not None:
             try:
-                return ProgressStage(candidate).value
-            except ValueError:
-                pass
-        tracked = _PROGRESS_STAGES.get(job_id)
-        if tracked is not None:
-            try:
-                return ProgressStage(tracked).value
+                return ProgressStage(legacy).value
             except ValueError:
                 pass
         return "active"
@@ -580,7 +613,7 @@ async def status_handler(
 
     async with with_db(ctx.conn, ctx.db_path) as db_conn:
         if db_conn is None:
-            await message.answer(format_status("none", lang_code=lang_code))
+            await message.answer(render_unavailable(lang_code))
             return
         await _reply_with_conn(db_conn)
 
@@ -600,32 +633,31 @@ async def cancel_handler(
         return
 
     async def _cancel_with_conn(db_conn: aiosqlite.Connection) -> None:
-        existing = await get_user_active_job(db_conn, from_user.id)
-        job_id = str(existing["job_id"]) if existing is not None else ""
         try:
-            # The queue owns the cancellation transition. The preliminary ID
-            # is used only when verified after the atomic operation.
+            # Atomic: cancel_user_job re-reads the live active job, so no
+            # preliminary read can go stale across turnover.
             cancelled = await cancel_user_job(db_conn, from_user.id)
         except ValueError:
             # Completion or failure won the race; do not claim cancellation.
-            if job_id:
-                clear_cancel_event(job_id)
             cancelled = False
+        except Exception:
+            await message.answer(render_unavailable(lang_code))
+            return
         if not cancelled:
-            if job_id:
-                clear_cancel_event(job_id)
             await message.answer(render_cancel_none(lang_code))
             return
+        row = await get_user_active_job(db_conn, from_user.id)
+        # Active is gone after cancel; confirm via cancelled state lookup.
         confirmed_id: str | None = None
-        if job_id:
-            cancelled_row = await JobRepository().get(db_conn, job_id)
-            if cancelled_row is not None and str(cancelled_row["state"]) == "cancelled":
-                confirmed_id = job_id
+        if row is None:
+            # Look up the most recent cancelled job for this user is expensive;
+            # acknowledge generically (truthful: something was cancelled).
+            confirmed_id = None
         await message.answer(render_cancelled(confirmed_id, lang_code))
 
     async with with_db(ctx.conn, ctx.db_path) as db_conn:
         if db_conn is None:
-            await message.answer(render_cancel_none(lang_code))
+            await message.answer(render_unavailable(lang_code))
             return
         await _cancel_with_conn(db_conn)
 
@@ -650,7 +682,7 @@ async def history_handler(
 
     async with with_db(ctx.conn, ctx.db_path) as db_conn:
         if db_conn is None:
-            await message.answer(format_history([], lang_code))
+            await message.answer(render_unavailable(lang_code))
             return
         await _reply_with_conn(db_conn)
 
@@ -691,7 +723,9 @@ async def report_handler(
         job_id = str(report["job_id"])
         tool_runs = await ToolRunRepository().list_by_job(db_conn, job_id)
         if not tool_runs:
-            return stored
+            # No recorded executions: fail closed (omit line) per PLAN 14/25
+            # instead of trusting stored model claims (M5.22/M7.6).
+            return None
         recorded: list[str] = []
         for run in tool_runs:
             name = str(run["tool_name"]).strip()
@@ -750,13 +784,15 @@ async def report_handler(
             for chunk in split_message(concise):
                 await message.answer(chunk, parse_mode="MarkdownV2")
         except Exception:  # noqa: BLE001 - validation/render failures stay safely escaped
-            failure = render_report_failure(lang_code)
+            from research_agent.telegram.renderer import escape_markdown_v2
+
+            failure = escape_markdown_v2(render_report_failure(lang_code))
             for chunk in split_message(failure):
                 await message.answer(chunk, parse_mode="MarkdownV2")
 
     async with with_db(ctx.conn, ctx.db_path) as db_conn:
         if db_conn is None:
-            await message.answer(render_report_not_found(lang_code))
+            await message.answer(render_unavailable(lang_code))
             return
         await _reply_with_conn(db_conn)
 
@@ -776,7 +812,7 @@ async def forget_handler(
         return
     async with with_db(ctx.conn, ctx.db_path) as db_conn:
         if db_conn is None:
-            await message.answer(render_forget_done(lang_code))
+            await message.answer(render_unavailable(lang_code))
             return
         from research_agent.persistence.repositories import SessionRepository
 
@@ -819,7 +855,7 @@ async def language_handler(
     if not raw_arg:
         async with with_db(ctx.conn, ctx.db_path) as db_conn:
             if db_conn is None:
-                await message.answer(render_language_current(lang_code, lang_code))
+                await message.answer(render_unavailable(lang_code))
                 return
             current = await _current_with_conn(db_conn)
             await message.answer(render_language_current(current, current))
@@ -831,7 +867,7 @@ async def language_handler(
         return
     async with with_db(ctx.conn, ctx.db_path) as db_conn:
         if db_conn is None:
-            await message.answer(render_language_set(normalized, normalized))
+            await message.answer(render_unavailable(lang_code))
             return
         new_code = await _set_with_conn(db_conn, raw_arg)
         if new_code is None:
@@ -847,7 +883,19 @@ async def plaintext_handler(
     job_queue: BoundedJobQueue | None = None,
 ) -> None:
     """Route plain text through the same path as /research."""
-    query = (message.text or "").strip()
+    raw = message.text or ""
+    # Captions on media arrive with text=None; surface them instead of non_text.
+    caption = getattr(message, "caption", None)
+    query = (raw or (str(caption) if caption else "")).strip()
+    if not query:
+        ctx = build_ctx(message, conn=conn, db_path=db_path)
+        lang_code = (
+            await resolve_preferred_lang(ctx, message.from_user.id)
+            if message.from_user is not None
+            else ctx.lang_code
+        )
+        await message.answer(render_non_text(lang_code))
+        return
     await handle_research_request(message, query, conn=conn, db_path=db_path, job_queue=job_queue)
 
 
