@@ -38,6 +38,32 @@ class UserBusyError(Exception):
         self.job_id = job_id
 
 
+class QuotaExceededError(Exception):
+    """Raised when a user exceeds the daily request quota (M9.3 partial)."""
+
+    def __init__(self, user_id: int, limit: int = 10) -> None:
+        super().__init__(f"user {user_id} exceeded daily quota of {limit}".strip())
+        self.user_id = user_id
+        self.limit = limit
+
+
+async def _check_daily_quota(
+    conn: aiosqlite.Connection, user_id: int, limit: int = 10
+) -> None:
+    """Enforce N requests/user/day using jobs.created_at (UTC day)."""
+    if limit <= 0:
+        return
+    start = datetime.now(UTC).replace(hour=0, minute=0, second=0, microsecond=0).isoformat()
+    cursor = await conn.execute(
+        "SELECT COUNT(*) AS n FROM jobs WHERE user_id = ? AND created_at >= ?",
+        (user_id, start),
+    )
+    row = await cursor.fetchone()
+    count = int(row["n"]) if row is not None else 0
+    if count >= limit:
+        raise QuotaExceededError(user_id, limit)
+
+
 @dataclass
 class JobRef:
     """Lightweight reference to an enqueued research job."""
@@ -56,6 +82,7 @@ async def _insert_job(
     request_id: str | None = None,
     *,
     job_timeout_seconds: int = _DEFAULT_JOB_TIMEOUT_SECONDS,
+    daily_quota: int | None = None,
 ) -> JobRef:
     """Insert one queued job on an open connection (shared enqueue core).
 
@@ -77,6 +104,8 @@ async def _insert_job(
             await _set_job_deadline(conn, request_id, job_timeout_seconds)
             await conn.commit()
             return ref
+    if daily_quota is not None:
+        await _check_daily_quota(conn, user_id, daily_quota)
     if await has_active_for_user(conn, user_id):
         existing = await get_user_active_job(conn, user_id)
         existing_id = str(existing["job_id"]) if existing is not None else ""
@@ -445,8 +474,10 @@ class BoundedJobQueue:
     ``asyncio.Queue`` plus ``queue_position`` counting older queued rows.
     Live job tasks and cooperative cancel events are tracked in dicts.
 
-    NOTE (M9 scope): daily quotas (10 requests/user/day, 3 deep/day)
-    are intentionally not enforced here; see BudgetManager in M9.
+    Daily quota (10 requests/user/day, M9.3 partial) is enforced on
+    ``enqueue`` via ``Settings.requests_per_user_per_day``; deep-job quota
+    remains M9 scope. Single-process deployment is assumed for the global-3
+    guarantee (multi-instance would need a DB semaphore — M10 note).
     """
 
     def __init__(
@@ -471,6 +502,9 @@ class BoundedJobQueue:
         self._running = False
         self._stopping = False
         self._bot: Any | None = None
+        self._start_lock = asyncio.Lock()
+        self._put_lock = asyncio.Lock()
+        self._daily_quota: int | None = None
 
     @classmethod
     def from_settings(
@@ -478,11 +512,13 @@ class BoundedJobQueue:
     ) -> BoundedJobQueue:
         """Build a queue with Semaphore sized from settings.max_concurrent_jobs."""
         path = db_path if db_path is not None else settings.database_path
-        return cls(
+        queue = cls(
             path,
             max_concurrent_jobs=int(settings.max_concurrent_jobs),
             job_timeout_seconds=int(settings.job_timeout_seconds),
         )
+        queue._daily_quota = int(settings.requests_per_user_per_day)
+        return queue
 
     @property
     def db_path(self) -> Path:
@@ -515,9 +551,9 @@ class BoundedJobQueue:
         Enforces one active job per user; raises :class:`UserBusyError`
         when the user already has a queued/active job. ``request_id``
         optionally fixes the ``job_id`` for idempotent handler wiring. The
-        third positional argument remains the language.
+        third positional argument remains the language. Raises
+        :class:`QuotaExceededError` past the daily quota.
         """
-        # NOTE: daily quotas are M9 scope (stub only); not enforced here.
         async with open_db(self._db_path) as conn:
             ref = await _insert_job(
                 conn,
@@ -526,6 +562,7 @@ class BoundedJobQueue:
                 language,
                 request_id,
                 job_timeout_seconds=self._job_timeout_seconds,
+                daily_quota=self._daily_quota,
             )
         await self.put(ref)
         logger.info(
@@ -538,6 +575,10 @@ class BoundedJobQueue:
 
     async def put(self, job: JobRef) -> None:
         """Schedule a pre-persisted job reference FIFO (handler wiring compat)."""
+        async with self._put_lock:
+            await self._put_locked(job)
+
+    async def _put_locked(self, job: JobRef) -> None:
         async with open_db(self._db_path) as conn:
             row = await JobRepository().get(conn, job.job_id)
             if row is None:
@@ -565,7 +606,15 @@ class BoundedJobQueue:
             raise
 
     def put_nowait(self, job: JobRef) -> None:
-        """Non-blocking variant of :meth:`put` for handler wiring."""
+        """Non-blocking variant of :meth:`put` for handler wiring.
+
+        Validates identifiers in-memory only; the job MUST already be
+        persisted (use :meth:`put` when durability checks are needed).
+        """
+        if not job.job_id or _REQUEST_ID_PATTERN.fullmatch(job.job_id) is None:
+            raise ValueError(f"invalid job_id {job.job_id!r}")
+        if job.user_id <= 0 or not job.query.strip():
+            raise ValueError("job requires a positive user_id and non-empty query")
         if job.job_id in self._scheduled_job_ids or job.job_id in self._tasks:
             return
         self._scheduled_job_ids.add(job.job_id)
@@ -589,10 +638,12 @@ class BoundedJobQueue:
     async def recover_pending_jobs(self, *, exclude_job_ids: Collection[str] | None = None) -> int:
         """Terminally reconcile persisted jobs left by a prior worker.
 
-        Queued jobs are cancelled because their in-memory FIFO position cannot
-        be reconstructed safely. Active jobs are failed with a sanitized
-        recovery reason. ``exclude_job_ids`` lets :meth:`start` preserve jobs
-        already scheduled by this queue instance.
+        Cancel-on-restart policy (MVP): queued jobs are cancelled because
+        their in-memory FIFO position cannot be reconstructed safely.
+        Active jobs are failed with a sanitized recovery reason.
+        ``exclude_job_ids`` lets :meth:`start` preserve jobs already
+        scheduled by this queue instance. Per-row races are skipped so one
+        concurrent completion never strands the rest.
         """
         excluded = set(self._scheduled_job_ids if exclude_job_ids is None else exclude_job_ids)
         recovered = 0
@@ -616,20 +667,24 @@ class BoundedJobQueue:
                 else:
                     target = JobState.FAILED
                     reason = "job failed during queue recovery"
-                if await set_state(conn, job_id, target, error=reason):
-                    recovered += 1
+                try:
+                    if await set_state(conn, job_id, target, error=reason):
+                        recovered += 1
+                except ValueError:
+                    continue
         return recovered
 
     async def start(self) -> None:
         """Start the background FIFO worker loop (idempotent)."""
-        if self._worker_task is not None and not self._worker_task.done():
-            return
-        # Only reconcile rows not already scheduled by this instance. A caller
-        # may enqueue before start, while a fresh process has no such IDs.
-        await self.recover_pending_jobs()
-        self._stopping = False
-        self._running = True
-        self._worker_task = asyncio.create_task(self.worker_loop())
+        async with self._start_lock:
+            if self._worker_task is not None and not self._worker_task.done():
+                return
+            # Only reconcile rows not already scheduled by this instance. A caller
+            # may enqueue before start, while a fresh process has no such IDs.
+            await self.recover_pending_jobs()
+            self._stopping = False
+            self._running = True
+            self._worker_task = asyncio.create_task(self.worker_loop())
 
     async def stop(self) -> None:
         """Stop workers and durably reconcile every remaining live job."""
