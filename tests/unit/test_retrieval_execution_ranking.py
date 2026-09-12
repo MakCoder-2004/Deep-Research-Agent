@@ -166,6 +166,59 @@ async def test_execution_is_concurrent_but_respects_provider_limit() -> None:
 
 
 @pytest.mark.asyncio
+async def test_execution_result_runs_ranked_candidate_pipeline_without_mutation() -> None:
+    first = _hit(
+        "https://example.org/article?utm_source=first",
+        "Climate policy evidence",
+        tool="first",
+        snippet="climate policy evidence from the first adapter",
+    )
+    duplicate = _hit(
+        "https://example.org/article?utm_medium=second",
+        "Climate policy evidence!",
+        tool="second",
+        source_type=SourceType.OFFICIAL,
+        publisher="Official source",
+        snippet="climate policy evidence from the second adapter",
+    )
+    independent = _hit(
+        "https://independent.example/report",
+        "Independent climate report",
+        tool="second",
+        snippet="independent climate policy evidence",
+    )
+    raw_hits = [first, duplicate, independent]
+    before = [hit.model_dump(mode="json") for hit in raw_hits]
+    first_tool = FakeTool("first", [raw_hits[0]])
+    second_tool = FakeTool("second", [raw_hits[1], raw_hits[2]])
+
+    result = await ToolRouter([first_tool, second_tool]).execute(
+        [_task("first"), _task("second")],
+        plan=ResearchPlan(
+            query="climate policy",
+            tools_selected=["first", "second"],
+            source_budget=4,
+            task_budget=2,
+        ),
+    )
+
+    assert len(result.hits) == 3
+    assert len(result.ranked_hits) == 2
+    assert [candidate.source_id for candidate in result.source_candidates] == [1, 2]
+    assert result.ranked_hits[0].source_type is SourceType.OFFICIAL
+    assert str(result.source_candidates[0].canonical_url) == "https://example.org/article"
+    assert [str(candidate.canonical_url) for candidate in result.source_candidates] == [
+        str(hit.url) for hit in result.ranked_hits
+    ]
+    merged = next(
+        hit for hit in result.ranked_hits if str(hit.url) == "https://example.org/article"
+    )
+    assert merged.tool_name == "second"
+    assert set(merged.tool_names) == {"first", "second"}
+    assert [hit.model_dump(mode="json") for hit in raw_hits] == before
+
+
+@pytest.mark.asyncio
 async def test_failed_and_unknown_tools_do_not_cancel_independent_requests() -> None:
     good = FakeTool("good", [_hit("https://good.example/a", "Good")], delay=0.01)
     bad = FakeTool(

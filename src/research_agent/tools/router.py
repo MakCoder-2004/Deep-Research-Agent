@@ -27,9 +27,16 @@ from pydantic import (
 from research_agent.errors import ClarificationRequiredError, ErrorCategory
 from research_agent.models import AttemptOutcome
 from research_agent.models.reports import canonicalize_url
-from research_agent.models.research import ResearchPlan, SearchHit, SearchTask
+from research_agent.models.research import (
+    ResearchPlan,
+    SearchHit,
+    SearchTask,
+    SourceCandidate,
+    source_candidates_from_ranked_hits,
+)
 from research_agent.models.urls import normalize_source_url
 from research_agent.observability.redaction import redact_mapping, redact_text
+from research_agent.ranking import canonicalize_hits, deduplicate_hits, rank_sources
 from research_agent.tools._common import max_results_from_filters, timeout_for_task
 from research_agent.tools.base import ResearchTool, ToolError
 
@@ -158,11 +165,19 @@ class ToolAttempt(BaseModel):
 
 @dataclass
 class ToolExecutionResult:
-    """Normalized output and accounting for a group of tool requests."""
+    """Normalized output, ranked candidates, and accounting for tool requests.
+
+    ``hits`` remains the normalized task-order output for compatibility.  The
+    ranked retrieval boundary is exposed through ``ranked_hits`` and
+    ``source_candidates``; candidates are created only after canonicalization,
+    deduplication, and ranking.
+    """
 
     hits: list[SearchHit] = field(default_factory=list)
     attempts: list[ToolAttempt] = field(default_factory=list)
     task_hits: dict[str, list[SearchHit]] = field(default_factory=dict)
+    ranked_hits: list[SearchHit] = field(default_factory=list)
+    source_candidates: list[SourceCandidate] = field(default_factory=list)
 
     @property
     def successful_tools(self) -> list[str]:
@@ -1051,14 +1066,21 @@ class ToolRouter:
         tasks: Sequence[SearchTask],
         task_hits: Sequence[list[SearchHit]],
         attempts: Sequence[ToolAttempt | None],
+        plan: ResearchPlan | None = None,
     ) -> ToolExecutionResult:
         accepted_hits: list[SearchHit] = []
         result_by_task: dict[str, list[SearchHit]] = {}
         for task, hits in zip(tasks, task_hits, strict=True):
             result_by_task[task.task_id] = list(hits)
             accepted_hits.extend(hits)
+        canonical_hits = canonicalize_hits(accepted_hits)
+        deduplicated_hits = deduplicate_hits(canonical_hits)
+        query: str | ResearchPlan = plan or (tasks[0].query if tasks else "")
+        ranked_hits = rank_sources(deduplicated_hits, query)
         return ToolExecutionResult(
             hits=accepted_hits,
+            ranked_hits=ranked_hits,
+            source_candidates=source_candidates_from_ranked_hits(ranked_hits),
             attempts=[attempt for attempt in attempts if attempt is not None],
             task_hits=result_by_task,
         )

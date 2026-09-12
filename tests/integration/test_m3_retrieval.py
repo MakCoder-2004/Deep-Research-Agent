@@ -2,13 +2,10 @@
 
 from __future__ import annotations
 
-from datetime import UTC, datetime
-
 import pytest
 
 from research_agent.agents.analyzer import analyze_query
 from research_agent.models.research import SearchTask
-from research_agent.ranking import deduplicate_hits, rank_sources
 from research_agent.tools.router import ToolRouter
 
 
@@ -55,25 +52,26 @@ async def test_mocked_analyze_route_execute_normalize_dedup_rank(query: str) -> 
     router = ToolRouter(tools, request_timeout_seconds=1.0)
 
     execution = await router.execute_plan(plan, job_id=f"m3-{plan.language.value}")
-    deduplicated = deduplicate_hits(execution.hits)
-    ranked = rank_sources(
-        deduplicated,
-        plan,
-        now=datetime(2026, 3, 1, tzinfo=UTC),
-    )
+    ranked = execution.ranked_hits
 
     assert ranked
     assert len(ranked) == len({str(hit.url) for hit in ranked})
     assert all(hit.url.scheme in {"http", "https"} for hit in ranked)
     assert all("utm_" not in str(hit.url) for hit in ranked)
+    assert [candidate.source_id for candidate in execution.source_candidates] == list(
+        range(1, len(ranked) + 1)
+    )
+    assert [str(candidate.canonical_url) for candidate in execution.source_candidates] == [
+        str(hit.url) for hit in ranked
+    ]
+    assert all(candidate.tool_names for candidate in execution.source_candidates)
     assert set(tools) == set(plan.tools_selected)
     assert all(tool.calls for tool in tools.values())
     assert {task.tool_name for tool in tools.values() for task in tool.calls} == set(tools)
     assert all(task.language is plan.language for tool in tools.values() for task in tool.calls)
 
-    repeated = rank_sources(
-        deduplicate_hits(execution.hits),
-        plan,
-        now=datetime(2026, 3, 1, tzinfo=UTC),
+    repeated = await router.execute_plan(plan, job_id=f"m3-repeat-{plan.language.value}")
+    assert [str(hit.url) for hit in repeated.ranked_hits] == [str(hit.url) for hit in ranked]
+    assert [candidate.source_id for candidate in repeated.source_candidates] == list(
+        range(1, len(ranked) + 1)
     )
-    assert [str(hit.url) for hit in repeated] == [str(hit.url) for hit in ranked]
