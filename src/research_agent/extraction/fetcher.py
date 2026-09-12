@@ -25,10 +25,21 @@ from research_agent.extraction.security import (
     normalize_url,
     validate_resolved_addresses,
 )
-from research_agent.extraction.transport import PinnedNetworkBackend, pinned_route
+from research_agent.extraction.transport import PinnedAsyncHTTPTransport, pinned_route
 from research_agent.tools._common import http_status_category
 
 REDIRECT_STATUSES = frozenset({301, 302, 303, 307, 308})
+_CREDENTIAL_HEADERS = frozenset(
+    {
+        "authorization",
+        "proxy-authorization",
+        "cookie",
+        "api-key",
+        "x-api-key",
+        "x-auth-token",
+        "x-jina-api-key",
+    }
+)
 
 
 class SafeFetcher:
@@ -39,14 +50,25 @@ class SafeFetcher:
         config: ExtractionConfig | None = None,
         *,
         client: httpx.AsyncClient | None = None,
+        test_transport: httpx.MockTransport | None = None,
         resolver: DNSResolver | DNSResolverCallable | None = None,
         address_validator: AddressValidator | None = None,
     ) -> None:
+        if client is not None:
+            raise ValueError(
+                "AsyncClient injection is not supported; use test_transport for "
+                "MockTransport tests."
+            )
+        if test_transport is not None and not isinstance(test_transport, httpx.MockTransport):
+            raise ValueError("Only httpx.MockTransport may be injected through test_transport.")
+        if test_transport is None and (resolver is not None or address_validator is not None):
+            raise ValueError(
+                "Resolver and address-validator injection is test-only; provide test_transport."
+            )
         self.config = config or ExtractionConfig()
         self._resolver = resolver or SystemDNSResolver()
         self._address_validator = address_validator or validate_resolved_addresses
-        self._client = client or self._build_client()
-        self._owned_client = client is None
+        self._client = self._build_client(test_transport)
         self._robots = RobotsPolicy(self.config, self._fetch_robots)
         self._closed = False
 
@@ -59,21 +81,17 @@ class SafeFetcher:
     def _mime(value: str | None) -> str:
         return (value or "").split(";", 1)[0].strip().lower()
 
-    def _build_client(self) -> httpx.AsyncClient:
+    def _build_client(self, test_transport: httpx.MockTransport | None) -> httpx.AsyncClient:
         timeout = httpx.Timeout(
             connect=self.config.connect_timeout_seconds,
             read=self.config.read_timeout_seconds,
             write=self.config.write_timeout_seconds,
             pool=self.config.pool_timeout_seconds,
         )
-        transport = httpx.AsyncHTTPTransport(
-            network_backend=PinnedNetworkBackend(),
-            retries=0,
-            http2=False,
-        )  # type: ignore[call-arg]  # httpx exposes this runtime hook without a stub.
+        transport = test_transport or PinnedAsyncHTTPTransport()
         return httpx.AsyncClient(
             timeout=timeout,
-            headers={"User-Agent": self.config.user_agent},
+            headers={"User-Agent": self.config.user_agent, "Accept-Encoding": "identity"},
             follow_redirects=False,
             trust_env=False,
             transport=transport,
@@ -86,7 +104,7 @@ class SafeFetcher:
         await self.close()
 
     async def close(self) -> None:
-        if not self._closed and self._owned_client:
+        if not self._closed:
             await self._client.aclose()
         self._closed = True
 
@@ -95,12 +113,20 @@ class SafeFetcher:
             ipaddress.ip_address(target.hostname)
         except ValueError:
             try:
+                operation: object
                 if callable(self._resolver):
-                    answers = await self._resolver(target.hostname, target.port)
+                    operation = self._resolver(target.hostname, target.port)
                 else:
-                    answers = await self._resolver.resolve(target.hostname, target.port)
+                    operation = self._resolver.resolve(target.hostname, target.port)
+                answers = await asyncio.wait_for(operation, timeout=self.config.dns_timeout_seconds)
             except asyncio.CancelledError:
                 raise
+            except TimeoutError as exc:
+                raise ExtractionError(
+                    "Hostname resolution timed out.",
+                    category=ErrorCategory.TIMEOUT,
+                    url=target.url,
+                ) from exc
             except Exception as exc:
                 raise ExtractionError(
                     "Hostname resolution failed.", category=ErrorCategory.DNS, url=target.url
@@ -155,7 +181,11 @@ class SafeFetcher:
         request_headers = {"User-Agent": self.config.user_agent}
         if headers:
             request_headers.update(headers)
+        # Never let HTTPX negotiate a compressed response: the extraction limit
+        # is enforced on the bytes that arrive, before any decoder runs.
+        request_headers["Accept-Encoding"] = "identity"
         allowed = frozenset(self._mime(value) for value in allowed_mime_types)
+        self._client.cookies.clear()
         while True:
             addresses = await self._resolve(current)
             if (
@@ -192,7 +222,7 @@ class SafeFetcher:
                                     http_status=status,
                                 )
                             try:
-                                current = normalize_url(urljoin(current.url, location))
+                                next_url = normalize_url(urljoin(current.url, location))
                             except ExtractionError as exc:
                                 if exc.category is ErrorCategory.INVALID_REQUEST:
                                     raise ExtractionError(
@@ -202,6 +232,9 @@ class SafeFetcher:
                                         http_status=status,
                                     ) from exc
                                 raise
+                            if next_url.origin != current.origin:
+                                request_headers = _strip_credentials(request_headers)
+                            current = next_url
                             redirects += 1
                             continue
                         if status not in accepted_statuses and not 200 <= status < 300:
@@ -232,6 +265,7 @@ class SafeFetcher:
                                 url=current.url,
                                 http_status=status,
                             )
+                        _reject_encoded_response(response, current.url)
                         _check_content_length(
                             response.headers.get("content-length"), max_response_bytes
                         )
@@ -267,6 +301,11 @@ class SafeFetcher:
                     category=ErrorCategory.HTTP,
                     url=current.url,
                 ) from exc
+            finally:
+                # AsyncClient extracts Set-Cookie into its jar before returning
+                # a response.  This fetcher never persists cookies between
+                # requests, including redirects or separate source fetches.
+                self._client.cookies.clear()
 
 
 def _address_values(answers: Sequence[object]) -> list[object]:
@@ -301,11 +340,38 @@ def _check_content_length(value: str | None, maximum: int) -> None:
         )
 
 
+def _strip_credentials(headers: Mapping[str, str]) -> dict[str, str]:
+    """Keep ordinary request headers while removing origin-bound credentials."""
+    return {
+        name: value for name, value in headers.items() if name.casefold() not in _CREDENTIAL_HEADERS
+    }
+
+
+def _reject_encoded_response(response: httpx.Response, url: str) -> None:
+    """Reject compressed bodies before HTTPX can inflate them in memory."""
+    encodings = response.headers.get("content-encoding", "").strip().casefold()
+    if encodings and encodings != "identity":
+        raise ExtractionError(
+            "Compressed source responses are not allowed by the size boundary.",
+            category=ErrorCategory.SIZE,
+            url=url,
+        )
+
+
 async def _read_bounded(response: httpx.Response, maximum: int, url: str) -> bytes:
     chunks: list[bytes] = []
     total = 0
     try:
-        async for chunk in response.aiter_bytes():
+        if response.is_stream_consumed:
+            content = response.content
+            if len(content) > maximum:
+                raise ExtractionError(
+                    "The source response exceeds the size limit.",
+                    category=ErrorCategory.SIZE,
+                    url=url,
+                )
+            return content
+        async for chunk in response.aiter_raw():
             total += len(chunk)
             if total > maximum:
                 raise ExtractionError(

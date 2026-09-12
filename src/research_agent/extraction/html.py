@@ -39,28 +39,45 @@ _REMOVE_TAGS = frozenset(
         "embed",
         "form",
         "nav",
+        "menu",
         "aside",
         "footer",
     }
 )
-_BOILERPLATE_MARKERS = (
-    "ad",
-    "ads",
-    "advert",
-    "advertisement",
-    "breadcrumb",
-    "cookie",
-    "consent",
-    "footer",
-    "nav",
-    "newsletter",
-    "promo",
-    "recommend",
-    "related",
-    "share",
-    "sidebar",
-    "social",
-    "subscribe",
+_BOILERPLATE_MARKERS = frozenset(
+    {
+        "ad",
+        "ads",
+        "advert",
+        "advertisement",
+        "banner",
+        "breadcrumb",
+        "cookie",
+        "consent",
+        "footer",
+        "header",
+        "login",
+        "menu",
+        "modal",
+        "nav",
+        "newsletter",
+        "pagination",
+        "paywall",
+        "popup",
+        "promo",
+        "recommend",
+        "related",
+        "share",
+        "sidebar",
+        "social",
+        "subscribe",
+        "toolbar",
+    }
+)
+_TEXT_BOILERPLATE_RE = re.compile(
+    r"\b(?:advert(?:isement)?|cookie(?:s| notice)?|newsletter|privacy settings|"
+    r"related articles|sign[ -]?up|subscribe)\b",
+    re.IGNORECASE,
 )
 
 
@@ -78,6 +95,7 @@ class HTMLExtractor:
         source_title: str = "",
         source_publisher: str | None = None,
         source_published_at: datetime | None = None,
+        source_url: str | None = None,
     ) -> SourceDocument:
         try:
             soup = BeautifulSoup(page.content, "lxml")
@@ -149,8 +167,8 @@ class HTMLExtractor:
         )
         return SourceDocument(
             source_id=source_id,
-            url=_as_http_url(page.final_url),
-            requested_url=_as_http_url(page.requested_url),
+            url=_as_http_url(source_url or page.final_url),
+            requested_url=_as_http_url(source_url or page.requested_url),
             title=_bounded_text(_clean_text(title or ""), 500),
             author=_optional_bounded(author, 300),
             publisher=_optional_bounded(publisher, 300),
@@ -161,6 +179,8 @@ class HTMLExtractor:
             quotations=quotations,
             fetch_ms=page.fetch_ms,
             extraction_tool="beautifulsoup",
+            fetch_requested_url=_as_http_url(page.requested_url),
+            fetch_final_url=_as_http_url(page.final_url),
             status_code=page.status_code,
             content_type=page.content_type,
             bytes_read=page.bytes_read,
@@ -173,19 +193,54 @@ def _remove_untrusted_or_boilerplate(soup: BeautifulSoup) -> None:
     for element in list(soup.find_all(True)):
         if not isinstance(element, Tag):
             continue
+        if element.attrs is None:
+            continue
         tag_name = element.name.lower() if element.name else ""
         classes = str(element.get("class") or "")
-        identity = f"{classes} {element.get('id', '')}".casefold()
+        identity_values = [
+            classes,
+            str(element.get("id", "")),
+            str(element.get("aria-label", "")),
+            str(element.get("data-testid", "")),
+            str(element.get("data-component", "")),
+            str(element.get("data-purpose", "")),
+        ]
+        identity = " ".join(identity_values).casefold()
         marker_tokens = set(re.findall(r"[a-z0-9]+", identity))
         role = str(element.get("role", "")).casefold()
         aria_hidden = str(element.get("aria-hidden", "")).casefold()
+        is_content_header = tag_name == "header" and _inside_content_container(element)
+        matched_markers = marker_tokens & _BOILERPLATE_MARKERS
+        is_marked_article_header = _inside_content_container(element) and matched_markers == {
+            "header"
+        }
+        is_text_boilerplate = (
+            tag_name in {"div", "section"}
+            and not element.find("article")
+            and len(_clean_text(element.get_text(" ", strip=True))) <= 800
+            and _TEXT_BOILERPLATE_RE.search(element.get_text(" ", strip=True)) is not None
+            and (not element.find_all("p") or element.find(["form", "button", "input"]) is not None)
+        )
         if (
-            tag_name in _REMOVE_TAGS
+            (tag_name in _REMOVE_TAGS and not is_content_header)
+            or (tag_name == "header" and not is_content_header)
             or role in {"navigation", "banner", "complementary", "contentinfo"}
             or aria_hidden == "true"
-            or any(marker in marker_tokens for marker in _BOILERPLATE_MARKERS)
+            or (bool(matched_markers) and not is_marked_article_header)
+            or is_text_boilerplate
         ):
             element.decompose()
+
+
+def _inside_content_container(element: Tag) -> bool:
+    for parent in element.parents:
+        if not isinstance(parent, Tag):
+            continue
+        if parent.name in {"article", "main"}:
+            return True
+        if str(parent.get("role", "")).casefold() == "main":
+            return True
+    return False
 
 
 def _content_root(soup: BeautifulSoup) -> Tag | BeautifulSoup:

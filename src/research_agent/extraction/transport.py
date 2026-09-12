@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import ssl
+import typing
 from collections.abc import Iterable, Iterator
 from contextlib import contextmanager
 from contextvars import ContextVar, Token
@@ -9,9 +11,10 @@ from dataclasses import dataclass
 from typing import Any
 
 import httpcore
+import httpx
 from httpcore._backends.auto import AutoBackend
 
-__all__ = ["PinnedNetworkBackend", "pinned_route"]
+__all__ = ["PinnedAsyncHTTPTransport", "PinnedNetworkBackend", "pinned_route"]
 
 
 @dataclass(frozen=True, slots=True)
@@ -84,3 +87,103 @@ class PinnedNetworkBackend(httpcore.AsyncNetworkBackend):
 
     async def sleep(self, seconds: float) -> None:
         await self._backend.sleep(seconds)
+
+
+class _AsyncResponseStream(httpx.AsyncByteStream):
+    """Adapt an httpcore response stream to the httpx transport contract."""
+
+    def __init__(self, stream: typing.AsyncIterable[bytes]) -> None:
+        self._stream = stream
+
+    async def __aiter__(self) -> typing.AsyncIterator[bytes]:
+        try:
+            async for chunk in self._stream:
+                yield chunk
+        except _HTTPCORE_ERRORS as exc:
+            raise _map_httpcore_exception(exc) from exc
+
+    async def aclose(self) -> None:
+        close = getattr(self._stream, "aclose", None)
+        if callable(close):
+            await close()
+
+
+class PinnedAsyncHTTPTransport(httpx.AsyncBaseTransport):
+    """HTTPX transport backed by a DNS-pinned httpcore connection pool.
+
+    HTTPX 0.28 does not expose ``network_backend`` on ``AsyncHTTPTransport``.
+    Constructing the pool directly is the supported httpcore API and avoids
+    falling back to proxy or environment-based DNS behavior.
+    """
+
+    def __init__(self) -> None:
+        self._pool = httpcore.AsyncConnectionPool(
+            ssl_context=ssl.create_default_context(),
+            max_connections=20,
+            max_keepalive_connections=10,
+            keepalive_expiry=5.0,
+            http1=True,
+            http2=False,
+            retries=0,
+            network_backend=PinnedNetworkBackend(),
+        )
+
+    async def handle_async_request(self, request: httpx.Request) -> httpx.Response:
+        httpcore_request = httpcore.Request(
+            method=request.method,
+            url=httpcore.URL(
+                scheme=request.url.raw_scheme,
+                host=request.url.raw_host,
+                port=request.url.port,
+                target=request.url.raw_path,
+            ),
+            headers=request.headers.raw,
+            content=typing.cast(typing.AsyncIterable[bytes], request.stream),
+            extensions=request.extensions,
+        )
+        try:
+            response = await self._pool.handle_async_request(httpcore_request)
+        except _HTTPCORE_ERRORS as exc:
+            raise _map_httpcore_exception(exc) from exc
+        return httpx.Response(
+            status_code=response.status,
+            headers=response.headers,
+            stream=_AsyncResponseStream(typing.cast(typing.AsyncIterable[bytes], response.stream)),
+            extensions=response.extensions,
+        )
+
+    async def aclose(self) -> None:
+        await self._pool.aclose()
+
+
+_HTTPCORE_ERRORS = (
+    httpcore.TimeoutException,
+    httpcore.NetworkError,
+    httpcore.ProxyError,
+    httpcore.UnsupportedProtocol,
+    httpcore.ProtocolError,
+)
+
+
+def _map_httpcore_exception(exc: Exception) -> httpx.HTTPError:
+    """Keep transport failures on httpx's public exception taxonomy."""
+    mappings: tuple[tuple[type[Exception], type[httpx.HTTPError]], ...] = (
+        (httpcore.ConnectTimeout, httpx.ConnectTimeout),
+        (httpcore.ReadTimeout, httpx.ReadTimeout),
+        (httpcore.WriteTimeout, httpx.WriteTimeout),
+        (httpcore.PoolTimeout, httpx.PoolTimeout),
+        (httpcore.TimeoutException, httpx.TimeoutException),
+        (httpcore.ConnectError, httpx.ConnectError),
+        (httpcore.ReadError, httpx.ReadError),
+        (httpcore.WriteError, httpx.WriteError),
+        (httpcore.ProxyError, httpx.ProxyError),
+        (httpcore.UnsupportedProtocol, httpx.UnsupportedProtocol),
+        (httpcore.LocalProtocolError, httpx.LocalProtocolError),
+        (httpcore.RemoteProtocolError, httpx.RemoteProtocolError),
+        (httpcore.ProtocolError, httpx.ProtocolError),
+        (httpcore.NetworkError, httpx.NetworkError),
+    )
+    for source, target in mappings:
+        if isinstance(exc, source):
+            return target(str(exc))
+    return httpx.HTTPError(str(exc))

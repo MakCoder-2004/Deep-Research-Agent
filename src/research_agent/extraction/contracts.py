@@ -23,6 +23,7 @@ class ExtractionConfig(BaseModel):
     read_timeout_seconds: float = Field(default=20.0, gt=0)
     write_timeout_seconds: float = Field(default=5.0, gt=0)
     pool_timeout_seconds: float = Field(default=5.0, gt=0)
+    dns_timeout_seconds: float = Field(default=5.0, gt=0)
     max_redirects: int = Field(default=3, ge=0, le=20)
     max_response_bytes: int = Field(default=2_000_000, ge=1)
     max_source_chars: int = Field(default=20_000, ge=1)
@@ -37,6 +38,7 @@ class ExtractionConfig(BaseModel):
     )
     allowed_mime_types: frozenset[str] = frozenset({"text/html", "application/xhtml+xml"})
     robots_max_response_bytes: int = Field(default=512_000, ge=1)
+    robots_cache_ttl_seconds: float | None = Field(default=3_600.0, gt=0)
     jina_reader_enabled: bool = False
     jina_reader_base_url: str = "https://r.jina.ai/"
     jina_reader_api_key: SecretStr = SecretStr("")
@@ -46,7 +48,10 @@ class ExtractionConfig(BaseModel):
     def _validate_user_agent(cls, value: str) -> str:
         if any(ord(char) < 32 or ord(char) == 127 for char in value):
             raise ValueError("user_agent must not contain control characters.")
-        return value.strip()
+        normalized = value.strip()
+        if not normalized:
+            raise ValueError("user_agent must not be blank.")
+        return normalized
 
     @field_validator("allowed_mime_types", mode="before")
     @classmethod
@@ -82,10 +87,12 @@ class ExtractionConfig(BaseModel):
             read_timeout_seconds=getattr(settings, "extraction_read_timeout_seconds", 20.0),
             write_timeout_seconds=getattr(settings, "extraction_write_timeout_seconds", 5.0),
             pool_timeout_seconds=getattr(settings, "extraction_pool_timeout_seconds", 5.0),
+            dns_timeout_seconds=getattr(settings, "extraction_dns_timeout_seconds", 5.0),
             max_redirects=getattr(settings, "max_redirects", 3),
             max_response_bytes=getattr(settings, "max_response_bytes", 2_000_000),
             max_source_chars=getattr(settings, "chars_per_source", 20_000),
             respect_robots_txt=getattr(settings, "respect_robots_txt", True),
+            robots_cache_ttl_seconds=getattr(settings, "robots_cache_ttl_seconds", 3_600.0),
             jina_reader_enabled=getattr(settings, "jina_reader_enabled", False),
             jina_reader_base_url=getattr(settings, "jina_reader_base_url", "https://r.jina.ai/"),
             jina_reader_api_key=SecretStr(
@@ -132,4 +139,4 @@ class DNSResolver(Protocol):
 class ReaderFallback(Protocol):
     """Narrow contract for an optional, already safety-wrapped reader."""
 
-    async def read(self, url: str) -> str: ...
+    async def read(self, url: str) -> FetchedPage: ...

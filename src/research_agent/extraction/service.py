@@ -33,6 +33,7 @@ class SafeExtractor:
         *,
         settings: object | None = None,
         client: httpx.AsyncClient | None = None,
+        test_transport: httpx.MockTransport | None = None,
         resolver: DNSResolver | DNSResolverCallable | None = None,
         address_validator: AddressValidator | None = None,
         reader_fallback: ReaderFallback | None = None,
@@ -47,6 +48,7 @@ class SafeExtractor:
         self.fetcher = SafeFetcher(
             self.config,
             client=client,
+            test_transport=test_transport,
             resolver=resolver,
             address_validator=address_validator,
         )
@@ -121,7 +123,7 @@ class SafeExtractor:
     ) -> SourceDocument:
         assert self.reader_fallback is not None
         try:
-            text = await self.reader_fallback.read(source_url)
+            page = await self.reader_fallback.read(source_url)
         except asyncio.CancelledError:
             raise
         except ExtractionError:
@@ -132,28 +134,19 @@ class SafeExtractor:
                 category=ErrorCategory.UNAVAILABLE,
                 url=source_url,
             ) from exc
-        if not isinstance(text, str) or not text.strip():
+        if not isinstance(page, FetchedPage) or not page.content.strip():
             raise ExtractionError(
-                "The reader fallback returned no text.",
+                "The reader fallback returned no response content.",
                 category=ErrorCategory.EXTRACTION,
                 url=source_url,
             )
-        encoded = text.encode("utf-8", errors="replace")
-        page = FetchedPage(
-            requested_url=source_url,
-            final_url=source_url,
-            status_code=200,
-            content_type="text/plain",
-            content=encoded,
-            bytes_read=len(encoded),
-            fetch_ms=0,
-        )
         document = self.html_extractor.extract(
             page,
             source_id=source_id,
             source_title=source_title,
             source_publisher=publisher,
             source_published_at=published_at,
+            source_url=source_url,
         )
         return document.model_copy(update={"extraction_tool": "jina_reader", "fallback_used": True})
 
@@ -165,7 +158,7 @@ def _source_values(
     if isinstance(source, SourceCandidate):
         return (
             str(source.canonical_url),
-            source_id or source.source_id,
+            source_id if source_id is not None else source.source_id,
             source.title,
             source.publisher,
             source.published_at,
@@ -173,7 +166,11 @@ def _source_values(
     url_value = getattr(source, "url", source)
     if not isinstance(url_value, (str, httpx.URL)):
         url_value = str(url_value)
-    candidate_id: object = source_id or getattr(source, "source_id", getattr(source, "id", 1))
+    candidate_id: object = (
+        source_id
+        if source_id is not None
+        else getattr(source, "source_id", getattr(source, "id", 1))
+    )
     try:
         numeric_id = int(str(candidate_id))
     except (TypeError, ValueError) as exc:
@@ -187,10 +184,14 @@ def _source_values(
     return (
         str(url_value),
         numeric_id,
-        str(getattr(source, "title", "")),
+        _title_value(getattr(source, "title", "")),
         _optional_str(getattr(source, "publisher", None)),
         getattr(source, "published_at", None),
     )
+
+
+def _title_value(value: object) -> str:
+    return value if isinstance(value, str) else ""
 
 
 def _optional_str(value: Any) -> str | None:

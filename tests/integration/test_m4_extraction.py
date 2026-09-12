@@ -20,16 +20,16 @@ async def test_allowed_source_becomes_clean_bounded_document() -> None:
     async def handler(request: httpx.Request) -> httpx.Response:
         return httpx.Response(200, headers={"content-type": "text/html"}, content=html)
 
-    client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+    transport = httpx.MockTransport(handler)
     extractor = SafeExtractor(
         ExtractionConfig(max_source_chars=80, respect_robots_txt=False),
-        client=client,
+        test_transport=transport,
         resolver=Resolver(),
     )
     try:
         document = await extractor.extract("https://example.com/report", source_id=1)
     finally:
-        await client.aclose()
+        await extractor.close()
     assert document.source_id == 1
     assert document.body_text == "Report\nEvidence from the source."
     assert len(document.body_text) <= 80

@@ -287,6 +287,8 @@ class SourceDocument(BaseModel):
     fetch_ms: int = Field(default=0, ge=0)
     extraction_tool: str = "beautifulsoup"
     requested_url: HttpUrl | None = None
+    fetch_requested_url: HttpUrl | None = None
+    fetch_final_url: HttpUrl | None = None
     status_code: int | None = Field(default=None, ge=100, le=599)
     content_type: str | None = None
     bytes_read: int = Field(default=0, ge=0)

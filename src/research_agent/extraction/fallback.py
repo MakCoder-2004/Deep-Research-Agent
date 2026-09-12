@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from research_agent.errors import ErrorCategory, ExtractionError
-from research_agent.extraction.contracts import ExtractionConfig
+from research_agent.extraction.contracts import ExtractionConfig, FetchedPage
 from research_agent.extraction.fetcher import SafeFetcher
 from research_agent.extraction.security import normalize_url, validate_url
 
@@ -15,7 +15,7 @@ class JinaReaderFallback:
         self._fetcher = fetcher
         self._config = config
 
-    async def read(self, url: str) -> str:
+    async def read(self, url: str) -> FetchedPage:
         source = normalize_url(url)
         base = self._config.jina_reader_base_url.strip()
         try:
@@ -36,11 +36,10 @@ class JinaReaderFallback:
             allowed_mime_types=frozenset({"text/plain", "text/markdown", "text/html"}),
             headers=headers,
         )
-        text = page.content.decode("utf-8", errors="replace")
-        if not text.strip():
+        if not page.content.decode("utf-8", errors="replace").strip():
             raise ExtractionError(
                 "The reader returned no extractable text.",
                 category=ErrorCategory.EXTRACTION,
                 url=source.url,
             )
-        return text
+        return page

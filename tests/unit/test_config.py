@@ -88,9 +88,19 @@ def test_safe_extraction_defaults_and_limits() -> None:
     assert settings.max_redirects == 3
     assert settings.max_response_bytes == 2_000_000
     assert settings.extraction_connect_timeout_seconds == 5.0
+    assert settings.extraction_dns_timeout_seconds == 5.0
+    assert settings.robots_cache_ttl_seconds == 3600.0
     assert settings.extraction_read_timeout_seconds == 20.0
     assert settings.respect_robots_txt is True
     assert settings.jina_reader_enabled is False
+
+
+def test_extraction_user_agent_is_trimmed_but_not_allowed_to_be_blank() -> None:
+    from research_agent.extraction import ExtractionConfig
+
+    assert ExtractionConfig(user_agent="  ResearchBot/1.0  ").user_agent == "ResearchBot/1.0"
+    with pytest.raises(ValidationError):
+        ExtractionConfig(user_agent="   ")
 
 
 def test_search_concurrency_limits_parse_and_validate() -> None:

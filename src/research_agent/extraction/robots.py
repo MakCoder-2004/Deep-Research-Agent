@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
+import time
 from collections.abc import Awaitable, Callable
+from dataclasses import dataclass
 from urllib.robotparser import RobotFileParser
 
 from research_agent.errors import ErrorCategory, ExtractionError
@@ -12,19 +14,33 @@ from research_agent.extraction.security import SafeURL
 FetchRobots = Callable[[str], Awaitable[FetchedPage]]
 
 
+@dataclass(frozen=True, slots=True)
+class _CachedPolicy:
+    parser: RobotFileParser | None
+    allow_all: bool
+    fetched_at: float
+
+    def allows(self, user_agent: str, target_url: str) -> bool:
+        if self.allow_all:
+            return True
+        return self.parser is not None and self.parser.can_fetch(user_agent, target_url)
+
+
 class RobotsPolicy:
     """Fetch and cache only parsed robots policy, never the robots body."""
 
     def __init__(self, config: ExtractionConfig, fetch_robots: FetchRobots) -> None:
         self._config = config
         self._fetch_robots = fetch_robots
-        self._cache: dict[tuple[str, str, int], bool] = {}
+        self._cache: dict[tuple[str, str, int], _CachedPolicy] = {}
 
     async def allowed(self, target: SafeURL) -> bool:
         key = target.origin
         cached = self._cache.get(key)
-        if cached is not None:
-            return cached
+        now = time.monotonic()
+        ttl = self._config.robots_cache_ttl_seconds
+        if cached is not None and (ttl is None or now - cached.fetched_at < ttl):
+            return cached.allows(self._config.user_agent, target.url)
         host_for_url = f"[{target.hostname}]" if ":" in target.hostname else target.hostname
         robots_url = f"{target.scheme}://{host_for_url}"
         if target.port != (80 if target.scheme == "http" else 443):
@@ -42,14 +58,15 @@ class RobotsPolicy:
                 url=target.url,
             ) from exc
         if page.status_code in (401, 403):
-            allowed = False
+            policy = _CachedPolicy(parser=None, allow_all=False, fetched_at=now)
         elif page.status_code in (404, 410):
-            allowed = True
+            policy = _CachedPolicy(parser=None, allow_all=True, fetched_at=now)
         elif 200 <= page.status_code < 300:
             parser = RobotFileParser()
             parser.parse(page.content.decode("utf-8", errors="replace").splitlines())
-            allowed = parser.can_fetch(self._config.user_agent, target.url)
+            policy = _CachedPolicy(parser=parser, allow_all=False, fetched_at=now)
         else:
-            allowed = False
-        self._cache[key] = allowed
-        return allowed
+            policy = _CachedPolicy(parser=None, allow_all=False, fetched_at=now)
+        if ttl is not None:
+            self._cache[key] = policy
+        return policy.allows(self._config.user_agent, target.url)

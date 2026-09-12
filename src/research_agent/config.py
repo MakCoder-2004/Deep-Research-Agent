@@ -243,11 +243,17 @@ class Settings(BaseSettings):
     extraction_pool_timeout_seconds: float = Field(
         default=5.0, alias="EXTRACTION_POOL_TIMEOUT_SECONDS", gt=0
     )
+    extraction_dns_timeout_seconds: float = Field(
+        default=5.0, alias="EXTRACTION_DNS_TIMEOUT_SECONDS", gt=0
+    )
     max_redirects: int = Field(default=3, alias="MAX_REDIRECTS", ge=0, le=10)
     max_response_bytes: int = Field(
         default=2_000_000, alias="MAX_RESPONSE_BYTES", ge=1_024, le=50_000_000
     )
     respect_robots_txt: bool = Field(default=True, alias="RESPECT_ROBOTS_TXT")
+    robots_cache_ttl_seconds: float | None = Field(
+        default=3_600.0, alias="ROBOTS_CACHE_TTL_SECONDS", gt=0
+    )
     jina_reader_enabled: bool = Field(default=False, alias="JINA_READER_ENABLED")
     jina_reader_base_url: str = Field(default="https://r.jina.ai/", alias="JINA_READER_BASE_URL")
     jina_reader_api_key: SecretStr = Field(default=SecretStr(""), alias="JINA_READER_API_KEY")
