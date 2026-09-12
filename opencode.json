@@ -1,10 +1,20 @@
 {
   "$schema": "https://opencode.ai/config.json",
+  "subagent_depth": 0,
   "skills": {
     "paths": [
-      ".agents/skills",
-      "D:/Programming/Projects/Web Development/Geekers/.opencode/skills"
+      ".agents/skills"
     ]
+  },
+  "compaction": {
+    "auto": true,
+    "prune": true,
+    "tail_turns": 8
+  },
+  "permission": {
+    "skill": {
+      "*": "ask"
+    }
   },
   "mcp": {
     "docs-langchain": {
