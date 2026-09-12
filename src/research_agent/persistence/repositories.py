@@ -297,7 +297,12 @@ class ReportRepository:
     async def search(
         self, conn: aiosqlite.Connection, query: str, limit: int = 10
     ) -> list[aiosqlite.Row]:
-        """Full-text search over report topics and summaries, best match first."""
+        """Full-text search over report topics and summaries, best match first.
+
+        The query is passed as a quoted FTS5 phrase so user input containing
+        operators (``-``, ``OR``, ``*``, ...) cannot break the MATCH syntax.
+        """
+        phrase = '"' + query.replace('"', '""') + '"'
         cursor = await conn.execute(
             """
             SELECT r.* FROM report_fts
@@ -306,7 +311,7 @@ class ReportRepository:
             ORDER BY bm25(report_fts)
             LIMIT ?
             """,
-            (query, limit),
+            (phrase, limit),
         )
         return list(await cursor.fetchall())
 

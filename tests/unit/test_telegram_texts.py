@@ -41,16 +41,15 @@ def test_render_whoami_exact_wording() -> None:
     assert render_whoami(123456789) == "Your Telegram user ID is: 123456789"
 
 
-def test_limits_are_truthful_until_daily_quotas_are_implemented() -> None:
+def test_limits_state_the_live_daily_quota() -> None:
     english = render_start("en") + render_help("en")
     arabic = render_start("ar") + render_help("ar")
     assert english.count("3 concurrent jobs globally") == 2
     assert english.count("1 active job per user") == 2
-    assert english.count("Daily quotas coming soon (M9).") == 2
-    assert "10 requests per user" not in english
-    assert "3 مهام متزامنة عالميًا" in arabic
+    assert english.count("Daily quota: 10 requests per user per day.") == 2
+    assert "coming soon" not in english
     assert "مهمة نشطة واحدة لكل مستخدم" in arabic
-    assert arabic.count("الحصص اليومية قادمة قريبًا (M9).") == 2
+    assert arabic.count("الحصة اليومية: 10 طلبات لكل مستخدم يوميًا.") == 2
 
 
 def test_capability_messages_use_runtime_limits() -> None:
@@ -62,6 +61,7 @@ def test_capability_messages_use_runtime_limits() -> None:
         repair_cycles=0,
         session_ttl_hours=8,
         session_max_interactions=3,
+        requests_per_user_per_day=7,
     )
     text = render_start("en", limits) + render_help("en", limits)
     assert "2 concurrent jobs globally" in text
@@ -69,6 +69,7 @@ def test_capability_messages_use_runtime_limits() -> None:
     assert "75s job timeout with 0 repair cycle(s)" in text
     assert "reports kept 11 days" in text
     assert "sessions kept 8h or last 3 interactions" in text
+    assert "Daily quota: 7 requests per user per day." in text
 
 
 def test_status_localizes_the_current_stage() -> None:
