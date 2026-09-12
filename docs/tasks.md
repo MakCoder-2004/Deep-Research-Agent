@@ -162,15 +162,15 @@ Tasks are ordered by dependency inside each milestone. Task IDs are stable refer
 
 ### Execution And Ranking
 
-- [ ] **M3.23** Route general, academic, medical, news, technical, MENA, URL, legal, and financial requests using plan-defined source priorities.
-- [ ] **M3.24** Run independent tool requests concurrently within per-provider limits.
-- [ ] **M3.25** Apply request deadlines and record every tool attempt, including failures.
-- [ ] **M3.26** Normalize all responses into `SearchHit` records.
-- [ ] **M3.27** Preserve publisher, publication date, access date, source type, and tool provenance.
-- [ ] **M3.28** Canonicalize URLs and remove tracking parameters.
-- [ ] **M3.29** Deduplicate by canonical URL, DOI, title similarity, and content hash.
-- [ ] **M3.30** Implement deterministic source scoring for relevance, authority, freshness, primary-source status, language or region match, corroboration, duplication, and accessibility.
-- [ ] **M3.31** Prefer primary and independent sources without consuming LLM quota during the first ranking pass.
+- [x] **M3.23** Route general, academic, medical, news, technical, MENA, URL, legal, and financial requests using plan-defined source priorities.
+- [x] **M3.24** Run independent tool requests concurrently within per-provider limits.
+- [x] **M3.25** Apply request deadlines and record every tool attempt, including failures.
+- [x] **M3.26** Normalize all responses into `SearchHit` records.
+- [x] **M3.27** Preserve publisher, publication date, access date, source type, and tool provenance.
+- [x] **M3.28** Canonicalize URLs and remove tracking parameters.
+- [x] **M3.29** Deduplicate by canonical URL, DOI, title similarity, and content hash.
+- [x] **M3.30** Implement deterministic source scoring for relevance, authority, freshness, primary-source status, language or region match, corroboration, duplication, and accessibility.
+- [x] **M3.31** Prefer primary and independent sources without consuming LLM quota during the first ranking pass.
 
 ### Verification
 

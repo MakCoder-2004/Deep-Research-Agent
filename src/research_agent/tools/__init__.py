@@ -6,6 +6,17 @@ from research_agent.tools.base import ResearchTool, ToolError
 from research_agent.tools.medical import EuropePMCTool, EuropePmcTool, PubMedTool
 from research_agent.tools.news import GdeltTool
 from research_agent.tools.official import OfficialDomainTool
+from research_agent.tools.router import (
+    SOURCE_PRIORITIES,
+    AttemptRecorder,
+    ToolAttempt,
+    ToolExecutionResult,
+    ToolRouter,
+    ToolRunRecorder,
+    normalize_hit,
+    normalize_hits,
+    route_plan,
+)
 from research_agent.tools.technical import GithubTool, StackExchangeTool
 from research_agent.tools.web import (
     BraveTool,
@@ -19,6 +30,7 @@ from research_agent.tools.wiki import WikipediaTool
 
 __all__ = [
     "ArxivTool",
+    "AttemptRecorder",
     "BraveTool",
     "CrossrefTool",
     "DdgsTool",
@@ -37,6 +49,14 @@ __all__ = [
     "SerpApiTool",
     "StackExchangeTool",
     "TavilyTool",
+    "ToolAttempt",
+    "ToolExecutionResult",
+    "ToolRouter",
+    "ToolRunRecorder",
     "ToolError",
     "WikipediaTool",
+    "SOURCE_PRIORITIES",
+    "normalize_hit",
+    "normalize_hits",
+    "route_plan",
 ]

@@ -411,25 +411,40 @@ class ToolRunRepository:
         conn: aiosqlite.Connection,
         *,
         job_id: str,
+        task_id: str = "",
         tool_name: str,
         success: bool,
         duration_ms: int = 0,
         result_count: int = 0,
         error_category: str | None = None,
+        error_message: str | None = None,
+        quota_metadata: Mapping[str, Any] | None = None,
     ) -> None:
+        from research_agent.observability.redaction import redact_mapping, redact_text
+
+        safe_error = redact_text(error_message)[:500] if error_message else None
+        safe_quota = (
+            json.dumps(redact_mapping(dict(quota_metadata)), sort_keys=True, default=str)
+            if quota_metadata
+            else None
+        )
         await conn.execute(
             """
-            INSERT INTO tool_runs (job_id, tool_name, success, duration_ms,
-                                   result_count, error_category, created_at)
-            VALUES (?, ?, ?, ?, ?, ?, ?)
+            INSERT INTO tool_runs (job_id, task_id, tool_name, success, duration_ms,
+                                   result_count, error_category, error_message,
+                                   quota_metadata, created_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 job_id,
+                task_id,
                 tool_name,
                 int(success),
                 duration_ms,
                 result_count,
                 error_category,
+                safe_error,
+                safe_quota,
                 _now_iso(),
             ),
         )

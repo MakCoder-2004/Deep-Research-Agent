@@ -68,11 +68,25 @@ class SearchHit(BaseModel):
     source_type: SourceType = SourceType.WEB
     tool_name: str = Field(min_length=1)
     score: float = 0.0
+    doi: str | None = None
+    content_hash: str | None = None
+    tool_names: list[str] = Field(default_factory=list)
+    aliases: list[HttpUrl] = Field(default_factory=list)
 
     @model_validator(mode="after")
     def _require_tz_aware(self) -> SearchHit:
         require_tz_aware(self.accessed_at, "accessed_at")
         require_tz_aware(self.published_at, "published_at")
+        return self
+
+    @model_validator(mode="after")
+    def _include_primary_tool(self) -> SearchHit:
+        """Keep the original adapter name in merged-provenance metadata."""
+        names: list[str] = []
+        for name in [self.tool_name, *self.tool_names]:
+            if name and name not in names:
+                names.append(name)
+        self.tool_names = names
         return self
 
 
