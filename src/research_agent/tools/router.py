@@ -514,6 +514,7 @@ class ToolRouter:
         global_deadline: float | None,
         attempts: list[ToolAttempt | None],
         task_hits: list[list[SearchHit]],
+        deadline_expired: list[bool],
     ) -> None:
         started = time.monotonic()
         success = False
@@ -540,9 +541,13 @@ class ToolRouter:
             hits = normalize_hits(raw, task.tool_name)
             success = True
         except asyncio.CancelledError:
-            cancelled = True
-            error_category = "cancelled"
-            error_message = "Tool request cancelled."
+            if deadline_expired[0]:
+                error_category = ErrorCategory.TIMEOUT.value
+                error_message = "Tool request deadline exceeded."
+            else:
+                cancelled = True
+                error_category = "cancelled"
+                error_message = "Tool request cancelled."
             raise
         except TimeoutError:
             error_category = ErrorCategory.TIMEOUT.value
@@ -606,6 +611,7 @@ class ToolRouter:
         task_list = list(tasks)
         attempts: list[ToolAttempt | None] = [None] * len(task_list)
         task_hits: list[list[SearchHit]] = [[] for _ in task_list]
+        deadline_expired = [False]
         workers = [
             asyncio.create_task(
                 self._execute_one(
@@ -615,24 +621,29 @@ class ToolRouter:
                     global_deadline,
                     attempts,
                     task_hits,
+                    deadline_expired,
                 )
             )
             for index, task in enumerate(task_list)
         ]
         gathered: list[object] = []
-        deadline_expired = False
         if workers:
             try:
                 if global_seconds is None or math.isinf(global_seconds):
                     gathered = list(await asyncio.gather(*workers, return_exceptions=True))
                 else:
-                    async with asyncio.timeout(max(0.0, global_seconds)):
-                        gathered = list(await asyncio.gather(*workers, return_exceptions=True))
-            except TimeoutError:
-                deadline_expired = True
-                # Workers record their own cancellation/timeout before ending.
+                    _, pending = await asyncio.wait(workers, timeout=max(0.0, global_seconds))
+                    if pending:
+                        deadline_expired[0] = True
+                        for worker in pending:
+                            worker.cancel()
+                    gathered = list(await asyncio.gather(*workers, return_exceptions=True))
+            except asyncio.CancelledError:
+                for worker in workers:
+                    worker.cancel()
                 await asyncio.gather(*workers, return_exceptions=True)
-        if not deadline_expired:
+                raise
+        if not deadline_expired[0]:
             for outcome in gathered:
                 if isinstance(outcome, asyncio.CancelledError):
                     raise outcome
