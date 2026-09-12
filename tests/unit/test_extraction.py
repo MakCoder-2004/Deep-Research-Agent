@@ -232,3 +232,45 @@ async def test_fallback_cannot_bypass_mime_rejection_or_store_full_pages() -> No
     assert raised.value.category is ErrorCategory.MIME
     assert reader.calls == 0
     assert not hasattr(extractor.fetcher, "last_page")
+
+
+@pytest.mark.asyncio
+async def test_configured_jina_reader_uses_safe_fetching_and_bounded_output() -> None:
+    requests: list[str] = []
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        requests.append(str(request.url))
+        if request.url.host == "r.jina.ai":
+            return httpx.Response(
+                200,
+                headers={"content-type": "text/plain"},
+                content=b"Jina evidence returned as untrusted text.",
+            )
+        return httpx.Response(
+            200,
+            headers={"content-type": "text/html"},
+            content=b"<html><script>no article body</script></html>",
+        )
+
+    client = _client(handler)
+    extractor = SafeExtractor(
+        ExtractionConfig(
+            jina_reader_enabled=True,
+            jina_reader_base_url="https://r.jina.ai/",
+            max_source_chars=40,
+            respect_robots_txt=False,
+        ),
+        client=client,
+        resolver=FakeResolver(),
+    )
+    try:
+        document = await extractor.extract("https://example.com/article", source_id=2)
+    finally:
+        await client.aclose()
+    assert document.fallback_used is True
+    assert document.extraction_tool == "jina_reader"
+    assert len(document.body_text) <= 40
+    assert requests == [
+        "https://example.com/article",
+        "https://r.jina.ai/https://example.com/article",
+    ]

@@ -7,6 +7,7 @@ import pytest
 
 from research_agent.errors import ErrorCategory, ExtractionError
 from research_agent.extraction import ExtractionConfig, SafeFetcher, validate_url
+from research_agent.extraction.transport import PinnedNetworkBackend, pinned_route
 
 
 class FakeResolver:
@@ -131,3 +132,19 @@ async def test_redirect_limit_is_hard_and_manual() -> None:
         await client.aclose()
     assert raised.value.category is ErrorCategory.REDIRECT
     assert requests == 2
+
+
+@pytest.mark.asyncio
+async def test_transport_connects_to_the_validated_ip_not_a_rebound_hostname() -> None:
+    calls: list[str] = []
+
+    class Backend:
+        async def connect_tcp(self, host: str, port: int, **kwargs: object) -> object:
+            calls.append(host)
+            return object()
+
+    backend = PinnedNetworkBackend()
+    backend._backend = Backend()  # type: ignore[assignment]
+    with pinned_route("rebound.example", ("93.184.216.34",)):
+        await backend.connect_tcp("rebound.example", 443)
+    assert calls == ["93.184.216.34"]
