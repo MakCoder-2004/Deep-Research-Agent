@@ -46,7 +46,7 @@ dev = [
 [tool.ruff]
 target-version = "py312"
 line-length = 100
-exclude = [".agents", ".claude", ".venv", ".git"]
+exclude = [".agents", ".claude", ".venv", ".git", ".mypy_cache", ".ruff_cache", "htmlcov", "dist", "build"]
 
 [tool.ruff.lint]
 select = ["E", "F", "I", "UP", "B", "ASYNC", "S"]
@@ -74,5 +74,5 @@ source = ["src/research_agent"]
 branch = true
 
 [tool.coverage.report]
-fail_under = 0
+fail_under = 80
 show_missing = true
