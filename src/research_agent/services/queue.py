@@ -273,6 +273,36 @@ async def has_active_for_user(conn: aiosqlite.Connection, user_id: int) -> bool:
     return await get_user_active_job(conn, user_id) is not None
 
 
+async def _stored_user_language(conn: aiosqlite.Connection, user_id: int) -> str | None:
+    """Return the stored 'en'/'ar' preference for progress edits, if any."""
+    from research_agent.services.sessions import normalize_language
+
+    cursor = await conn.execute("SELECT language FROM users WHERE user_id = ?", (user_id,))
+    row = await cursor.fetchone()
+    if row is None:
+        return None
+    try:
+        return normalize_language(str(row["language"]))
+    except Exception:  # noqa: BLE001, S110 - callers fall back to job language
+        return None
+
+
+async def get_user_latest_job_in_state(
+    conn: aiosqlite.Connection, user_id: int, state: JobState | str
+) -> aiosqlite.Row | None:
+    """Return the user's most recently updated job in a state, if any."""
+    cursor = await conn.execute(
+        """
+        SELECT * FROM jobs
+        WHERE user_id = ? AND state = ?
+        ORDER BY updated_at DESC, rowid DESC
+        LIMIT 1
+        """,
+        (user_id, JobState(state).value),
+    )
+    return await cursor.fetchone()
+
+
 async def queue_position(conn: aiosqlite.Connection, job_id: str) -> int:
     """Return 1-indexed FIFO position counting older queued jobs (0 if not queued)."""
     cursor = await conn.execute(
@@ -884,6 +914,7 @@ class BoundedJobQueue:
 
         cancel_event = get_cancel_event(job.job_id)
         job_lang = "mixed"
+        stored_user_lang: str | None = None
         async with open_db(self._db_path) as conn:
             row = await JobRepository().get(conn, job.job_id)
             if row is None:
@@ -902,19 +933,26 @@ class BoundedJobQueue:
             except Exception:
                 job_lang = "mixed"
             try:
+                stored_user_lang = await _stored_user_language(conn, int(row["user_id"]))
+            except Exception:  # noqa: BLE001, S110 - job language remains the fallback
+                stored_user_lang = None
+            try:
                 await set_state(conn, job.job_id, JobState.ACTIVE)
             except ValueError:
                 # Cancellation may win between the state read and update.
                 return
-        # Prefer the tracked progress language (handler wiring) over the
-        # persisted job language so AR users keep AR edits.
+        # Prefer the tracked progress language (handler wiring), then the
+        # stored user preference (survives restarts), then the job language,
+        # so AR users keep AR edits even after a worker restart.
         try:
             tracked = get_progress_state(job.job_id)
-            lang = tracked["lang"] if tracked else job_lang
+            lang = tracked["lang"] if tracked else None
         except Exception:
-            lang = job_lang
+            lang = None
+        if lang is None:
+            lang = stored_user_lang or job_lang
         if lang not in ("en", "ar"):
-            lang = "mixed" if lang == "mixed" else "en"
+            lang = "en"
         cancelled = False
         for stage in list(ProgressStage):
             if cancel_event.is_set():

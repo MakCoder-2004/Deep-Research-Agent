@@ -23,6 +23,7 @@ class TelegramLimits:
     repair_cycles: int = 1
     session_ttl_hours: int = 24
     session_max_interactions: int = 6
+    requests_per_user_per_day: int = 10
 
     @property
     def active_jobs_en(self) -> str:
@@ -48,6 +49,7 @@ class TelegramLimits:
             repair_cycles=int(settings.repair_cycles),
             session_ttl_hours=int(settings.session_ttl_hours),
             session_max_interactions=int(settings.session_max_interactions),
+            requests_per_user_per_day=int(settings.requests_per_user_per_day),
         )
 
 
@@ -91,7 +93,7 @@ START_EN = (
     "with {active_jobs_en} per user; {job_timeout_seconds}s job timeout with "
     "{repair_cycles} repair cycle(s); reports kept {report_retention_days} days; sessions kept "
     "{session_ttl_hours}h or last {session_max_interactions} interactions.\n"
-    "Daily quotas coming soon (M9)."
+    "Daily quota: {requests_per_user_per_day} requests per user per day."
 )
 
 START_AR = (
@@ -113,7 +115,7 @@ START_AR = (
     "مع {active_jobs_ar} لكل مستخدم؛ مهلة {job_timeout_seconds} ثانية مع "
     "{repair_cycles} دورة إصلاح؛ تُحفظ التقارير {report_retention_days} يومًا؛ وتُحفظ الجلسات "
     "{session_ttl_hours} ساعة أو آخر {session_max_interactions} تفاعلات.\n"
-    "الحصص اليومية قادمة قريبًا (M9)."
+    "الحصة اليومية: {requests_per_user_per_day} طلبات لكل مستخدم يوميًا."
 )
 
 HELP_EN = (
@@ -135,7 +137,7 @@ HELP_EN = (
     "with {active_jobs_en} per user; {job_timeout_seconds}s job timeout with "
     "{repair_cycles} repair cycle(s); reports kept {report_retention_days} days; sessions kept "
     "{session_ttl_hours}h or last {session_max_interactions} interactions.\n"
-    "Daily quotas coming soon (M9)."
+    "Daily quota: {requests_per_user_per_day} requests per user per day."
 )
 
 HELP_AR = (
@@ -157,7 +159,7 @@ HELP_AR = (
     "مع {active_jobs_ar} لكل مستخدم؛ مهلة {job_timeout_seconds} ثانية مع "
     "{repair_cycles} دورة إصلاح؛ تُحفظ التقارير {report_retention_days} يومًا؛ وتُحفظ الجلسات "
     "{session_ttl_hours} ساعة أو آخر {session_max_interactions} تفاعلات.\n"
-    "الحصص اليومية قادمة قريبًا (M9)."
+    "الحصة اليومية: {requests_per_user_per_day} طلبات لكل مستخدم يوميًا."
 )
 
 
@@ -224,6 +226,7 @@ def _render_with_limits(key: str, lang_code: str | None, limits: TelegramLimits 
         report_retention_days=selected.report_retention_days,
         session_ttl_hours=selected.session_ttl_hours,
         session_max_interactions=selected.session_max_interactions,
+        requests_per_user_per_day=selected.requests_per_user_per_day,
     )
 
 
@@ -413,6 +416,17 @@ def render_cancel_none(lang_code: str | None) -> str:
     return _t("cancel_none", lang_code)
 
 
+QUOTA_EXCEEDED_EN_TEMPLATE = (
+    "You have reached your daily quota of {limit} requests. Please try again tomorrow."
+)
+QUOTA_EXCEEDED_AR_TEMPLATE = "لقد بلغت حصتك اليومية وهي {limit} طلبات. يرجى المحاولة مجددًا غدًا."
+
+
+def render_quota_exceeded(limit: int, lang_code: str | None) -> str:
+    """Render the daily-quota rejection without revealing other users' usage."""
+    return _t("quota_exceeded", lang_code).format(limit=limit)
+
+
 BUSY_EN_TEMPLATE = "You already have active job {job_id}. Use /status or /cancel."
 BUSY_NO_ID_EN = "You already have active job. Use /status or /cancel."
 BUSY_AR_TEMPLATE = (
@@ -449,14 +463,17 @@ def format_history(reports: Sequence[object] | None, lang_code: str | None) -> s
     lang = pick_lang(lang_code)
     if not items:
         return _t("history_empty", lang_code)
-    header = _t("history_header", lang_code).format(n=len(items))
-    lines = [header]
+    lines: list[str] = []
     for row in items:
         report_id = _get_field(row, "report_id")
         topic = _get_field(row, "topic")
         if report_id is None or topic is None:
             continue
         lines.append(f"- {report_id}: {topic}")
+    if not lines:
+        return _t("history_empty", lang_code)
+    header = _t("history_header", lang_code).format(n=len(lines))
+    lines.insert(0, header)
     lines.append(
         "استخدم /report <id> لاسترجاع تقرير."
         if lang == "ar"
@@ -583,6 +600,7 @@ _T.update(
         "cancelled": {"en": CANCELLED_EN_TEMPLATE, "ar": CANCELLED_AR_TEMPLATE},
         "cancelled_generic": {"en": CANCELLED_GENERIC_EN, "ar": CANCELLED_GENERIC_AR},
         "cancel_none": {"en": CANCEL_NONE_EN, "ar": CANCEL_NONE_AR},
+        "quota_exceeded": {"en": QUOTA_EXCEEDED_EN_TEMPLATE, "ar": QUOTA_EXCEEDED_AR_TEMPLATE},
         "history_empty": {"en": HISTORY_EMPTY_EN, "ar": HISTORY_EMPTY_AR},
         "history_header": {"en": HISTORY_HEADER_EN, "ar": HISTORY_HEADER_AR},
         "report_usage": {"en": REPORT_USAGE_EN, "ar": REPORT_USAGE_AR},

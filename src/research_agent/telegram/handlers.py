@@ -27,10 +27,12 @@ from research_agent.persistence.repositories import (
 )
 from research_agent.services.queue import (
     JobRef,
+    QuotaExceededError,
     UserBusyError,
     cancel_user_job,
     enqueue_request,
     get_user_active_job,
+    get_user_latest_job_in_state,
     queue_position,
 )
 from research_agent.services.reports import get_report_bundle, list_recent_reports
@@ -62,6 +64,7 @@ from research_agent.telegram.texts import (
     render_language_set,
     render_non_text,
     render_private_chat_only,
+    render_quota_exceeded,
     render_report_failure,
     render_report_not_found,
     render_report_usage,
@@ -326,12 +329,15 @@ def extract_research_arg(text: str | None, command: str) -> str:
     stripped = text.strip()
     lowered = stripped.lower()
     cmd = command.lower()
-    is_cmd = (
-        lowered == cmd
-        or lowered.startswith(cmd + " ")
-        or lowered.startswith(cmd + "\n")
-        or lowered.startswith(cmd + "@")
-    )
+    # Word boundary: after the command must come end-of-text, "@mention",
+    # or any whitespace (space, tab, newline, ...) so "/researcher" is not
+    # treated as "/research" while "/research\tq" is.
+    is_cmd = False
+    if lowered == cmd:
+        is_cmd = True
+    elif lowered.startswith(cmd):
+        tail = lowered[len(cmd) :]
+        is_cmd = tail.startswith("@") or (bool(tail) and tail[0].isspace())
     if not is_cmd:
         # Not this command: for plain-text routing return as-is, but a
         # leading-slash unknown command yields "" so callers show usage.
@@ -378,7 +384,10 @@ async def handle_research_request(
     if clean.startswith("/"):
         await message.answer(render_research_usage(lang_code))
         return None
-    if len(clean) > 4000 or (clean.startswith(("http://", "https://")) and len(clean) > 2000):
+    lowered_clean = clean.lower()
+    if len(clean) > 4000 or (
+        lowered_clean.startswith(("http://", "https://")) and len(clean) > 2000
+    ):
         await message.answer(render_too_long(lang_code))
         return None
     kind = classify_input(clean)
@@ -454,6 +463,9 @@ async def handle_research_request(
         job = await _enqueue()
     except UserBusyError as busy:
         await message.answer(render_busy(busy.job_id or None, lang_code))
+        return None
+    except QuotaExceededError as quota:
+        await message.answer(render_quota_exceeded(quota.limit, lang_code))
         return None
     except Exception:  # noqa: BLE001 - gateway must not fake-accept unavailable jobs
         await message.answer(render_unavailable(lang_code))
@@ -663,12 +675,15 @@ async def cancel_handler(
         if not cancelled:
             await message.answer(render_cancel_none(lang_code))
             return
-        row = await get_user_active_job(db_conn, from_user.id)
-        # Active is gone after cancel; confirm via cancelled state lookup.
+        # Confirm with the verified cancelled job ID (most recently updated
+        # cancelled job for this user); fall back to the generic message only
+        # when the lookup itself fails.
         confirmed_id: str | None = None
-        if row is None:
-            # Look up the most recent cancelled job for this user is expensive;
-            # acknowledge generically (truthful: something was cancelled).
+        try:
+            latest = await get_user_latest_job_in_state(db_conn, from_user.id, "cancelled")
+            if latest is not None:
+                confirmed_id = str(latest["job_id"])
+        except Exception:  # noqa: BLE001, S110 - generic ack stays truthful
             confirmed_id = None
         await message.answer(render_cancelled(confirmed_id, lang_code))
 
@@ -902,8 +917,9 @@ async def plaintext_handler(
     """Route plain text through the same path as /research."""
     raw = message.text or ""
     # Captions on media arrive with text=None; surface them instead of non_text.
+    # Strip text first so whitespace-only text still falls through to captions.
     caption = getattr(message, "caption", None)
-    query = (raw or (str(caption) if caption else "")).strip()
+    query = (raw.strip() or (str(caption) if caption else "")).strip()
     if not query:
         ctx = build_ctx(message, conn=conn, db_path=db_path)
         lang_code = (

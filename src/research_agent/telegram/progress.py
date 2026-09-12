@@ -120,19 +120,19 @@ def _record_progress_state(
     }
 
 
-def register_progress(job_id: str, chat_id: int, message_id: int) -> None:
+def register_progress(job_id: str, chat_id: int, message_id: int, lang: str = "en") -> None:
     """Store the chat/message IDs for a job's progress message."""
     _PROGRESS_REGISTRY.pop(job_id, None)
     _PROGRESS_REGISTRY[job_id] = (chat_id, message_id)
     stage = ProgressStage.ANALYZING
-    lang = "en"
+    resolved = _resolve_lang(lang)
     _record_progress_state(
         job_id,
         chat_id,
         message_id,
         stage,
-        lang,
-        format_initial_text(stage, job_id, None, lang),
+        resolved,
+        format_initial_text(stage, job_id, None, resolved),
     )
     _bound_progress_registry()
 
@@ -325,6 +325,6 @@ async def publish_progress(
     message_id = sent.message_id
     chat_id = message.chat.id
     if chat_id and message_id:
-        register_progress(job_id, chat_id, message_id)
+        register_progress(job_id, chat_id, message_id, resolved)
         _record_progress_state(job_id, chat_id, message_id, stage_key, resolved, text)
     return message_id
