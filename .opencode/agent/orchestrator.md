@@ -16,6 +16,9 @@ permission:
     "*": deny
     "git status*": allow
     "git diff*": allow
+    "git log*": allow
+    "git add *": allow
+    "git commit -m *": allow
     "python -m json.tool*": allow
     "opencode debug config*": allow
 ---
@@ -46,7 +49,20 @@ Treat the packet as the worker's boundary. Do not delegate without it. For a com
 
 Use `glob` and `grep` to locate relevant files, then targeted `read` ranges. Never ask a worker to read an entire document, the entire `PLAN.md`, `tasks.md`, or the repository. Do not load skills broadly. A worker may use only a specifically allowed, directly relevant skill when the packet says it is needed.
 
-Parallelize only independent work. Every delegated agent must be non-recursive: it must not launch another agent. Use `implementation-worker` for bounded changes and `reviewer` after the focused diff exists. Keep the context brief and outputs within their budgets.
+Parallelize only independent read-only work. Implementation workers write to the
+shared worktree, so run them sequentially when their changes will be committed.
+Every delegated agent must be non-recursive: it must not launch another agent.
+Use `implementation-worker` for bounded changes and `reviewer` after the focused
+diff exists. Keep the context brief and outputs within their budgets.
+
+After a worker completes and its focused checks and review pass, create one
+checkpoint commit for that task. First compare `git status` and the changed-path
+list with the packet. Stop if there are unexpected paths or untracked files.
+Stage only the reported paths with `git add -- <exact paths>`; never use `git
+add .`, `git add -A`, or a wildcard. Verify `git diff --cached --check` and the
+cached path list, confirm `AGENTS.md` is not staged, then commit with the task ID
+in the message, such as `feat(m5.1): define workflow state`. Never amend, reset,
+force-push, or merge as part of a task checkpoint.
 
 ## Stop and escalate
 
