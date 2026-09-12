@@ -11,7 +11,7 @@ from research_agent.errors import ErrorCategory, ExtractionError
 from research_agent.extraction.contracts import ExtractionConfig, FetchedPage
 from research_agent.extraction.security import SafeURL
 
-FetchRobots = Callable[[str], Awaitable[FetchedPage]]
+FetchRobots = Callable[[str, str], Awaitable[FetchedPage]]
 
 
 @dataclass(frozen=True, slots=True)
@@ -34,20 +34,21 @@ class RobotsPolicy:
         self._fetch_robots = fetch_robots
         self._cache: dict[tuple[str, str, int], _CachedPolicy] = {}
 
-    async def allowed(self, target: SafeURL) -> bool:
+    async def allowed(self, target: SafeURL, user_agent: str | None = None) -> bool:
+        effective_user_agent = user_agent or self._config.user_agent
         key = target.origin
         cached = self._cache.get(key)
         now = time.monotonic()
         ttl = self._config.robots_cache_ttl_seconds
         if cached is not None and (ttl is None or now - cached.fetched_at < ttl):
-            return cached.allows(self._config.user_agent, target.url)
+            return cached.allows(effective_user_agent, target.url)
         host_for_url = f"[{target.hostname}]" if ":" in target.hostname else target.hostname
         robots_url = f"{target.scheme}://{host_for_url}"
         if target.port != (80 if target.scheme == "http" else 443):
             robots_url += f":{target.port}"
         robots_url += "/robots.txt"
         try:
-            page = await self._fetch_robots(robots_url)
+            page = await self._fetch_robots(robots_url, effective_user_agent)
         except ExtractionError as exc:
             # A missing robots file is handled by the HTTP status branch.  A
             # policy fetch failure otherwise fails closed rather than silently
@@ -69,4 +70,4 @@ class RobotsPolicy:
             policy = _CachedPolicy(parser=None, allow_all=False, fetched_at=now)
         if ttl is not None:
             self._cache[key] = policy
-        return policy.allows(self._config.user_agent, target.url)
+        return policy.allows(effective_user_agent, target.url)

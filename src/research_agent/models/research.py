@@ -13,6 +13,7 @@ from pydantic import (
     Field,
     FiniteFloat,
     HttpUrl,
+    ValidationInfo,
     field_validator,
     model_validator,
 )
@@ -295,9 +296,46 @@ class SourceDocument(BaseModel):
     fallback_used: bool = False
 
     @model_validator(mode="after")
-    def _require_tz_aware(self) -> SourceDocument:
+    def _validate_contract(self, info: ValidationInfo) -> SourceDocument:
         require_tz_aware(self.published_at, "published_at")
+        context = info.context if isinstance(info.context, dict) else {}
+        max_source_chars = _document_limit(context, "max_source_chars", 20_000)
+        max_headings = _document_limit(context, "max_headings", 100)
+        heading_max_chars = _document_limit(context, "heading_max_chars", 500)
+        title_max_chars = _document_limit(context, "title_max_chars", 500)
+        metadata_max_chars = _document_limit(context, "metadata_max_chars", 300)
+        max_quotations = _document_limit(context, "max_quotations", 5)
+        quotation_max_chars = _document_limit(context, "quotation_max_chars", 280)
+        max_links = _document_limit(context, "max_links", 100)
+
+        if len(self.body_text) > max_source_chars:
+            raise ValueError("body_text exceeds the configured source character limit.")
+        if len(self.headings) > max_headings:
+            raise ValueError("headings exceed the configured item limit.")
+        if any(len(heading) > heading_max_chars for heading in self.headings):
+            raise ValueError("a heading exceeds the configured character limit.")
+        if len(self.title) > title_max_chars:
+            raise ValueError("title exceeds the configured character limit.")
+        if any(
+            value is not None and len(value) > metadata_max_chars
+            for value in (self.author, self.publisher)
+        ):
+            raise ValueError("source metadata exceeds the configured character limit.")
+        if len(self.quotations) > max_quotations:
+            raise ValueError("quotations exceed the configured item limit.")
+        if any(
+            not quotation or len(quotation) > quotation_max_chars or quotation not in self.body_text
+            for quotation in self.quotations
+        ):
+            raise ValueError("quotations must be bounded evidence from body_text.")
+        if len(self.links) > max_links:
+            raise ValueError("links exceed the configured item limit.")
         return self
+
+
+def _document_limit(context: dict[object, object], name: str, default: int) -> int:
+    value = context.get(name, default)
+    return value if isinstance(value, int) and value >= 0 else default
 
 
 class EvidenceClaim(BaseModel):

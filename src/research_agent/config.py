@@ -213,7 +213,11 @@ class Settings(BaseSettings):
     quick_max_tools: int = Field(default=2, alias="QUICK_MAX_TOOLS", ge=1, le=6)
     standard_max_tools: int = Field(default=4, alias="STANDARD_MAX_TOOLS", ge=1, le=6)
     deep_max_tools: int = Field(default=6, alias="DEEP_MAX_TOOLS", ge=1, le=6)
-    chars_per_source: int = Field(default=20000, alias="CHARS_PER_SOURCE", ge=1000, le=100000)
+    chars_per_source: int = Field(default=20000, alias="CHARS_PER_SOURCE", ge=1000, le=20000)
+    max_headings: int = Field(default=100, alias="MAX_HEADINGS", ge=0, le=1000)
+    heading_max_chars: int = Field(default=500, alias="HEADING_MAX_CHARS", ge=1, le=2000)
+    title_max_chars: int = Field(default=500, alias="TITLE_MAX_CHARS", ge=1, le=2000)
+    metadata_max_chars: int = Field(default=300, alias="METADATA_MAX_CHARS", ge=1, le=2000)
     reader_context_chars: int = Field(
         default=40000, alias="READER_CONTEXT_CHARS", ge=4000, le=500000
     )

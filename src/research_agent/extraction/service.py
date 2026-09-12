@@ -32,7 +32,6 @@ class SafeExtractor:
         config: ExtractionConfig | None = None,
         *,
         settings: object | None = None,
-        client: httpx.AsyncClient | None = None,
         test_transport: httpx.MockTransport | None = None,
         resolver: DNSResolver | DNSResolverCallable | None = None,
         address_validator: AddressValidator | None = None,
@@ -47,7 +46,6 @@ class SafeExtractor:
             self.config = config or ExtractionConfig()
         self.fetcher = SafeFetcher(
             self.config,
-            client=client,
             test_transport=test_transport,
             resolver=resolver,
             address_validator=address_validator,
@@ -76,7 +74,11 @@ class SafeExtractor:
         *,
         source_id: int | None = None,
     ) -> SourceDocument:
-        """Extract one URL or M3 ``SourceCandidate`` into a bounded document."""
+        """Extract one source into a bounded document.
+
+        Raw URL values require ``source_id``; ranked ``SourceCandidate``
+        values carry their own stable ID.
+        """
         url, resolved_source_id, source_title, publisher, published_at = _source_values(
             source, source_id
         )
@@ -89,6 +91,7 @@ class SafeExtractor:
                 source_title=source_title,
                 source_publisher=publisher,
                 source_published_at=published_at,
+                source_url=target.url,
             )
         except asyncio.CancelledError:
             raise
@@ -122,6 +125,7 @@ class SafeExtractor:
         published_at: datetime | None,
     ) -> SourceDocument:
         assert self.reader_fallback is not None
+        await self.fetcher.validate_target(source_url)
         try:
             page = await self.reader_fallback.read(source_url)
         except asyncio.CancelledError:
@@ -166,11 +170,13 @@ def _source_values(
     url_value = getattr(source, "url", source)
     if not isinstance(url_value, (str, httpx.URL)):
         url_value = str(url_value)
-    candidate_id: object = (
-        source_id
-        if source_id is not None
-        else getattr(source, "source_id", getattr(source, "id", 1))
-    )
+    candidate_id: object = source_id
+    if candidate_id is None:
+        candidate_id = getattr(source, "source_id", getattr(source, "id", None))
+    if candidate_id is None:
+        raise ExtractionError(
+            "Source ID is required for raw URL extraction.", category=ErrorCategory.INVALID_REQUEST
+        )
     try:
         numeric_id = int(str(candidate_id))
     except (TypeError, ValueError) as exc:

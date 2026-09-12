@@ -7,6 +7,7 @@ import gzip
 
 import httpx
 import pytest
+from pydantic import ValidationError
 
 from research_agent.errors import ErrorCategory, ExtractionError
 from research_agent.extraction import (
@@ -17,6 +18,7 @@ from research_agent.extraction import (
 )
 from research_agent.extraction.contracts import FetchedPage
 from research_agent.extraction.transport import PinnedAsyncHTTPTransport
+from research_agent.models.research import SourceDocument
 
 
 class FakeResolver:
@@ -53,8 +55,8 @@ async def test_async_client_injection_is_not_a_production_test_seam() -> None:
     try:
         with pytest.raises(ValueError, match="test_transport"):
             SafeFetcher(client=fetcher_client)
-        with pytest.raises(ValueError, match="test_transport"):
-            SafeExtractor(client=extractor_client)
+        with pytest.raises(TypeError, match="client"):
+            SafeExtractor(client=extractor_client)  # type: ignore[call-arg]
     finally:
         await fetcher_client.aclose()
         await extractor_client.aclose()
@@ -179,6 +181,37 @@ async def test_robots_policy_is_cached_per_origin_but_evaluated_per_path() -> No
 
 
 @pytest.mark.asyncio
+async def test_robots_uses_the_effective_request_user_agent() -> None:
+    requests: list[httpx.Request] = []
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        requests.append(request)
+        if request.url.path == "/robots.txt":
+            return httpx.Response(
+                200,
+                headers={"content-type": "text/plain"},
+                content=(
+                    b"User-agent: SpecificResearchBot\nDisallow: /blocked\n"
+                    b"User-agent: *\nAllow: /\n"
+                ),
+            )
+        return httpx.Response(200, headers={"content-type": "text/html"}, content=b"<p>secret</p>")
+
+    fetcher = SafeFetcher(test_transport=_transport(handler), resolver=FakeResolver())
+    try:
+        with pytest.raises(ExtractionError) as raised:
+            await fetcher.fetch(
+                "https://example.com/blocked",
+                headers={"User-Agent": "SpecificResearchBot/1.0"},
+            )
+    finally:
+        await fetcher.close()
+    assert raised.value.category is ErrorCategory.ROBOTS
+    assert requests[0].headers["user-agent"] == "SpecificResearchBot/1.0"
+    assert len(requests) == 1
+
+
+@pytest.mark.asyncio
 async def test_redirected_path_is_checked_against_cached_robots_policy() -> None:
     requests: list[str] = []
 
@@ -270,6 +303,8 @@ async def test_cross_origin_redirect_strips_credentials_and_response_cookies() -
                 "Authorization": "Bearer secret",
                 "Cookie": "manual=secret",
                 "X-Api-Key": "secret",
+                "X-Provider-Secret": "provider-secret",
+                "User-Agent": "CallerBot/1.0",
             },
         )
     finally:
@@ -278,9 +313,13 @@ async def test_cross_origin_redirect_strips_credentials_and_response_cookies() -
     assert requests[0].headers["authorization"] == "Bearer secret"
     assert requests[0].headers["cookie"] == "manual=secret"
     assert requests[0].headers["x-api-key"] == "secret"
+    assert requests[0].headers["x-provider-secret"] == "provider-secret"
+    assert requests[0].headers["user-agent"] == "CallerBot/1.0"
     assert "authorization" not in requests[1].headers
     assert "cookie" not in requests[1].headers
     assert "x-api-key" not in requests[1].headers
+    assert "x-provider-secret" not in requests[1].headers
+    assert requests[1].headers["user-agent"] == "CallerBot/1.0"
 
 
 @pytest.mark.asyncio
@@ -394,6 +433,144 @@ def test_html_cleanup_metadata_quotes_links_and_bounds() -> None:
     assert all(len(quote) <= 280 for quote in document.quotations)
     assert [str(link) for link in document.links] == ["https://example.com/related"]
     assert document.bytes_read == len(html)
+
+
+def test_quotations_are_selected_only_from_the_bounded_body() -> None:
+    page = FetchedPage(
+        requested_url="https://example.com/article",
+        final_url="https://example.com/article",
+        status_code=200,
+        content_type="text/html",
+        content=(
+            b"<main><p>Evidence retained in the bounded body.</p>"
+            b"<p>This later paragraph is outside the body limit and cannot be evidence.</p></main>"
+        ),
+        bytes_read=0,
+        fetch_ms=1,
+    )
+    config = ExtractionConfig(max_source_chars=len("Evidence retained in the bounded body."))
+    document = HTMLExtractor(config).extract(page, source_id=1)
+    assert document.body_text == "Evidence retained in the bounded body."
+    assert document.quotations == [document.body_text]
+    assert all(quote in document.body_text for quote in document.quotations)
+
+
+def test_extracted_document_fields_follow_configured_limits() -> None:
+    page = FetchedPage(
+        requested_url="https://example.com/article",
+        final_url="https://example.com/article",
+        status_code=200,
+        content_type="text/html",
+        content=(
+            b"<html><head><title>A title longer than ten</title>"
+            b"<meta name='author' content='Author longer than eight'>"
+            b"<meta property='og:site_name' content='Publisher longer than eight'></head>"
+            b"<body><main><h1>Heading longer than eight</h1><h2>Second heading</h2>"
+            b"<p>Bounded evidence paragraph.</p><a href='/one'>one</a><a href='/two'>two</a>"
+            b"</main></body></html>"
+        ),
+        bytes_read=0,
+        fetch_ms=1,
+    )
+    config = ExtractionConfig(
+        max_source_chars=80,
+        max_headings=1,
+        heading_max_chars=8,
+        title_max_chars=10,
+        metadata_max_chars=8,
+        max_quotations=1,
+        quotation_max_chars=40,
+        max_links=1,
+    )
+    document = HTMLExtractor(config).extract(page, source_id=1)
+    assert len(document.body_text) <= 80
+    assert len(document.headings) <= 1
+    assert all(len(heading) <= 8 for heading in document.headings)
+    assert len(document.title) <= 10
+    assert document.author is not None and len(document.author) <= 8
+    assert document.publisher is not None and len(document.publisher) <= 8
+    assert len(document.quotations) <= 1
+    assert all(len(quote) <= 40 and quote in document.body_text for quote in document.quotations)
+    assert len(document.links) <= 1
+
+
+def test_source_document_rejects_unbounded_or_unlinked_evidence() -> None:
+    with pytest.raises(ValidationError, match="body_text"):
+        SourceDocument(
+            source_id=1,
+            url="https://example.com/article",
+            body_text="x" * 20_001,
+        )
+    with pytest.raises(ValidationError, match="quotations"):
+        SourceDocument(
+            source_id=1,
+            url="https://example.com/article",
+            body_text="bounded body",
+            quotations=["not in the body"],
+        )
+
+
+@pytest.mark.parametrize(
+    ("field", "value", "context", "message"),
+    [
+        ("headings", ["heading"], {"max_headings": 0}, "headings"),
+        ("headings", ["long"], {"heading_max_chars": 3}, "heading"),
+        ("title", "long title", {"title_max_chars": 3}, "title"),
+        ("author", "long author", {"metadata_max_chars": 3}, "metadata"),
+        (
+            "quotations",
+            ["bounded evidence", "bounded evidence"],
+            {"max_quotations": 1},
+            "quotations",
+        ),
+        ("quotations", ["bounded evidence"], {"quotation_max_chars": 3}, "quotations"),
+        (
+            "links",
+            ["https://example.com/one", "https://example.com/two"],
+            {"max_links": 1},
+            "links",
+        ),
+    ],
+)
+def test_source_document_validates_each_configured_bound(
+    field: str, value: object, context: dict[str, int], message: str
+) -> None:
+    payload: dict[str, object] = {
+        "source_id": 1,
+        "url": "https://example.com/article",
+        "title": "T",
+        "author": "A",
+        "publisher": "P",
+        "body_text": "bounded evidence",
+    }
+    payload[field] = value
+    with pytest.raises(ValidationError, match=message):
+        SourceDocument.model_validate(payload, context=context)
+
+
+@pytest.mark.asyncio
+async def test_direct_extraction_keeps_source_url_when_fetch_redirects() -> None:
+    async def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.host == "example.com":
+            return httpx.Response(302, headers={"location": "https://other.example/final"})
+        return httpx.Response(
+            200,
+            headers={"content-type": "text/html"},
+            content=b"<main><p>Redirected source evidence.</p></main>",
+        )
+
+    extractor = SafeExtractor(
+        ExtractionConfig(respect_robots_txt=False),
+        test_transport=_transport(handler),
+        resolver=FakeResolver(),
+    )
+    try:
+        document = await extractor.extract("https://example.com/original", source_id=1)
+    finally:
+        await extractor.close()
+    assert str(document.url) == "https://example.com/original"
+    assert str(document.requested_url) == "https://example.com/original"
+    assert str(document.fetch_final_url) == "https://other.example/final"
 
 
 def test_html_cleanup_removes_structural_boilerplate_but_keeps_article_header() -> None:
@@ -556,7 +733,9 @@ async def test_configured_jina_reader_uses_safe_fetching_and_bounded_output() ->
         resolver=FakeResolver(),
     )
     try:
-        document = await extractor.extract("https://example.com/article", source_id=2)
+        document = await extractor.extract(
+            "https://example.com/article?topic=ai&lang=en", source_id=2
+        )
     finally:
         await extractor.close()
     assert document.fallback_used is True
@@ -565,11 +744,32 @@ async def test_configured_jina_reader_uses_safe_fetching_and_bounded_output() ->
     assert document.content_type == "text/plain"
     assert document.bytes_read == len(b"Jina evidence returned as untrusted text.")
     assert document.fetch_ms >= 0
-    assert str(document.fetch_requested_url) == "https://r.jina.ai/https://example.com/article"
-    assert str(document.fetch_final_url) == "https://r.jina.ai/https://example.com/article"
-    assert str(document.url) == "https://example.com/article"
+    expected_reader_url = (
+        "https://r.jina.ai/https%3A%2F%2Fexample.com%2Farticle%3Ftopic%3Dai%26lang%3Den"
+    )
+    assert str(document.fetch_requested_url) == expected_reader_url
+    assert str(document.fetch_final_url) == expected_reader_url
+    assert str(document.url) == "https://example.com/article?topic=ai&lang=en"
     assert len(document.body_text) <= 40
     assert requests == [
-        "https://example.com/article",
-        "https://r.jina.ai/https://example.com/article",
+        "https://example.com/article?topic=ai&lang=en",
+        expected_reader_url,
     ]
+
+
+@pytest.mark.asyncio
+async def test_raw_url_extraction_requires_an_explicit_source_id() -> None:
+    extractor = SafeExtractor(
+        ExtractionConfig(respect_robots_txt=False),
+        test_transport=_transport(
+            lambda request: httpx.Response(
+                200, headers={"content-type": "text/html"}, content=b"<p>ok</p>"
+            )
+        ),
+        resolver=FakeResolver(),
+    )
+    try:
+        with pytest.raises(ExtractionError, match="required for raw URL"):
+            await extractor.extract("https://example.com/article")
+    finally:
+        await extractor.close()

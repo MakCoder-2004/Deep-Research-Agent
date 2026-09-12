@@ -5,6 +5,8 @@ from __future__ import annotations
 import io
 import logging
 
+from research_agent.config import Settings
+from research_agent.main import _collect_secrets
 from research_agent.observability.logging import (
     JsonFormatter,
     clear_context,
@@ -69,6 +71,28 @@ def test_json_formatter_redacts_log_output() -> None:
         clear_context()
     assert secret not in output
     assert "job-1" in output
+
+
+def test_jina_reader_key_is_in_log_secrets_and_redacted() -> None:
+    key = "jina-reader-test-secret-123"  # noqa: S105
+    settings = Settings(_env_file=None, JINA_READER_API_KEY=key)
+    assert key in _collect_secrets(settings)
+    stream = io.StringIO()
+    handler = logging.StreamHandler(stream)
+    handler.setFormatter(JsonFormatter())
+    logger = logging.getLogger("test.jina-redaction")
+    logger.handlers.clear()
+    logger.addHandler(handler)
+    logger.setLevel(logging.INFO)
+    set_secrets(_collect_secrets(settings))
+    try:
+        logger.info("reader failed with key %s", key)
+        output = stream.getvalue()
+    finally:
+        logger.handlers.clear()
+        clear_context()
+    assert key not in output
+    assert redact_mapping({"jina_reader_api_key": key})["jina_reader_api_key"] == "***"
 
 
 def test_configure_logging_preserves_host_handlers() -> None:

@@ -8,7 +8,13 @@ import httpx
 import pytest
 
 from research_agent.errors import ErrorCategory, ExtractionError
-from research_agent.extraction import ExtractionConfig, SafeExtractor, SafeFetcher, validate_url
+from research_agent.extraction import (
+    ExtractionConfig,
+    JinaReaderFallback,
+    SafeExtractor,
+    SafeFetcher,
+    validate_url,
+)
 from research_agent.extraction.transport import PinnedNetworkBackend, pinned_route
 
 
@@ -170,6 +176,82 @@ async def test_dns_resolution_has_a_bounded_timeout() -> None:
     finally:
         await fetcher.close()
     assert raised.value.category is ErrorCategory.TIMEOUT
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("blocked_address", ["10.0.0.1", "169.254.169.254"])
+async def test_jina_reader_rejects_private_or_metadata_source_before_calling_reader(
+    blocked_address: str,
+) -> None:
+    requests: list[str] = []
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        requests.append(str(request.url))
+        return httpx.Response(
+            200,
+            headers={"content-type": "text/plain"},
+            content=b"reader must not be called",
+        )
+
+    config = ExtractionConfig(
+        jina_reader_enabled=True,
+        jina_reader_base_url="https://r.jina.ai/",
+        respect_robots_txt=False,
+    )
+    fetcher = SafeFetcher(
+        config,
+        test_transport=httpx.MockTransport(handler),
+        resolver=FakeResolver(
+            {"private.example": [blocked_address], "r.jina.ai": ["93.184.216.34"]}
+        ),
+    )
+    try:
+        with pytest.raises(ExtractionError) as raised:
+            await JinaReaderFallback(fetcher, config).read("https://private.example/article")
+    finally:
+        await fetcher.close()
+    assert raised.value.category is ErrorCategory.SSRF
+    assert requests == []
+
+
+@pytest.mark.asyncio
+async def test_fallback_revalidates_a_source_after_direct_fetch_before_calling_jina() -> None:
+    requests: list[str] = []
+    source_resolutions = 0
+
+    class RebindingResolver:
+        async def resolve(self, hostname: str, port: int) -> list[str]:
+            nonlocal source_resolutions
+            if hostname == "source.example":
+                source_resolutions += 1
+                return ["93.184.216.34"] if source_resolutions == 1 else ["127.0.0.1"]
+            return ["93.184.216.34"]
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        requests.append(str(request.url))
+        return httpx.Response(
+            200,
+            headers={"content-type": "text/html"},
+            content=b"<html><script>no extractable body</script></html>",
+        )
+
+    extractor = SafeExtractor(
+        ExtractionConfig(
+            jina_reader_enabled=True,
+            jina_reader_base_url="https://r.jina.ai/",
+            respect_robots_txt=False,
+        ),
+        test_transport=httpx.MockTransport(handler),
+        resolver=RebindingResolver(),
+    )
+    try:
+        with pytest.raises(ExtractionError) as raised:
+            await extractor.extract("https://source.example/article", source_id=1)
+    finally:
+        await extractor.close()
+    assert raised.value.category is ErrorCategory.SSRF
+    assert source_resolutions == 2
+    assert requests == ["https://source.example/article"]
 
 
 @pytest.mark.asyncio

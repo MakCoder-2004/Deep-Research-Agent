@@ -26,7 +26,11 @@ class ExtractionConfig(BaseModel):
     dns_timeout_seconds: float = Field(default=5.0, gt=0)
     max_redirects: int = Field(default=3, ge=0, le=20)
     max_response_bytes: int = Field(default=2_000_000, ge=1)
-    max_source_chars: int = Field(default=20_000, ge=1)
+    max_source_chars: int = Field(default=20_000, ge=1, le=20_000)
+    max_headings: int = Field(default=100, ge=0, le=1_000)
+    heading_max_chars: int = Field(default=500, ge=1, le=2_000)
+    title_max_chars: int = Field(default=500, ge=1, le=2_000)
+    metadata_max_chars: int = Field(default=300, ge=1, le=2_000)
     max_quotations: int = Field(default=5, ge=0, le=50)
     quotation_max_chars: int = Field(default=280, ge=40, le=2_000)
     max_links: int = Field(default=100, ge=0, le=1_000)
@@ -91,6 +95,10 @@ class ExtractionConfig(BaseModel):
             max_redirects=getattr(settings, "max_redirects", 3),
             max_response_bytes=getattr(settings, "max_response_bytes", 2_000_000),
             max_source_chars=getattr(settings, "chars_per_source", 20_000),
+            max_headings=getattr(settings, "max_headings", 100),
+            heading_max_chars=getattr(settings, "heading_max_chars", 500),
+            title_max_chars=getattr(settings, "title_max_chars", 500),
+            metadata_max_chars=getattr(settings, "metadata_max_chars", 300),
             respect_robots_txt=getattr(settings, "respect_robots_txt", True),
             robots_cache_ttl_seconds=getattr(settings, "robots_cache_ttl_seconds", 3_600.0),
             jina_reader_enabled=getattr(settings, "jina_reader_enabled", False),

@@ -156,34 +156,46 @@ class HTMLExtractor:
                 _clean_text(_tag_text(tag))
                 for tag in root.find_all(["h1", "h2", "h3", "h4", "h5", "h6"])
             ],
-            500,
-        )
+            self.config.heading_max_chars,
+        )[: self.config.max_headings]
         links = _extract_links(root, page.final_url, self.config.max_links)
         quotations = _extract_quotations(
             root,
-            lines,
+            body_text,
             max_quotations=self.config.max_quotations,
             max_chars=self.config.quotation_max_chars,
         )
-        return SourceDocument(
-            source_id=source_id,
-            url=_as_http_url(source_url or page.final_url),
-            requested_url=_as_http_url(source_url or page.requested_url),
-            title=_bounded_text(_clean_text(title or ""), 500),
-            author=_optional_bounded(author, 300),
-            publisher=_optional_bounded(publisher, 300),
-            published_at=published_at,
-            headings=headings,
-            body_text=body_text,
-            links=links,
-            quotations=quotations,
-            fetch_ms=page.fetch_ms,
-            extraction_tool="beautifulsoup",
-            fetch_requested_url=_as_http_url(page.requested_url),
-            fetch_final_url=_as_http_url(page.final_url),
-            status_code=page.status_code,
-            content_type=page.content_type,
-            bytes_read=page.bytes_read,
+        return SourceDocument.model_validate(
+            {
+                "source_id": source_id,
+                "url": _as_http_url(source_url or page.final_url),
+                "requested_url": _as_http_url(source_url or page.requested_url),
+                "title": _bounded_text(_clean_text(title or ""), self.config.title_max_chars),
+                "author": _optional_bounded(author, self.config.metadata_max_chars),
+                "publisher": _optional_bounded(publisher, self.config.metadata_max_chars),
+                "published_at": published_at,
+                "headings": headings,
+                "body_text": body_text,
+                "links": links,
+                "quotations": quotations,
+                "fetch_ms": page.fetch_ms,
+                "extraction_tool": "beautifulsoup",
+                "fetch_requested_url": _as_http_url(page.requested_url),
+                "fetch_final_url": _as_http_url(page.final_url),
+                "status_code": page.status_code,
+                "content_type": page.content_type,
+                "bytes_read": page.bytes_read,
+            },
+            context={
+                "max_source_chars": self.config.max_source_chars,
+                "max_headings": self.config.max_headings,
+                "heading_max_chars": self.config.heading_max_chars,
+                "title_max_chars": self.config.title_max_chars,
+                "metadata_max_chars": self.config.metadata_max_chars,
+                "max_quotations": self.config.max_quotations,
+                "quotation_max_chars": self.config.quotation_max_chars,
+                "max_links": self.config.max_links,
+            },
         )
 
 
@@ -297,24 +309,26 @@ def _extract_links(root: Tag | BeautifulSoup, base_url: str, maximum: int) -> li
 
 def _extract_quotations(
     root: Tag | BeautifulSoup,
-    body_lines: list[str],
+    bounded_body_text: str,
     *,
     max_quotations: int,
     max_chars: int,
 ) -> list[str]:
-    body_set = set(body_lines)
     quotations: list[str] = []
     for element in root.find_all(["p", "blockquote", "li"]):
         text = _clean_text(element.get_text(" ", strip=True))
-        if not text or text not in body_set:
+        if not text or text not in bounded_body_text:
             continue
         quote = _bounded_text(text, max_chars)
-        if quote not in quotations:
+        if quote and quote in bounded_body_text and quote not in quotations:
             quotations.append(quote)
         if len(quotations) >= max_quotations:
             break
-    if not quotations and body_lines:
-        quotations = [_bounded_text(body_lines[0], max_chars)]
+    if not quotations and bounded_body_text and max_quotations:
+        first_line = bounded_body_text.splitlines()[0]
+        quote = _bounded_text(first_line, max_chars)
+        if quote:
+            quotations = [quote]
     return quotations[:max_quotations]
 
 
@@ -437,7 +451,12 @@ def _clean_text(value: str) -> str:
 
 def _bounded_text(value: str, maximum: int) -> str:
     text = value[:maximum]
-    if len(value) > maximum and " " in text:
+    if (
+        len(value) > maximum
+        and maximum < len(value)
+        and not value[maximum].isspace()
+        and " " in text
+    ):
         text = text.rsplit(" ", 1)[0]
     return text.rstrip()
 

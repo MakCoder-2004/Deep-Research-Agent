@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from urllib.parse import quote
+
 from research_agent.errors import ErrorCategory, ExtractionError
 from research_agent.extraction.contracts import ExtractionConfig, FetchedPage
 from research_agent.extraction.fetcher import SafeFetcher
@@ -17,10 +19,15 @@ class JinaReaderFallback:
 
     async def read(self, url: str) -> FetchedPage:
         source = normalize_url(url)
+        await self._fetcher.validate_target(source)
         base = self._config.jina_reader_base_url.strip()
         try:
             base_url = validate_url(base)
-            endpoint = validate_url(base_url.rstrip("/") + "/" + source.url)
+            # The source URL is one opaque path segment.  In particular, its
+            # query and fragment delimiters must not become delimiters of the
+            # reader request itself.
+            encoded_source = quote(source.url, safe="")
+            endpoint = validate_url(base_url.rstrip("/") + "/" + encoded_source)
         except ExtractionError as exc:
             raise ExtractionError(
                 "The configured reader endpoint is not safe.",

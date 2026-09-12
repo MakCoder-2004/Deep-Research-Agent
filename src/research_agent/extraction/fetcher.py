@@ -29,15 +29,18 @@ from research_agent.extraction.transport import PinnedAsyncHTTPTransport, pinned
 from research_agent.tools._common import http_status_category
 
 REDIRECT_STATUSES = frozenset({301, 302, 303, 307, 308})
-_CREDENTIAL_HEADERS = frozenset(
+_SAFE_REDIRECT_HEADERS = frozenset(
     {
-        "authorization",
-        "proxy-authorization",
-        "cookie",
-        "api-key",
-        "x-api-key",
-        "x-auth-token",
-        "x-jina-api-key",
+        "accept",
+        "accept-encoding",
+        "accept-language",
+        "cache-control",
+        "if-match",
+        "if-modified-since",
+        "if-none-match",
+        "if-unmodified-since",
+        "range",
+        "user-agent",
     }
 )
 
@@ -136,10 +139,22 @@ class SafeFetcher:
             values = [target.hostname]
         return self._address_validator(values)
 
-    async def _fetch_robots(self, url: str) -> FetchedPage:
+    async def validate_target(self, url: object) -> SafeURL:
+        """Validate URL syntax and current DNS answers without making a request.
+
+        Reader-style fallbacks pass the source URL to another service.  That
+        service must not become an SSRF bypass, so it uses this same resolver
+        and address policy before making its own request.
+        """
+        target = normalize_url(url)
+        await self._resolve(target)
+        return target
+
+    async def _fetch_robots(self, url: str, user_agent: str) -> FetchedPage:
         return await self._fetch(
             url,
             allowed_mime_types=frozenset({"text/plain", "text/html"}),
+            headers={"User-Agent": user_agent},
             check_robots=False,
             max_response_bytes=self.config.robots_max_response_bytes,
             accepted_statuses=frozenset({401, 403, 404, 410}),
@@ -178,9 +193,7 @@ class SafeFetcher:
         requested = normalize_url(url)
         current = requested
         redirects = 0
-        request_headers = {"User-Agent": self.config.user_agent}
-        if headers:
-            request_headers.update(headers)
+        request_headers = _build_request_headers(self.config.user_agent, headers)
         # Never let HTTPX negotiate a compressed response: the extraction limit
         # is enforced on the bytes that arrive, before any decoder runs.
         request_headers["Accept-Encoding"] = "identity"
@@ -191,7 +204,7 @@ class SafeFetcher:
             if (
                 check_robots
                 and self.config.respect_robots_txt
-                and not await self._robots.allowed(current)
+                and not await self._robots.allowed(current, request_headers["User-Agent"])
             ):
                 raise ExtractionError(
                     "robots.txt disallows fetching this URL.",
@@ -233,7 +246,8 @@ class SafeFetcher:
                                     ) from exc
                                 raise
                             if next_url.origin != current.origin:
-                                request_headers = _strip_credentials(request_headers)
+                                request_headers = _safe_redirect_headers(request_headers)
+                            self._client.cookies.clear()
                             current = next_url
                             redirects += 1
                             continue
@@ -340,10 +354,39 @@ def _check_content_length(value: str | None, maximum: int) -> None:
         )
 
 
-def _strip_credentials(headers: Mapping[str, str]) -> dict[str, str]:
-    """Keep ordinary request headers while removing origin-bound credentials."""
+def _build_request_headers(
+    configured_user_agent: str, headers: Mapping[str, str] | None
+) -> dict[str, str]:
+    """Build request headers with one effective, validated User-Agent."""
+    result: dict[str, str] = {"User-Agent": configured_user_agent}
+    if headers:
+        for name, value in headers.items():
+            normalized_name = name.casefold()
+            if normalized_name == "user-agent":
+                _validate_user_agent(value)
+                result["User-Agent"] = value.strip()
+            elif normalized_name == "accept-encoding":
+                result["Accept-Encoding"] = value
+            else:
+                result[name] = value
+    # Never let a caller opt into compressed responses, which would move the
+    # response-size check after decompression.
+    result["Accept-Encoding"] = "identity"
+    return result
+
+
+def _validate_user_agent(value: str) -> None:
+    if not value.strip() or any(ord(char) < 32 or ord(char) == 127 for char in value):
+        raise ExtractionError(
+            "User-Agent must be non-empty and contain no control characters.",
+            category=ErrorCategory.INVALID_REQUEST,
+        )
+
+
+def _safe_redirect_headers(headers: Mapping[str, str]) -> dict[str, str]:
+    """Forward only headers explicitly safe for a different origin."""
     return {
-        name: value for name, value in headers.items() if name.casefold() not in _CREDENTIAL_HEADERS
+        name: value for name, value in headers.items() if name.casefold() in _SAFE_REDIRECT_HEADERS
     }
 
 

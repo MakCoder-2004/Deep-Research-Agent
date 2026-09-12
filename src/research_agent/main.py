@@ -41,6 +41,7 @@ def _collect_secrets(settings: Settings) -> list[str]:
         settings.stackexchange_api_key.get_secret_value(),
         settings.semantic_scholar_api_key.get_secret_value(),
         settings.ncbi_api_key.get_secret_value(),
+        settings.jina_reader_api_key.get_secret_value(),
         settings.langsmith_api_key.get_secret_value(),
     ]
     return [secret for secret in candidates if secret]
