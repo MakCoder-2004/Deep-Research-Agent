@@ -6,10 +6,11 @@ import asyncio
 import html
 import math
 import re
+from collections.abc import Mapping
 from datetime import UTC, datetime
 from email.utils import parsedate_to_datetime
 from typing import Any
-from urllib.parse import urlparse
+from urllib.parse import unquote, urlparse
 
 import httpx
 from pydantic import ValidationError
@@ -27,11 +28,14 @@ __all__ = [
     "clean_text",
     "coerce_url",
     "domain_of",
+    "doi_url",
     "http_status_category",
     "map_transport_error",
     "max_results_from_filters",
+    "normalize_doi",
     "parse_datetime",
     "parse_retry_after",
+    "quota_metadata_from_headers",
     "strip_html",
     "timeout_for_task",
     "truncate",
@@ -41,6 +45,7 @@ TOOL_USER_AGENT = "DeepResearchAgent/0.1 (research; +https://github.com/deep-res
 
 _TAG_RE = re.compile(r"<[^>]+>")
 _GDELT_RE = re.compile(r"^(\d{4})(\d{2})(\d{2})(?:T)?(\d{2})(\d{2})(\d{2})(?:Z)?$")
+_DOI_RE = re.compile(r"(?i)(?:https?://(?:dx\.)?doi\.org/|doi:\s*)?(10\.\d{4,9}/[^\s\"<>]+)")
 
 
 def category_for_status(status: int, body: str) -> ErrorCategory:
@@ -48,12 +53,11 @@ def category_for_status(status: int, body: str) -> ErrorCategory:
     lowered = body.lower()
     if "content_filter" in lowered or "content-filter" in lowered or "moderation" in lowered:
         return ErrorCategory.CONTENT_FILTERED
-    if status in (401, 403):
-        if status == 403 and "rate limit" in lowered:
-            return ErrorCategory.RATE_LIMITED
-        return ErrorCategory.AUTH
-    if status == 429:
+    rate_markers = ("rate limit", "rate_limit", "quota exceeded", "usage limit")
+    if status in (402, 429, 432, 433) or any(marker in lowered for marker in rate_markers):
         return ErrorCategory.RATE_LIMITED
+    if status in (401, 403):
+        return ErrorCategory.AUTH
     if status == 408:
         return ErrorCategory.TIMEOUT
     if status in (400, 404, 422):
@@ -82,7 +86,7 @@ def map_transport_error(exc: Exception) -> ErrorCategory:
 
 def parse_retry_after(headers: httpx.Headers | dict[str, str]) -> float | None:
     """Read a numeric or HTTP-date Retry-After header without exposing values."""
-    value = headers.get("retry-after")
+    value = _header_value(headers, "retry-after")
     if not value:
         return None
     try:
@@ -98,6 +102,94 @@ def parse_retry_after(headers: httpx.Headers | dict[str, str]) -> float | None:
     return max(0.0, seconds)
 
 
+def _header_value(headers: httpx.Headers | dict[str, str], name: str) -> str | None:
+    """Read a header case-insensitively from either supported header shape."""
+    value = headers.get(name)
+    if value is not None:
+        return value
+    lowered = name.lower()
+    for key, candidate in headers.items():
+        if str(key).lower() == lowered:
+            return candidate
+    return None
+
+
+def _safe_metadata_value(value: object) -> int | float | str | None:
+    """Keep provider quota values bounded and free of arbitrary response data."""
+    if isinstance(value, bool) or value is None:
+        return None
+    if isinstance(value, (int, float)):
+        try:
+            return value if math.isfinite(float(value)) else None
+        except OverflowError:
+            return None
+    text = str(value).strip()
+    if not text or len(text) > 100 or any(ord(char) < 32 for char in text):
+        return None
+    try:
+        number = float(text)
+    except (OverflowError, ValueError):
+        return None
+    return int(number) if number.is_integer() else number
+
+
+def quota_metadata_from_headers(headers: httpx.Headers | dict[str, str]) -> dict[str, object]:
+    """Extract standard rate-limit headers without retaining credentials or body data."""
+    metadata: dict[str, object] = {}
+    aliases = {
+        "x-ratelimit-limit": "limit",
+        "x-rate-limit-limit": "limit",
+        "ratelimit-limit": "limit",
+        "x-ratelimit-remaining": "remaining",
+        "x-rate-limit-remaining": "remaining",
+        "ratelimit-remaining": "remaining",
+        "x-ratelimit-reset": "reset",
+        "x-rate-limit-reset": "reset",
+        "ratelimit-reset": "reset",
+    }
+    for header, key in aliases.items():
+        value = _header_value(headers, header)
+        if value is None or key in metadata:
+            continue
+        safe = _safe_metadata_value(value)
+        if safe is not None:
+            metadata[key] = safe
+    retry_after = parse_retry_after(headers)
+    if retry_after is not None:
+        metadata["retry_after"] = retry_after
+    return metadata
+
+
+def normalize_doi(value: object) -> str | None:
+    """Return a canonical bare DOI, or ``None`` for values that are not DOIs."""
+    if not isinstance(value, str):
+        return None
+    text = unquote(value.strip()).strip("<>\"'")
+    parsed_url = urlparse(text)
+    if (
+        parsed_url.scheme
+        and parsed_url.hostname
+        and parsed_url.hostname.lower()
+        in {
+            "doi.org",
+            "dx.doi.org",
+            "www.doi.org",
+        }
+    ):
+        text = parsed_url.path.lstrip("/")
+    match = _DOI_RE.search(text)
+    if match is None:
+        return None
+    doi = match.group(1).rstrip(".,;:!?)]}").strip().lower()
+    return doi or None
+
+
+def doi_url(value: object) -> str | None:
+    """Return a resolver URL for a normalized DOI, or ``None`` if invalid."""
+    doi = normalize_doi(value)
+    return f"https://doi.org/{doi}" if doi else None
+
+
 def http_status_category(
     status: int,
     body: str,
@@ -105,7 +197,9 @@ def http_status_category(
 ) -> ErrorCategory:
     """Map status codes, including quota exhaustion reported in headers."""
     if headers is not None:
-        remaining = headers.get("x-ratelimit-remaining")
+        remaining = _header_value(headers, "x-ratelimit-remaining") or _header_value(
+            headers, "ratelimit-remaining"
+        )
         if remaining is not None and remaining.strip() == "0":
             return ErrorCategory.RATE_LIMITED
     return category_for_status(status, body)
@@ -133,6 +227,7 @@ class AsyncHttpTool:
         self._timeout_seconds = timeout_seconds
         self._client = client
         self._owned = client is None
+        self.quota_metadata: dict[str, object] = {}
 
     @property
     def name(self) -> str:
@@ -184,6 +279,7 @@ class AsyncHttpTool:
                 tool_name=self.name,
             ) from exc
 
+        self.quota_metadata = quota_metadata_from_headers(response.headers)
         statuses = (expected_status,) if isinstance(expected_status, int) else expected_status
         if response.status_code not in statuses:
             body = _response_text(response)
@@ -198,13 +294,29 @@ class AsyncHttpTool:
 
     def _json(self, response: httpx.Response, *, message: str) -> object:
         try:
-            return response.json()
-        except (TypeError, ValueError) as exc:
+            data = response.json()
+        except (TypeError, UnicodeError, ValueError) as exc:
             raise ToolError(
                 f"{message} returned invalid JSON.",
                 category=ErrorCategory.INVALID_REQUEST,
                 tool_name=self.name,
             ) from exc
+        if isinstance(data, Mapping):
+            for raw_key, target in (
+                ("quota_max", "limit"),
+                ("quota_remaining", "remaining"),
+                ("credits", "credits"),
+                ("backoff", "backoff"),
+            ):
+                safe = _safe_metadata_value(data.get(raw_key))
+                if safe is not None:
+                    self.quota_metadata[target] = safe
+            usage = data.get("usage")
+            if isinstance(usage, Mapping):
+                safe = _safe_metadata_value(usage.get("credits"))
+                if safe is not None:
+                    self.quota_metadata["credits"] = safe
+        return data
 
 
 def timeout_for_task(task: SearchTask | None, default: float) -> float:
@@ -368,7 +480,21 @@ def parse_datetime(value: object) -> datetime | None:
             if parsed_email.tzinfo is None
             else parsed_email.astimezone(UTC)
         )
-    for fmt in ("%Y-%m-%d", "%Y/%m/%d", "%Y-%m", "%Y", "%d %b %Y", "%b %d, %Y", "%Y.%m.%d"):
+    for fmt in (
+        "%Y-%m-%d",
+        "%Y/%m/%d",
+        "%Y-%m",
+        "%Y",
+        "%d %b %Y",
+        "%b %d, %Y",
+        "%Y.%m.%d",
+        "%Y %b %d",
+        "%Y %B %d",
+        "%Y %b",
+        "%Y %B",
+        "%b %Y",
+        "%B %Y",
+    ):
         try:
             return datetime.strptime(text, fmt).replace(tzinfo=UTC)
         except ValueError:
@@ -386,6 +512,7 @@ def build_hit(
     source_type: SourceType = SourceType.WEB,
     tool_name: str,
     score: float = 0.0,
+    doi: object = None,
 ) -> SearchHit | None:
     """Build a valid normalized hit; malformed individual results are skipped."""
     raw_url = coerce_url(url)
@@ -408,6 +535,7 @@ def build_hit(
             source_type=source_type,
             tool_name=tool_name,
             score=raw_score,
+            doi=normalize_doi(doi),
         )
     except (ValidationError, TypeError, ValueError):
         return None

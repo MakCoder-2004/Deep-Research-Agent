@@ -37,7 +37,7 @@ from research_agent.models.research import (
 from research_agent.models.urls import normalize_source_url
 from research_agent.observability.redaction import redact_mapping, redact_text
 from research_agent.ranking import canonicalize_hits, deduplicate_hits, rank_sources
-from research_agent.tools._common import max_results_from_filters, timeout_for_task
+from research_agent.tools._common import max_results_from_filters, normalize_doi, timeout_for_task
 from research_agent.tools.base import ResearchTool, ToolError
 
 if TYPE_CHECKING:
@@ -416,10 +416,11 @@ def normalize_hit(raw: object, tool_name: str) -> SearchHit | None:
             if canonical != data["url"] and canonical not in aliases:
                 aliases.append(canonical)
     data["aliases"] = aliases
-    for key in ("doi", "content_hash"):
-        value = data.get(key)
-        if value is not None and not isinstance(value, str):
-            data[key] = str(value)
+    if data.get("doi") is not None:
+        data["doi"] = normalize_doi(data["doi"])
+    value = data.get("content_hash")
+    if value is not None and not isinstance(value, str):
+        data["content_hash"] = str(value)
     try:
         return SearchHit.model_validate(data)
     except (ValidationError, TypeError, ValueError):

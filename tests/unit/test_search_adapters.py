@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import sys
 import types
 
@@ -38,6 +39,7 @@ from research_agent.tools._common import (
     clean_text,
     coerce_url,
     max_results_from_filters,
+    normalize_doi,
     parse_datetime,
     strip_html,
 )
@@ -77,8 +79,10 @@ async def test_tavily_and_brave_normalize_web_and_news_results() -> None:
                         "published_date": "2026-01-02",
                         "score": 0.91,
                     }
-                ]
+                ],
+                "usage": {"credits": 1},
             },
+            headers={"X-RateLimit-Limit": "1000", "X-RateLimit-Remaining": "999"},
         )
     )
     tool = TavilyTool(api_key="tavily-secret")
@@ -86,7 +90,14 @@ async def test_tavily_and_brave_normalize_web_and_news_results() -> None:
     assert tavily_route.called
     _assert_hit(hits[0], "tavily", SourceType.WEB)
     assert hits[0].score == 0.91
-    assert "tavily-secret" in tavily_route.calls[0].request.content.decode()
+    tavily_request = tavily_route.calls[0].request
+    assert tavily_request.headers["authorization"] == "Bearer tavily-secret"
+    assert "tavily-secret" not in tavily_request.content.decode()
+    assert json.loads(tavily_request.content)["topic"] == "general"
+    assert tool.quota_metadata == {"limit": 1000, "remaining": 999, "credits": 1}
+    news_hits = await tool.search(_task("tavily", source_category="news", max_results="1"))
+    assert json.loads(tavily_route.calls[1].request.content)["topic"] == "news"
+    assert news_hits[0].source_type is SourceType.NEWS
     assert await tool.health_check()
     await tool.aclose()
 
@@ -112,6 +123,9 @@ async def test_tavily_and_brave_normalize_web_and_news_results() -> None:
     hits = await brave.search(_task("brave_search", max_results="1"))
     assert brave_web.called
     _assert_hit(hits[0], "brave_search", SourceType.WEB)
+    assert brave_web.calls[0].request.headers["x-subscription-token"] == "brave-secret"
+    assert brave_web.calls[0].request.url.params["count"] == "1"
+    assert "channel" not in brave_web.calls[0].request.url.params
     assert await brave.health_check()
     await brave.aclose()
 
@@ -133,6 +147,8 @@ async def test_tavily_and_brave_normalize_web_and_news_results() -> None:
     brave = BraveTool(api_key="brave-secret")
     hits = await brave.search(_task("brave_search", channel="news", max_results="1"))
     assert brave_news.called
+    assert brave_news.calls[0].request.url.path.endswith("/news/search")
+    assert brave_news.calls[0].request.url.params["search_lang"] == "en"
     _assert_hit(hits[0], "brave_search", SourceType.NEWS)
     await brave.aclose()
 
@@ -185,6 +201,7 @@ async def test_academic_adapters_normalize_metadata() -> None:
                         "year": 2025,
                         "paperId": "paper-id",
                         "externalIds": {"DOI": "10.1000/test"},
+                        "publicationDate": "2025-04-05",
                     }
                 ]
             },
@@ -194,6 +211,8 @@ async def test_academic_adapters_normalize_metadata() -> None:
     hits = await semantic_tool.search(_task("semantic_scholar", max_results="1"))
     assert semantic.called
     _assert_hit(hits[0], "semantic_scholar", SourceType.PAPER)
+    assert hits[0].doi == "10.1000/test"
+    assert hits[0].published_at == parse_datetime("2025-04-05")
     assert await semantic_tool.health_check()
     await semantic_tool.aclose()
 
@@ -220,15 +239,18 @@ async def test_academic_adapters_normalize_metadata() -> None:
     hits = await crossref_tool.search(_task("crossref", max_results="1"))
     assert crossref.called
     _assert_hit(hits[0], "crossref", SourceType.ACADEMIC)
+    assert hits[0].doi == "10.1000/crossref"
+    assert hits[0].published_at == parse_datetime("2024-03-04")
     doi_route = respx.get("https://api.crossref.org/works/10.1000%2Fcrossref").mock(
         return_value=httpx.Response(
             200,
             json={"message": {"DOI": "10.1000/crossref", "title": ["DOI paper"]}},
         )
     )
-    doi_hits = await crossref_tool.search(_task("crossref", query="10.1000/crossref"))
+    doi_hits = await crossref_tool.search(_task("crossref", query="DOI:10.1000/CROSSREF"))
     assert doi_route.called
     assert doi_hits[0].title == "DOI paper"
+    assert doi_hits[0].doi == "10.1000/crossref"
     assert await crossref_tool.health_check()
     await crossref_tool.aclose()
 
@@ -236,12 +258,14 @@ async def test_academic_adapters_normalize_metadata() -> None:
         return_value=httpx.Response(
             200,
             text="""
-                <feed xmlns="http://www.w3.org/2005/Atom">
+                 <feed xmlns="http://www.w3.org/2005/Atom"
+                       xmlns:arxiv="http://arxiv.org/schemas/atom">
                   <entry>
                     <id>https://arxiv.org/abs/1234.5678</id>
                     <title>Preprint title</title>
                     <summary>Preprint summary</summary>
                     <published>2024-01-02T00:00:00Z</published>
+                    <arxiv:doi>10.1000/arxiv</arxiv:doi>
                   </entry>
                 </feed>
             """,
@@ -251,6 +275,7 @@ async def test_academic_adapters_normalize_metadata() -> None:
     hits = await arxiv_tool.search(_task("arxiv", max_results="1"))
     assert arxiv.called
     _assert_hit(hits[0], "arxiv", SourceType.PAPER)
+    assert hits[0].doi == "10.1000/arxiv"
     assert await arxiv_tool.health_check()
     await arxiv_tool.aclose()
 
@@ -278,6 +303,8 @@ async def test_academic_adapters_normalize_metadata() -> None:
     hits = await openalex_tool.search(_task("openalex", max_results="1"))
     assert openalex.called
     _assert_hit(hits[0], "openalex", SourceType.PAPER)
+    assert hits[0].doi == "10.1000/openalex"
+    assert hits[0].published_at == parse_datetime("2023-01-01")
     assert await openalex_tool.health_check()
     await openalex_tool.aclose()
 
@@ -285,7 +312,7 @@ async def test_academic_adapters_normalize_metadata() -> None:
 @pytest.mark.asyncio
 @respx.mock
 async def test_news_technical_and_medical_adapters() -> None:
-    gdelt = respx.get("https://api.gdeltproject.org/api/v2/doc").mock(
+    gdelt = respx.get("https://api.gdeltproject.org/api/v2/doc/doc").mock(
         return_value=httpx.Response(
             200,
             json={
@@ -304,6 +331,11 @@ async def test_news_technical_and_medical_adapters() -> None:
     gdelt_tool = GdeltTool()
     hits = await gdelt_tool.search(_task("gdelt", max_results="1"))
     assert gdelt.called
+    request = gdelt.calls[0].request
+    assert request.url.path == "/api/v2/doc/doc"
+    assert request.url.params["mode"] == "artlist"
+    assert request.url.params["format"] == "json"
+    assert request.url.params["maxrecords"] == "1"
     _assert_hit(hits[0], "gdelt", SourceType.NEWS)
     assert await gdelt_tool.health_check()
     await gdelt_tool.aclose()
@@ -388,6 +420,8 @@ async def test_news_technical_and_medical_adapters() -> None:
         return_value=httpx.Response(
             200,
             json={
+                "quota_max": 300,
+                "quota_remaining": 299,
                 "items": [
                     {
                         "link": "https://stackoverflow.com/questions/1",
@@ -395,7 +429,7 @@ async def test_news_technical_and_medical_adapters() -> None:
                         "body": "<p>Answer</p>",
                         "creation_date": 1700000000,
                     }
-                ]
+                ],
             },
         )
     )
@@ -403,6 +437,7 @@ async def test_news_technical_and_medical_adapters() -> None:
     hits = await stack_tool.search(_task("stack_exchange", max_results="1"))
     assert stack.called
     _assert_hit(hits[0], "stack_exchange", SourceType.TECHNICAL)
+    assert stack_tool.quota_metadata == {"limit": 300, "remaining": 299}
     respx.get("https://api.stackexchange.com/2.3/info").mock(
         return_value=httpx.Response(200, json={"items": []})
     )
@@ -423,6 +458,7 @@ async def test_news_technical_and_medical_adapters() -> None:
                         "fulljournalname": "Medical Journal",
                         "pubdate": "2022 Jan",
                         "sortfirstauthor": "Author",
+                        "articleids": [{"idtype": "doi", "value": "doi:10.1000/medical"}],
                     },
                 }
             },
@@ -432,6 +468,8 @@ async def test_news_technical_and_medical_adapters() -> None:
     hits = await pubmed.search(_task("pubmed", max_results="1"))
     assert esearch.called and esummary.called
     _assert_hit(hits[0], "pubmed", SourceType.MEDICAL)
+    assert hits[0].doi == "10.1000/medical"
+    assert hits[0].published_at == parse_datetime("2022 Jan")
     assert await pubmed.health_check()
     await pubmed.aclose()
 
@@ -446,6 +484,7 @@ async def test_news_technical_and_medical_adapters() -> None:
                             "title": "Europe paper",
                             "abstractText": "An abstract.",
                             "firstPublicationDate": "2021-05-06",
+                            "doi": "https://doi.org/10.1000/europe",
                             "journalInfo": {"journal": {"title": "European Journal"}},
                         }
                     ]
@@ -457,8 +496,58 @@ async def test_news_technical_and_medical_adapters() -> None:
     hits = await europe_tool.search(_task("europe_pmc", max_results="1"))
     assert europe.called
     _assert_hit(hits[0], "europe_pmc", SourceType.MEDICAL)
+    assert hits[0].doi == "10.1000/europe"
+    assert hits[0].published_at == parse_datetime("2021-05-06")
     assert await europe_tool.health_check()
     await europe_tool.aclose()
+
+
+@pytest.mark.asyncio
+@respx.mock
+async def test_provider_error_shapes_raise_normalized_tool_errors() -> None:
+    crossref = respx.get("https://api.crossref.org/works").mock(
+        return_value=httpx.Response(200, json={"message": {"status": "ok"}})
+    )
+    crossref_tool = CrossrefTool()
+    with pytest.raises(ToolError) as crossref_error:
+        await crossref_tool.search(_task("crossref"))
+    assert crossref.called
+    assert crossref_error.value.category is ErrorCategory.INVALID_REQUEST
+    await crossref_tool.aclose()
+
+    arxiv = respx.get("https://export.arxiv.org/api/query").mock(
+        return_value=httpx.Response(
+            200,
+            text="""
+                <feed xmlns="http://www.w3.org/2005/Atom">
+                  <entry>
+                    <id>http://arxiv.org/api/errors#bad_query</id>
+                    <title>Error</title>
+                    <summary>bad query</summary>
+                  </entry>
+                </feed>
+            """,
+        )
+    )
+    arxiv_tool = ArxivTool(min_interval_seconds=0)
+    with pytest.raises(ToolError) as arxiv_error:
+        await arxiv_tool.search(_task("arxiv"))
+    assert arxiv.called
+    assert arxiv_error.value.category is ErrorCategory.INVALID_REQUEST
+    await arxiv_tool.aclose()
+
+    pubmed = respx.get("https://eutils.ncbi.nlm.nih.gov/entrez/eutils/esearch.fcgi").mock(
+        return_value=httpx.Response(
+            200,
+            json={"esearchresult": {"ERROR": "invalid query"}},
+        )
+    )
+    pubmed_tool = PubMedTool(min_interval_seconds=0)
+    with pytest.raises(ToolError) as pubmed_error:
+        await pubmed_tool.search(_task("pubmed"))
+    assert pubmed.called
+    assert pubmed_error.value.category is ErrorCategory.INVALID_REQUEST
+    await pubmed_tool.aclose()
 
 
 @pytest.mark.asyncio
@@ -554,6 +643,17 @@ async def test_optional_http_adapters_share_contract() -> None:
 
 
 @pytest.mark.asyncio
+async def test_optional_http_adapters_disable_cleanly_without_configuration() -> None:
+    tools = (ExaTool(), SerpApiTool(), SearXNGTool())
+    for tool in tools:
+        with pytest.raises(ToolError) as excinfo:
+            await tool.search(_task(tool.name))
+        assert excinfo.value.category is ErrorCategory.UNAVAILABLE
+        assert await tool.health_check() is False
+        await tool.aclose()
+
+
+@pytest.mark.asyncio
 async def test_ddgs_adapter_normalizes_optional_local_results(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -584,7 +684,15 @@ async def test_ddgs_adapter_normalizes_optional_local_results(
 @respx.mock
 async def test_tool_errors_include_retry_metadata_and_cancelled_error_propagates() -> None:
     route = respx.post("https://api.tavily.com/search").mock(
-        return_value=httpx.Response(429, text="slow down", headers={"Retry-After": "2"})
+        return_value=httpx.Response(
+            429,
+            text="api_key=secret-not-logged; slow down",
+            headers={
+                "Retry-After": "2",
+                "X-RateLimit-Limit": "100",
+                "X-RateLimit-Remaining": "0",
+            },
+        )
     )
     tool = TavilyTool(api_key="secret-not-logged")
     with pytest.raises(ToolError) as excinfo:
@@ -594,6 +702,8 @@ async def test_tool_errors_include_retry_metadata_and_cancelled_error_propagates
     assert excinfo.value.http_status == 429
     assert excinfo.value.retry_after == 2.0
     assert "secret-not-logged" not in str(excinfo.value)
+    assert tool.quota_metadata == {"limit": 100, "remaining": 0, "retry_after": 2.0}
+    assert "secret-not-logged" not in route.calls[0].request.content.decode()
     await tool.aclose()
 
     async def cancelled(request: httpx.Request) -> httpx.Response:
@@ -618,6 +728,9 @@ def test_shared_normalization_helpers_and_settings() -> None:
     assert parse_datetime(1700000000) is not None
     assert parse_datetime(True) is None
     assert parse_datetime("not a date") is None
+    assert normalize_doi("https://doi.org/10.1000/ABC.") == "10.1000/abc"
+    assert normalize_doi("doi: 10.1000/ABC") == "10.1000/abc"
+    assert normalize_doi("not a doi") is None
     assert max_results_from_filters({"max_results": "100"}, maximum=10) == 10
     assert max_results_from_filters({"max_results": "nope"}) == 5
     hit = build_hit(

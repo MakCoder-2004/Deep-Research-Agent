@@ -12,7 +12,9 @@ from research_agent.tools._common import (
     AsyncHttpTool,
     build_hit,
     clean_text,
+    doi_url,
     max_results_from_filters,
+    normalize_doi,
     parse_datetime,
     truncate,
 )
@@ -41,11 +43,11 @@ class EuropePMCTool(AsyncHttpTool):
         return "europe_pmc"
 
     def _result_url(self, item: dict[str, object]) -> str:
-        doi = clean_text(item.get("doi"))
+        doi = normalize_doi(item.get("doi"))
         pmcid = clean_text(item.get("pmcid"))
         pmid = clean_text(item.get("pmid") or item.get("id"))
         if doi:
-            return f"https://doi.org/{doi}"
+            return doi_url(doi) or ""
         if pmcid:
             return f"https://europepmc.org/articles/{pmcid}"
         if pmid:
@@ -66,6 +68,7 @@ class EuropePMCTool(AsyncHttpTool):
             if not isinstance(item, dict):
                 continue
             abstract = clean_text(item.get("abstractText"))
+            doi = normalize_doi(item.get("doi"))
             journal_info = item.get("journalInfo")
             journal = ""
             if isinstance(journal_info, dict):
@@ -73,15 +76,24 @@ class EuropePMCTool(AsyncHttpTool):
                 if isinstance(journal_node, dict):
                     journal = clean_text(journal_node.get("title"))
             publisher = journal or clean_text(item.get("journalTitle")) or "Europe PMC"
+            published_at = parse_datetime(item.get("firstPublicationDate"))
+            if published_at is None:
+                journal_info = item.get("journalInfo")
+                if isinstance(journal_info, dict):
+                    published_at = parse_datetime(
+                        journal_info.get("printPublicationDate")
+                        or journal_info.get("journalIssueDate")
+                    )
             hit = build_hit(
                 url=self._result_url(item),
                 title=item.get("title"),
                 snippet=truncate(abstract),
                 publisher=publisher,
-                published_at=parse_datetime(item.get("firstPublicationDate")),
+                published_at=published_at,
                 source_type=SourceType.MEDICAL,
                 tool_name=self.name,
                 score=max(0.0, 1.0 - index * 0.1),
+                doi=doi,
             )
             if hit is not None:
                 hits.append(hit)

@@ -53,7 +53,7 @@ class SerpApiTool(AsyncHttpTool):
         if not self._api_key.get_secret_value():
             raise ToolError(
                 "SerpApi key is not configured.",
-                category=ErrorCategory.AUTH,
+                category=ErrorCategory.UNAVAILABLE,
                 tool_name=self.name,
             )
         limit = max_results_from_filters(task.filters, default=5, maximum=10)

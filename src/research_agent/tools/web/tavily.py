@@ -45,19 +45,27 @@ class TavilyTool(AsyncHttpTool):
     def _payload(self, task: SearchTask, limit: int) -> dict[str, object]:
         filters = {str(k).lower(): v for k, v in task.filters.items()}
         depth = filters.get("search_depth", "basic")
-        if depth not in ("basic", "advanced"):
+        if depth not in ("basic", "advanced", "fast", "ultra-fast"):
             depth = "basic"
+        topic = (
+            "news"
+            if filters.get("channel", "").strip().lower() == "news"
+            or filters.get("source_category", "").strip().lower() == "news"
+            else "general"
+        )
         body: dict[str, object] = {
-            "api_key": self._api_key.get_secret_value(),
             "query": task.query,
             "search_depth": depth,
             "max_results": limit,
+            "topic": topic,
             "include_answer": False,
             "include_raw_content": False,
         }
         time_range = filters.get("time_range", "")
-        if time_range in ("day", "week", "month", "year"):
+        if time_range in ("day", "week", "month", "year", "d", "w", "m", "y"):
             body["time_range"] = time_range
+        if topic == "news":
+            body["include_published_date"] = True
         for key in ("include_domains", "exclude_domains"):
             values = [part.strip() for part in filters.get(key, "").split(",") if part.strip()]
             if values:
@@ -78,12 +86,20 @@ class TavilyTool(AsyncHttpTool):
                 tool_name=self.name,
             )
         limit = max_results_from_filters(task.filters, default=5, maximum=10)
+        filters = {str(k).lower(): str(v) for k, v in task.filters.items()}
+        is_news = filters.get("channel", "").strip().lower() == "news" or (
+            filters.get("source_category", "").strip().lower() == "news"
+        )
         response = await self._request(
             task,
             "POST",
             f"{self._base_url}/search",
             error_message="Tavily request",
-            headers={"Content-Type": "application/json", "User-Agent": TOOL_USER_AGENT},
+            headers={
+                "Authorization": f"Bearer {self._api_key.get_secret_value()}",
+                "Content-Type": "application/json",
+                "User-Agent": TOOL_USER_AGENT,
+            },
             json=self._payload(task, limit),
         )
         data = self._json(response, message="Tavily")
@@ -108,7 +124,7 @@ class TavilyTool(AsyncHttpTool):
                 snippet=item.get("content", ""),
                 publisher=item.get("publisher"),
                 published_at=parse_datetime(item.get("published_date")),
-                source_type=SourceType.WEB,
+                source_type=SourceType.NEWS if is_news else SourceType.WEB,
                 tool_name=self.name,
                 score=score,
             )
@@ -125,11 +141,15 @@ class TavilyTool(AsyncHttpTool):
                 "POST",
                 f"{self._base_url}/search",
                 error_message="Tavily health request",
-                headers={"Content-Type": "application/json", "User-Agent": TOOL_USER_AGENT},
+                headers={
+                    "Authorization": f"Bearer {self._api_key.get_secret_value()}",
+                    "Content-Type": "application/json",
+                    "User-Agent": TOOL_USER_AGENT,
+                },
                 json={
-                    "api_key": self._api_key.get_secret_value(),
                     "query": "health check",
                     "max_results": 1,
+                    "topic": "general",
                     "include_answer": False,
                 },
             )

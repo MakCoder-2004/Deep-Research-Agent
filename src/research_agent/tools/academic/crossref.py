@@ -16,7 +16,9 @@ from research_agent.tools._common import (
     AsyncHttpTool,
     build_hit,
     clean_text,
+    doi_url,
     max_results_from_filters,
+    normalize_doi,
 )
 from research_agent.tools.base import ToolError
 
@@ -34,11 +36,15 @@ def _crossref_date(item: dict[str, Any]) -> datetime | None:
         parts = node.get("date-parts")
         if not isinstance(parts, list) or not parts or not isinstance(parts[0], list):
             continue
-        numbers = [
-            number
-            for number in parts[0]
-            if isinstance(number, int) and not isinstance(number, bool)
-        ]
+        numbers: list[int] = []
+        for number in parts[0]:
+            if isinstance(number, int) and not isinstance(number, bool):
+                parsed = number
+            elif isinstance(number, str) and number.strip().isdigit():
+                parsed = int(number.strip())
+            else:
+                continue
+            numbers.append(parsed)
         if not numbers:
             continue
         try:
@@ -55,9 +61,20 @@ def _crossref_date(item: dict[str, Any]) -> datetime | None:
 
 def _doi_query(query: str) -> str:
     value = query.strip()
-    for prefix in ("https://doi.org/", "http://doi.org/", "doi:"):
-        if value.lower().startswith(prefix):
-            return value[len(prefix) :].strip()
+    normalized = normalize_doi(value)
+    if normalized is not None and (
+        value.lower().startswith("10.")
+        or value.lower().startswith(
+            (
+                "https://doi.org/",
+                "http://doi.org/",
+                "https://dx.doi.org/",
+                "http://dx.doi.org/",
+                "doi:",
+            )
+        )
+    ):
+        return normalized
     return value
 
 
@@ -99,15 +116,19 @@ class CrossrefTool(AsyncHttpTool):
                 category=ErrorCategory.INVALID_REQUEST,
                 tool_name=self.name,
             )
-        query = _doi_query(task.query)
         limit = max_results_from_filters(task.filters, default=5, maximum=10)
+        doi_query = _doi_query(task.query)
+        is_doi_lookup = doi_query.lower().startswith("10.") and "/" in doi_query
         params: dict[str, str] = {
-            "select": "DOI,title,publisher,URL,published,issued,created,container-title",
+            "select": (
+                "DOI,title,publisher,URL,published,published-print,published-online,"
+                "issued,created,container-title"
+            ),
         }
         if self._mailto:
             params["mailto"] = self._mailto
-        if query.lower().startswith("10."):
-            url = f"{self._base_url}/works/{quote(query, safe='')}"
+        if is_doi_lookup:
+            url = f"{self._base_url}/works/{quote(doi_query, safe='')}"
         else:
             url = f"{self._base_url}/works"
             params.update({"query": task.query, "rows": str(limit)})
@@ -127,6 +148,12 @@ class CrossrefTool(AsyncHttpTool):
                 category=ErrorCategory.INVALID_REQUEST,
                 tool_name=self.name,
             )
+        if not is_doi_lookup and not isinstance(message.get("items"), list):
+            raise ToolError(
+                "Crossref returned an unexpected payload.",
+                category=ErrorCategory.INVALID_REQUEST,
+                tool_name=self.name,
+            )
         raw_results = self._items(data)
         hits: list[SearchHit] = []
         for index, item in enumerate(raw_results[:limit]):
@@ -136,8 +163,8 @@ class CrossrefTool(AsyncHttpTool):
             title = titles[0] if isinstance(titles, list) and titles else ""
             containers = item.get("container-title")
             snippet = containers[0] if isinstance(containers, list) and containers else ""
-            doi = clean_text(item.get("DOI"))
-            page_url = clean_text(item.get("URL")) or (f"https://doi.org/{doi}" if doi else "")
+            doi = normalize_doi(item.get("DOI")) or (doi_query if is_doi_lookup else None)
+            page_url = clean_text(item.get("URL")) or doi_url(doi) or ""
             hit = build_hit(
                 url=page_url,
                 title=title,
@@ -147,6 +174,7 @@ class CrossrefTool(AsyncHttpTool):
                 source_type=SourceType.ACADEMIC,
                 tool_name=self.name,
                 score=max(0.0, 1.0 - index * 0.1),
+                doi=doi,
             )
             if hit is not None:
                 hits.append(hit)

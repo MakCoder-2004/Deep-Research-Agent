@@ -66,6 +66,9 @@ class BraveTool(AsyncHttpTool):
             value = filters.get(key, "").strip()
             if value and (key == "country" or value in ("pd", "pw", "pm", "py")):
                 params[key] = value
+        offset = filters.get("offset", "").strip()
+        if offset.isdigit() and int(offset) <= 9:
+            params["offset"] = offset
         return params
 
     async def search(self, task: SearchTask) -> list[SearchHit]:
@@ -80,7 +83,10 @@ class BraveTool(AsyncHttpTool):
                 "Brave API key is not configured.", category=ErrorCategory.AUTH, tool_name=self.name
             )
         limit = max_results_from_filters(task.filters, default=5, maximum=10)
-        channel = str(task.filters.get("channel", "")).strip().lower()
+        filters = {str(k).lower(): str(v) for k, v in task.filters.items()}
+        channel = filters.get("channel", "").strip().lower()
+        if not channel and filters.get("source_category", "").strip().lower() == "news":
+            channel = "news"
         is_news = channel == "news"
         response = await self._request(
             task,
@@ -111,7 +117,9 @@ class BraveTool(AsyncHttpTool):
             publisher = ""
             profile = item.get("profile")
             if isinstance(profile, dict):
-                publisher = clean_text(profile.get("name"))
+                publisher = clean_text(
+                    profile.get("long_name") or profile.get("name") or profile.get("short_name")
+                )
             meta = item.get("meta_url")
             if isinstance(meta, dict) and not publisher:
                 publisher = clean_text(meta.get("hostname")) or clean_text(meta.get("netloc"))
@@ -121,9 +129,14 @@ class BraveTool(AsyncHttpTool):
             hit = build_hit(
                 url=raw_url,
                 title=item.get("title"),
-                snippet=item.get("description", ""),
+                snippet=" ".join(
+                    [
+                        clean_text(item.get("description")),
+                        clean_text(item.get("extra_snippets")),
+                    ]
+                ).strip(),
                 publisher=publisher or None,
-                published_at=parse_datetime(item.get("page_age") or item.get("age")),
+                published_at=parse_datetime(item.get("age") or item.get("page_age")),
                 source_type=SourceType.NEWS if is_news else SourceType.WEB,
                 tool_name=self.name,
                 score=max(0.0, 1.0 - index * 0.1),

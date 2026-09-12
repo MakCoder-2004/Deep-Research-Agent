@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from datetime import UTC, datetime
 from typing import Any
 
 import httpx
@@ -14,7 +15,9 @@ from research_agent.tools._common import (
     AsyncHttpTool,
     build_hit,
     clean_text,
+    doi_url,
     max_results_from_filters,
+    normalize_doi,
     parse_datetime,
     truncate,
 )
@@ -105,16 +108,22 @@ class OpenAlexTool(AsyncHttpTool):
                 source = location.get("source")
                 if isinstance(source, dict):
                     publisher = clean_text(source.get("display_name"))
-            page_url = clean_text(work.get("doi")) or landing or clean_text(work.get("id"))
+            doi = normalize_doi(work.get("doi"))
+            page_url = doi_url(doi) or landing or clean_text(work.get("id"))
+            published_at = parse_datetime(work.get("publication_date"))
+            year = work.get("publication_year")
+            if published_at is None and isinstance(year, int) and 1500 <= year <= 2100:
+                published_at = datetime(year, 1, 1, tzinfo=UTC)
             hit = build_hit(
                 url=page_url,
                 title=work.get("title"),
                 snippet=truncate(reconstruct_abstract(work.get("abstract_inverted_index"))),
                 publisher=publisher or None,
-                published_at=parse_datetime(work.get("publication_date")),
+                published_at=published_at,
                 source_type=SourceType.PAPER,
                 tool_name=self.name,
                 score=max(0.0, 1.0 - index * 0.1),
+                doi=doi,
             )
             if hit is not None:
                 hits.append(hit)

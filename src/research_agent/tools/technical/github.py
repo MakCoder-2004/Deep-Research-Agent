@@ -196,8 +196,13 @@ class GithubTool(AsyncHttpTool):
                 f"{self._base_url}/repos/{full_name}/releases",
                 {"per_page": str(per_repo)},
             )
-            if isinstance(release_data, list):
-                hits.extend(self._release_hits(release_data, full_name, login))
+            if not isinstance(release_data, list):
+                raise ToolError(
+                    "GitHub returned an unexpected payload.",
+                    category=ErrorCategory.INVALID_REQUEST,
+                    tool_name=self.name,
+                )
+            hits.extend(self._release_hits(release_data, full_name, login))
             if len(hits) >= limit:
                 break
         return hits[:limit]

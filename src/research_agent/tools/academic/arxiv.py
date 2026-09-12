@@ -17,6 +17,7 @@ from research_agent.tools._common import (
     build_hit,
     clean_text,
     max_results_from_filters,
+    normalize_doi,
     parse_datetime,
     timeout_for_task,
     truncate,
@@ -28,12 +29,18 @@ __all__ = ["ArxivTool", "reset_arxiv_throttle_for_tests"]
 _DEFAULT_BASE_URL = "https://export.arxiv.org/api"
 _MIN_INTERVAL_SECONDS = 3.0
 _ATOM_NS = "http://www.w3.org/2005/Atom"
+_ARXIV_NS = "http://arxiv.org/schemas/atom"
 _throttle_lock = asyncio.Lock()
 _last_call_monotonic = 0.0
 
 
 def _atom_text(entry: ET.Element, tag: str) -> str:
     node = entry.find(f"{{{_ATOM_NS}}}{tag}")
+    return clean_text(node.text if node is not None else "")
+
+
+def _namespaced_text(entry: ET.Element, namespace: str, tag: str) -> str:
+    node = entry.find(f"{{{namespace}}}{tag}")
     return clean_text(node.text if node is not None else "")
 
 
@@ -73,10 +80,28 @@ class ArxivTool(AsyncHttpTool):
                 category=ErrorCategory.INVALID_REQUEST,
                 tool_name=self.name,
             ) from exc
+        if root.tag != f"{{{_ATOM_NS}}}feed":
+            raise ToolError(
+                "arXiv returned an unexpected payload.",
+                category=ErrorCategory.INVALID_REQUEST,
+                tool_name=self.name,
+            )
         hits: list[SearchHit] = []
         for index, entry in enumerate(root.findall(f"{{{_ATOM_NS}}}entry")[:limit]):
             page_url = _atom_text(entry, "id")
             title = " ".join(_atom_text(entry, "title").split())
+            if page_url.startswith("http://arxiv.org/api/errors#") or title.casefold() == "error":
+                raise ToolError(
+                    "arXiv returned an API error.",
+                    category=ErrorCategory.INVALID_REQUEST,
+                    tool_name=self.name,
+                )
+            doi = normalize_doi(_namespaced_text(entry, _ARXIV_NS, "doi"))
+            if doi is None:
+                for link in entry.findall(f"{{{_ATOM_NS}}}link"):
+                    if link.attrib.get("title", "").casefold() == "doi":
+                        doi = normalize_doi(link.attrib.get("href"))
+                        break
             hit = build_hit(
                 url=page_url,
                 title=title,
@@ -86,6 +111,7 @@ class ArxivTool(AsyncHttpTool):
                 source_type=SourceType.PAPER,
                 tool_name=self.name,
                 score=max(0.0, 1.0 - index * 0.1),
+                doi=doi,
             )
             if hit is not None:
                 hits.append(hit)

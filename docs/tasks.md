@@ -181,7 +181,7 @@ Tasks are ordered by dependency inside each milestone. Task IDs are stable refer
 
 ### Exit Gate
 
-- [x] **M3.GATE** English and Arabic test queries return normalized, deduplicated, ranked source candidates without live quota consumption in CI. (Close-out: `execute_plan` now exposes stable ranked hits and source candidates after canonicalization and deduplication, with merged tool provenance and post-ranking IDs.)
+- [ ] **M3.GATE** English and Arabic test queries return normalized, deduplicated, ranked source candidates without live quota consumption in CI. (Close-out: `execute_plan` now exposes stable ranked hits and source candidates after canonicalization and deduplication, with merged tool provenance and post-ranking IDs.)
 
 ## Milestone 4: Safe Extraction
 

@@ -16,13 +16,17 @@ from research_agent.tools._common import (
     build_hit,
     clean_text,
     max_results_from_filters,
+    normalize_doi,
+    parse_datetime,
 )
 from research_agent.tools.base import ToolError
 
 __all__ = ["SemanticScholarTool"]
 
 _DEFAULT_BASE_URL = "https://api.semanticscholar.org/graph/v1"
-_FIELDS = "title,abstract,url,authors,year,venue,externalIds,openAccessPdf,tldr"
+_FIELDS = (
+    "title,abstract,url,authors,year,venue,journal,publicationDate,externalIds,openAccessPdf,tldr"
+)
 
 
 class SemanticScholarTool(AsyncHttpTool):
@@ -80,7 +84,7 @@ class SemanticScholarTool(AsyncHttpTool):
             if not isinstance(item, dict):
                 continue
             external = item.get("externalIds")
-            doi = clean_text(external.get("DOI")) if isinstance(external, dict) else ""
+            doi = normalize_doi(external.get("DOI")) if isinstance(external, dict) else None
             pdf = item.get("openAccessPdf")
             pdf_url = clean_text(pdf.get("url")) if isinstance(pdf, dict) else ""
             direct = clean_text(item.get("url"))
@@ -96,21 +100,28 @@ class SemanticScholarTool(AsyncHttpTool):
             snippet = clean_text(tldr.get("text")) if isinstance(tldr, dict) else ""
             if not snippet:
                 snippet = clean_text(item.get("abstract"))
+            published_at = parse_datetime(item.get("publicationDate"))
             year = item.get("year")
-            published_at = (
-                datetime(year, 1, 1, tzinfo=UTC)
-                if isinstance(year, int) and 1500 <= year <= 2100
-                else None
+            if published_at is None and isinstance(year, int) and 1500 <= year <= 2100:
+                published_at = datetime(year, 1, 1, tzinfo=UTC)
+            journal = item.get("journal")
+            publisher = (
+                clean_text(journal.get("name"))
+                if isinstance(journal, dict)
+                else clean_text(item.get("venue"))
             )
+            if not publisher:
+                publisher = clean_text(item.get("venue"))
             hit = build_hit(
                 url=page_url,
                 title=item.get("title"),
                 snippet=snippet,
-                publisher=item.get("venue"),
+                publisher=publisher,
                 published_at=published_at,
                 source_type=SourceType.PAPER,
                 tool_name=self.name,
                 score=max(0.0, 1.0 - index * 0.1),
+                doi=doi,
             )
             if hit is not None:
                 hits.append(hit)

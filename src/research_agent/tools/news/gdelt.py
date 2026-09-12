@@ -38,6 +38,14 @@ class GdeltTool(AsyncHttpTool):
     def name(self) -> str:
         return "gdelt"
 
+    def _api_url(self) -> str:
+        """Return the GDELT DOC 2.0 article-list endpoint."""
+        if self._base_url.endswith("/doc/doc"):
+            return self._base_url
+        if self._base_url.endswith("/doc"):
+            return f"{self._base_url}/doc"
+        return f"{self._base_url}/doc/doc"
+
     async def search(self, task: SearchTask) -> list[SearchHit]:
         if not task.query.strip():
             raise ToolError(
@@ -47,22 +55,32 @@ class GdeltTool(AsyncHttpTool):
             )
         limit = max_results_from_filters(task.filters, default=5, maximum=10)
         filters = {str(k).lower(): str(v) for k, v in task.filters.items()}
-        mode = filters.get("mode", "artlist").strip() or "artlist"
-        if mode not in ("artlist", "timelinevol", "tonechart", "wordcloud"):
-            mode = "artlist"
+        # This adapter normalizes article records, so non-list visualization
+        # modes cannot produce a valid SearchHit response.
         params = {
             "query": task.query,
-            "mode": mode,
+            "mode": "artlist",
             "maxrecords": str(min(limit, 100)),
             "format": "json",
-            "sort": filters.get("sort", "datedesc").strip() or "datedesc",
+            "sort": filters.get("sort", "datedesc").strip().lower() or "datedesc",
         }
-        if filters.get("timespan", "").strip():
-            params["timespan"] = filters["timespan"].strip()
+        if params["sort"] not in {"datedesc", "dateasc", "toneasc", "tonedesc", "hybridrel"}:
+            params["sort"] = "datedesc"
+        for key in (
+            "timespan",
+            "startdatetime",
+            "enddatetime",
+            "sourcelang",
+            "sourcecountry",
+            "domain",
+        ):
+            value = filters.get(key, "").strip()
+            if value:
+                params[key] = value
         response = await self._request(
             task,
             "GET",
-            f"{self._base_url}/doc",
+            self._api_url(),
             error_message="GDELT request",
             headers={"Accept": "application/json", "User-Agent": TOOL_USER_AGENT},
             params=params,
@@ -99,7 +117,7 @@ class GdeltTool(AsyncHttpTool):
             await self._request(
                 None,
                 "GET",
-                f"{self._base_url}/doc",
+                self._api_url(),
                 error_message="GDELT health request",
                 headers={"Accept": "application/json", "User-Agent": TOOL_USER_AGENT},
                 params={

@@ -17,6 +17,7 @@ from research_agent.tools._common import (
     build_hit,
     clean_text,
     max_results_from_filters,
+    normalize_doi,
     parse_datetime,
     timeout_for_task,
     truncate,
@@ -105,6 +106,12 @@ class PubMedTool(AsyncHttpTool):
                 category=ErrorCategory.INVALID_REQUEST,
                 tool_name=self.name,
             )
+        if result.get("error") or result.get("ERROR"):
+            raise ToolError(
+                "PubMed returned an API error.",
+                category=ErrorCategory.INVALID_REQUEST,
+                tool_name=self.name,
+            )
         ordered_ids = result.get("uids")
         uids = [clean_text(uid) for uid in ordered_ids] if isinstance(ordered_ids, list) else ids
         hits: list[SearchHit] = []
@@ -112,13 +119,32 @@ class PubMedTool(AsyncHttpTool):
             item = result.get(uid)
             if not isinstance(item, dict):
                 continue
-            publication_date = clean_text(item.get("pubdate"))
+            publication_date = next(
+                (
+                    clean_text(item.get(field))
+                    for field in ("epubdate", "pubdate", "sortpubdate")
+                    if clean_text(item.get(field))
+                ),
+                "",
+            )
             title = clean_text(item.get("title"))
             journal = clean_text(item.get("fulljournalname") or item.get("source"))
             authors = item.get("sortfirstauthor") or item.get("authors")
             author = clean_text(authors)
             snippet = " by ".join(part for part in (author, journal) if part)
             url = f"https://pubmed.ncbi.nlm.nih.gov/{uid}/" if uid else ""
+            doi: str | None = None
+            article_ids = item.get("articleids")
+            if isinstance(article_ids, list):
+                for article_id in article_ids:
+                    if not isinstance(article_id, dict):
+                        continue
+                    if clean_text(article_id.get("idtype")).lower() == "doi":
+                        doi = normalize_doi(article_id.get("value"))
+                        if doi:
+                            break
+            if doi is None:
+                doi = normalize_doi(item.get("elocationid"))
             hit = build_hit(
                 url=url,
                 title=title,
@@ -128,6 +154,7 @@ class PubMedTool(AsyncHttpTool):
                 source_type=SourceType.MEDICAL,
                 tool_name=self.name,
                 score=max(0.0, 1.0 - index * 0.1),
+                doi=doi,
             )
             if hit is not None:
                 hits.append(hit)
@@ -147,12 +174,20 @@ class PubMedTool(AsyncHttpTool):
             self._params(term=task.query, retmax=str(limit), sort="relevance"),
         )
         search_result = search_data.get("esearchresult") if isinstance(search_data, dict) else None
-        idlist = search_result.get("idlist") if isinstance(search_result, dict) else None
-        ids = (
-            [clean_text(uid) for uid in idlist if clean_text(uid)]
-            if isinstance(idlist, list)
-            else []
-        )
+        if not isinstance(search_result, dict) or search_result.get("ERROR"):
+            raise ToolError(
+                "PubMed returned an unexpected payload.",
+                category=ErrorCategory.INVALID_REQUEST,
+                tool_name=self.name,
+            )
+        idlist = search_result.get("idlist")
+        if not isinstance(idlist, list):
+            raise ToolError(
+                "PubMed returned an unexpected payload.",
+                category=ErrorCategory.INVALID_REQUEST,
+                tool_name=self.name,
+            )
+        ids = [clean_text(uid) for uid in idlist if clean_text(uid)]
         if not ids:
             return []
         summary_data = await self._get(
