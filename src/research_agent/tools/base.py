@@ -2,12 +2,12 @@
 
 from __future__ import annotations
 
-from typing import Protocol
+from typing import Protocol, runtime_checkable
 
 from research_agent.errors import AgentError, ErrorCategory
 from research_agent.models.research import SearchHit, SearchTask
 
-__all__ = ["ResearchTool", "ToolError"]
+__all__ = ["ErrorCategory", "ResearchTool", "ToolError"]
 
 
 class ToolError(AgentError):
@@ -24,8 +24,15 @@ class ToolError(AgentError):
         self.tool_name = tool_name
 
 
+@runtime_checkable
 class ResearchTool(Protocol):
-    """Replaceable async search-tool contract."""
+    """Replaceable async search-tool contract.
+
+    Implementations MUST propagate ``asyncio.CancelledError`` and honor
+    caller deadlines (M3.25/M9.7). Routing metadata (domains, cost, limits)
+    lives in the M3 tools/router layer; adapters expose identity via
+    ``name`` and provenance via ``SearchHit.tool_name``.
+    """
 
     @property
     def name(self) -> str: ...
