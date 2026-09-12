@@ -8,6 +8,9 @@ from typing import Protocol, runtime_checkable
 
 from pydantic import BaseModel, ConfigDict, Field, SecretStr, field_validator, model_validator
 
+from research_agent.errors import ExtractionError
+from research_agent.extraction.security import normalize_url
+
 
 class ExtractionConfig(BaseModel):
     """Limits and feature flags for one extraction service instance.
@@ -23,6 +26,7 @@ class ExtractionConfig(BaseModel):
     read_timeout_seconds: float = Field(default=20.0, gt=0)
     write_timeout_seconds: float = Field(default=5.0, gt=0)
     pool_timeout_seconds: float = Field(default=5.0, gt=0)
+    total_timeout_seconds: float = Field(default=60.0, gt=0, le=300.0)
     dns_timeout_seconds: float = Field(default=5.0, gt=0)
     max_redirects: int = Field(default=3, ge=0, le=20)
     max_response_bytes: int = Field(default=2_000_000, ge=1)
@@ -43,6 +47,7 @@ class ExtractionConfig(BaseModel):
     allowed_mime_types: frozenset[str] = frozenset({"text/html", "application/xhtml+xml"})
     robots_max_response_bytes: int = Field(default=512_000, ge=1)
     robots_cache_ttl_seconds: float | None = Field(default=3_600.0, gt=0)
+    robots_cache_max_entries: int = Field(default=256, ge=1, le=10_000)
     jina_reader_enabled: bool = False
     jina_reader_base_url: str = "https://r.jina.ai/"
     jina_reader_api_key: SecretStr = SecretStr("")
@@ -56,6 +61,17 @@ class ExtractionConfig(BaseModel):
         if not normalized:
             raise ValueError("user_agent must not be blank.")
         return normalized
+
+    @field_validator("jina_reader_base_url")
+    @classmethod
+    def _validate_jina_reader_base_url(cls, value: str) -> str:
+        try:
+            endpoint = normalize_url(value.strip())
+        except ExtractionError as exc:
+            raise ValueError("jina_reader_base_url must be a safe HTTPS URL.") from exc
+        if endpoint.scheme != "https":
+            raise ValueError("jina_reader_base_url must use HTTPS.")
+        return endpoint.url
 
     @field_validator("allowed_mime_types", mode="before")
     @classmethod
@@ -86,11 +102,16 @@ class ExtractionConfig(BaseModel):
     @classmethod
     def from_settings(cls, settings: object) -> ExtractionConfig:
         """Build extraction limits from the application's Pydantic settings."""
+        configured_total_timeout = float(
+            getattr(settings, "extraction_total_timeout_seconds", 60.0)
+        )
+        job_timeout = float(getattr(settings, "job_timeout_seconds", configured_total_timeout))
         return cls(
             connect_timeout_seconds=getattr(settings, "extraction_connect_timeout_seconds", 5.0),
             read_timeout_seconds=getattr(settings, "extraction_read_timeout_seconds", 20.0),
             write_timeout_seconds=getattr(settings, "extraction_write_timeout_seconds", 5.0),
             pool_timeout_seconds=getattr(settings, "extraction_pool_timeout_seconds", 5.0),
+            total_timeout_seconds=min(configured_total_timeout, job_timeout),
             dns_timeout_seconds=getattr(settings, "extraction_dns_timeout_seconds", 5.0),
             max_redirects=getattr(settings, "max_redirects", 3),
             max_response_bytes=getattr(settings, "max_response_bytes", 2_000_000),
@@ -99,8 +120,12 @@ class ExtractionConfig(BaseModel):
             heading_max_chars=getattr(settings, "heading_max_chars", 500),
             title_max_chars=getattr(settings, "title_max_chars", 500),
             metadata_max_chars=getattr(settings, "metadata_max_chars", 300),
+            max_quotations=getattr(settings, "max_quotations", 5),
+            quotation_max_chars=getattr(settings, "quotation_max_chars", 280),
+            max_links=getattr(settings, "max_links", 100),
             respect_robots_txt=getattr(settings, "respect_robots_txt", True),
             robots_cache_ttl_seconds=getattr(settings, "robots_cache_ttl_seconds", 3_600.0),
+            robots_cache_max_entries=getattr(settings, "robots_cache_max_entries", 256),
             jina_reader_enabled=getattr(settings, "jina_reader_enabled", False),
             jina_reader_base_url=getattr(settings, "jina_reader_base_url", "https://r.jina.ai/"),
             jina_reader_api_key=SecretStr(

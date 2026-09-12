@@ -22,12 +22,25 @@ class JinaReaderFallback:
         await self._fetcher.validate_target(source)
         base = self._config.jina_reader_base_url.strip()
         try:
-            base_url = validate_url(base)
+            base_target = normalize_url(base)
+            if base_target.scheme != "https":
+                raise ExtractionError(
+                    "The configured reader endpoint must use HTTPS.",
+                    category=ErrorCategory.INVALID_REQUEST,
+                    url=source.url,
+                )
+            base_url = base_target.url
             # The source URL is one opaque path segment.  In particular, its
             # query and fragment delimiters must not become delimiters of the
             # reader request itself.
             encoded_source = quote(source.url, safe="")
             endpoint = validate_url(base_url.rstrip("/") + "/" + encoded_source)
+            if not endpoint.casefold().startswith("https://"):
+                raise ExtractionError(
+                    "The configured reader endpoint must use HTTPS.",
+                    category=ErrorCategory.INVALID_REQUEST,
+                    url=source.url,
+                )
         except ExtractionError as exc:
             raise ExtractionError(
                 "The configured reader endpoint is not safe.",

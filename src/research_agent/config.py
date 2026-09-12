@@ -9,6 +9,7 @@ from __future__ import annotations
 import re
 from pathlib import Path
 from typing import Annotated, Any, Literal
+from urllib.parse import urlsplit
 
 from pydantic import BeforeValidator, Field, SecretStr, field_validator, model_validator
 from pydantic_settings import BaseSettings, NoDecode, SettingsConfigDict
@@ -218,6 +219,9 @@ class Settings(BaseSettings):
     heading_max_chars: int = Field(default=500, alias="HEADING_MAX_CHARS", ge=1, le=2000)
     title_max_chars: int = Field(default=500, alias="TITLE_MAX_CHARS", ge=1, le=2000)
     metadata_max_chars: int = Field(default=300, alias="METADATA_MAX_CHARS", ge=1, le=2000)
+    max_quotations: int = Field(default=5, alias="MAX_QUOTATIONS", ge=0, le=50)
+    quotation_max_chars: int = Field(default=280, alias="QUOTATION_MAX_CHARS", ge=40, le=2000)
+    max_links: int = Field(default=100, alias="MAX_LINKS", ge=0, le=1000)
     reader_context_chars: int = Field(
         default=40000, alias="READER_CONTEXT_CHARS", ge=4000, le=500000
     )
@@ -247,6 +251,9 @@ class Settings(BaseSettings):
     extraction_pool_timeout_seconds: float = Field(
         default=5.0, alias="EXTRACTION_POOL_TIMEOUT_SECONDS", gt=0
     )
+    extraction_total_timeout_seconds: float = Field(
+        default=60.0, alias="EXTRACTION_TOTAL_TIMEOUT_SECONDS", gt=0, le=300
+    )
     extraction_dns_timeout_seconds: float = Field(
         default=5.0, alias="EXTRACTION_DNS_TIMEOUT_SECONDS", gt=0
     )
@@ -257,6 +264,9 @@ class Settings(BaseSettings):
     respect_robots_txt: bool = Field(default=True, alias="RESPECT_ROBOTS_TXT")
     robots_cache_ttl_seconds: float | None = Field(
         default=3_600.0, alias="ROBOTS_CACHE_TTL_SECONDS", gt=0
+    )
+    robots_cache_max_entries: int = Field(
+        default=256, alias="ROBOTS_CACHE_MAX_ENTRIES", ge=1, le=10_000
     )
     jina_reader_enabled: bool = Field(default=False, alias="JINA_READER_ENABLED")
     jina_reader_base_url: str = Field(default="https://r.jina.ai/", alias="JINA_READER_BASE_URL")
@@ -354,6 +364,17 @@ class Settings(BaseSettings):
     @classmethod
     def _parse_search_limits(cls, value: Any) -> Any:
         return _parse_concurrency_limits(value)
+
+    @field_validator("jina_reader_base_url")
+    @classmethod
+    def _validate_jina_reader_base_url(cls, value: str) -> str:
+        raw = value.strip()
+        parts = urlsplit(raw)
+        if parts.scheme.casefold() != "https" or not parts.netloc:
+            raise ValueError("JINA_READER_BASE_URL must be an HTTPS URL.")
+        if parts.username is not None or parts.password is not None:
+            raise ValueError("JINA_READER_BASE_URL must not contain credentials.")
+        return raw
 
     @model_validator(mode="after")
     def _check_context_budgets(self) -> Settings:

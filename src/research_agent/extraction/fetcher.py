@@ -190,6 +190,35 @@ class SafeFetcher:
         max_response_bytes: int,
         accepted_statuses: frozenset[int],
     ) -> FetchedPage:
+        try:
+            async with asyncio.timeout(self.config.total_timeout_seconds):
+                return await self._fetch_with_deadline(
+                    url,
+                    allowed_mime_types=allowed_mime_types,
+                    headers=headers,
+                    check_robots=check_robots,
+                    max_response_bytes=max_response_bytes,
+                    accepted_statuses=accepted_statuses,
+                )
+        except asyncio.CancelledError:
+            raise
+        except TimeoutError as exc:
+            raise ExtractionError(
+                "The source request exceeded its total timeout.",
+                category=ErrorCategory.TIMEOUT,
+                url=str(url),
+            ) from exc
+
+    async def _fetch_with_deadline(
+        self,
+        url: object,
+        *,
+        allowed_mime_types: frozenset[str] | set[str],
+        headers: Mapping[str, str] | None,
+        check_robots: bool,
+        max_response_bytes: int,
+        accepted_statuses: frozenset[int],
+    ) -> FetchedPage:
         requested = normalize_url(url)
         current = requested
         redirects = 0
@@ -297,6 +326,12 @@ class SafeFetcher:
                 raise
             except ExtractionError:
                 raise
+            except TimeoutError as exc:
+                raise ExtractionError(
+                    "The source request exceeded its total timeout.",
+                    category=ErrorCategory.TIMEOUT,
+                    url=current.url,
+                ) from exc
             except httpx.TimeoutException as exc:
                 raise ExtractionError(
                     "The source request timed out.",

@@ -18,6 +18,7 @@ from pydantic import (
     model_validator,
 )
 
+from research_agent.errors import ExtractionError
 from research_agent.models import (
     ClaimType,
     CriticOutcome,
@@ -298,6 +299,15 @@ class SourceDocument(BaseModel):
     @model_validator(mode="after")
     def _validate_contract(self, info: ValidationInfo) -> SourceDocument:
         require_tz_aware(self.published_at, "published_at")
+        for field_name, value in (
+            ("url", self.url),
+            ("requested_url", self.requested_url),
+            ("fetch_requested_url", self.fetch_requested_url),
+            ("fetch_final_url", self.fetch_final_url),
+            *[("links", link) for link in self.links],
+        ):
+            if value is not None:
+                _validate_document_url(str(value), field_name)
         context = info.context if isinstance(info.context, dict) else {}
         max_source_chars = _document_limit(context, "max_source_chars", 20_000)
         max_headings = _document_limit(context, "max_headings", 100)
@@ -335,7 +345,21 @@ class SourceDocument(BaseModel):
 
 def _document_limit(context: dict[object, object], name: str, default: int) -> int:
     value = context.get(name, default)
-    return value if isinstance(value, int) and value >= 0 else default
+    if not isinstance(value, int) or value < 0:
+        return default
+    if name == "max_source_chars":
+        return min(value, 20_000)
+    return value
+
+
+def _validate_document_url(value: str, field_name: str) -> None:
+    """Apply synchronous URL policy without attempting DNS from Pydantic."""
+    from research_agent.extraction.security import normalize_url
+
+    try:
+        normalize_url(value)
+    except ExtractionError as exc:
+        raise ValueError(f"{field_name} must be a safe HTTP(S) URL.") from exc
 
 
 class EvidenceClaim(BaseModel):

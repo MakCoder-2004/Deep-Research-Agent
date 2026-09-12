@@ -79,6 +79,34 @@ _TEXT_BOILERPLATE_RE = re.compile(
     r"related articles|sign[ -]?up|subscribe)\b",
     re.IGNORECASE,
 )
+_BLOCK_TEXT_TAGS = frozenset(
+    {
+        "article",
+        "blockquote",
+        "dd",
+        "div",
+        "dt",
+        "figcaption",
+        "figure",
+        "h1",
+        "h2",
+        "h3",
+        "h4",
+        "h5",
+        "h6",
+        "li",
+        "main",
+        "p",
+        "pre",
+        "section",
+        "td",
+        "th",
+        "tr",
+    }
+)
+_JSON_LD_MAX_CHARS = 200_000
+_JSON_LD_MAX_NODES = 10_000
+_JSON_LD_MAX_DEPTH = 50
 
 
 class HTMLExtractor:
@@ -107,19 +135,43 @@ class HTMLExtractor:
             ) from exc
 
         title = _first_value(
-            _meta_values(soup, names=("title",), properties=("og:title", "twitter:title"))
+            _meta_values(
+                soup,
+                names=("title", "citation_title", "dc.title", "dcterms.title"),
+                properties=("og:title", "twitter:title"),
+            )
+            + _itemprop_values(soup, ("headline", "name"))
             + [_tag_text(soup.find("title")), _tag_text(soup.find("h1")), source_title]
         )
         author = _first_value(
-            _meta_values(soup, names=("author", "byline"), properties=("article:author",))
+            _meta_values(
+                soup,
+                names=(
+                    "author",
+                    "byline",
+                    "citation_author",
+                    "dc.creator",
+                    "dcterms.creator",
+                ),
+                properties=("article:author",),
+            )
+            + _itemprop_values(soup, ("author", "creator"))
             + [_tag_text(_author_tag(soup))]
         )
         publisher = _first_value(
             _meta_values(
                 soup,
-                names=("publisher", "source", "application-name"),
+                names=(
+                    "publisher",
+                    "source",
+                    "application-name",
+                    "citation_publisher",
+                    "dc.publisher",
+                    "dcterms.publisher",
+                ),
                 properties=("og:site_name",),
             )
+            + _itemprop_values(soup, ("publisher",))
             + [source_publisher]
         )
         published_at = (
@@ -127,10 +179,29 @@ class HTMLExtractor:
                 _first_value(
                     _meta_values(
                         soup,
-                        names=("date", "pubdate", "publishdate", "datepublished"),
+                        names=(
+                            "date",
+                            "pubdate",
+                            "publishdate",
+                            "datepublished",
+                            "publication_date",
+                            "dc.date",
+                            "dc.date.issued",
+                            "dcterms.date",
+                            "dcterms.issued",
+                            "issued",
+                            "citation_date",
+                            "citation_online_date",
+                            "citation_print_date",
+                            "citation_publication_date",
+                        ),
                         properties=("article:published_time", "og:published_time"),
                     )
-                    + [_tag_attr(soup.find("time"), "datetime")]
+                    + _itemprop_values(
+                        soup,
+                        ("datepublished", "datecreated", "dateissued", "date"),
+                    )
+                    + [_tag_attr(tag, "datetime") for tag in soup.find_all("time")]
                 )
             )
             or source_published_at
@@ -168,7 +239,7 @@ class HTMLExtractor:
         return SourceDocument.model_validate(
             {
                 "source_id": source_id,
-                "url": _as_http_url(source_url or page.final_url),
+                "url": _as_http_url(source_url or page.requested_url),
                 "requested_url": _as_http_url(source_url or page.requested_url),
                 "title": _bounded_text(_clean_text(title or ""), self.config.title_max_chars),
                 "author": _optional_bounded(author, self.config.metadata_max_chars),
@@ -270,8 +341,17 @@ def _content_root(soup: BeautifulSoup) -> Tag | BeautifulSoup:
 
 
 def _text_lines(root: Tag | BeautifulSoup) -> list[str]:
-    raw = root.get_text("\n", strip=True)
-    candidates = [_clean_text(line) for line in raw.splitlines()]
+    candidates: list[str] = []
+    block_elements = [tag for tag in root.find_all(_BLOCK_TEXT_TAGS) if isinstance(tag, Tag)]
+    for element in block_elements:
+        if element.find(_BLOCK_TEXT_TAGS) is None:
+            text = _clean_text(element.get_text(" ", strip=True))
+            if text:
+                candidates.append(text)
+    if not candidates:
+        text = _clean_text(root.get_text(" ", strip=True))
+        if text:
+            candidates.append(text)
     candidates = [line for line in candidates if line]
     counts = Counter(candidates)
     lines: list[str] = []
@@ -286,6 +366,8 @@ def _text_lines(root: Tag | BeautifulSoup) -> list[str]:
 
 
 def _extract_links(root: Tag | BeautifulSoup, base_url: str, maximum: int) -> list[HttpUrl]:
+    if maximum <= 0:
+        return []
     links: list[HttpUrl] = []
     seen: set[str] = set()
     for anchor in root.find_all("a", href=True):
@@ -317,10 +399,10 @@ def _extract_quotations(
     quotations: list[str] = []
     for element in root.find_all(["p", "blockquote", "li"]):
         text = _clean_text(element.get_text(" ", strip=True))
-        if not text or text not in bounded_body_text:
+        quote = _bounded_body_quote(text, bounded_body_text, max_chars)
+        if not quote:
             continue
-        quote = _bounded_text(text, max_chars)
-        if quote and quote in bounded_body_text and quote not in quotations:
+        if quote not in quotations:
             quotations.append(quote)
         if len(quotations) >= max_quotations:
             break
@@ -330,6 +412,26 @@ def _extract_quotations(
         if quote:
             quotations = [quote]
     return quotations[:max_quotations]
+
+
+def _bounded_body_quote(text: str, bounded_body_text: str, maximum: int) -> str:
+    """Return only the portion of an element that exists in bounded body text."""
+    if not text or not bounded_body_text:
+        return ""
+    if text in bounded_body_text:
+        return _bounded_text(text, maximum)
+    # The body may end in the middle of a paragraph.  Prefer the longest
+    # prefix still present in the bounded body rather than quoting discarded
+    # content or falling back to a markup-fragmented text node.
+    probe_length = min(len(text), len(bounded_body_text), 64)
+    start = bounded_body_text.find(text[:probe_length])
+    if start >= 0:
+        available = min(len(text), len(bounded_body_text) - start)
+        prefix = text[:available].rstrip()
+        quote = _bounded_text(prefix, maximum)
+        if quote and quote in bounded_body_text:
+            return quote
+    return ""
 
 
 def _meta_values(
@@ -351,12 +453,34 @@ def _meta_values(
     return values
 
 
+def _itemprop_values(soup: BeautifulSoup, properties: tuple[str, ...]) -> list[str]:
+    wanted = {value.casefold() for value in properties}
+    values: list[str] = []
+    for tag in soup.find_all(True):
+        itemprop = tag.get("itemprop")
+        if not isinstance(itemprop, (str, list, tuple)):
+            continue
+        tokens = (
+            itemprop.split() if isinstance(itemprop, str) else [str(value) for value in itemprop]
+        )
+        if not wanted.intersection(token.casefold() for token in tokens):
+            continue
+        value = tag.get("content") or tag.get("datetime") or _tag_text(tag)
+        cleaned = _clean_text(str(value))
+        if cleaned:
+            values.append(cleaned)
+    return values
+
+
 def _json_ld_metadata(soup: BeautifulSoup) -> dict[str, Any]:
     output: dict[str, Any] = {}
     for script in soup.find_all("script", attrs={"type": "application/ld+json"}):
+        raw = script.string or script.get_text()
+        if len(raw) > _JSON_LD_MAX_CHARS:
+            continue
         try:
-            value = json.loads(script.string or script.get_text())
-        except (TypeError, ValueError, json.JSONDecodeError):
+            value = json.loads(raw)
+        except (TypeError, ValueError, json.JSONDecodeError, RecursionError):
             continue
         for item in _json_objects(value):
             for key in ("headline", "name", "author", "publisher", "datePublished"):
@@ -366,28 +490,40 @@ def _json_ld_metadata(soup: BeautifulSoup) -> dict[str, Any]:
 
 
 def _json_objects(value: Any) -> list[dict[str, Any]]:
-    if isinstance(value, dict):
-        output = [value]
-        for nested in value.values():
-            output.extend(_json_objects(nested))
-        return output
-    if isinstance(value, list):
-        objects: list[dict[str, Any]] = []
-        for nested in value:
-            objects.extend(_json_objects(nested))
-        return objects
-    return []
+    output: list[dict[str, Any]] = []
+    pending: list[tuple[Any, int]] = [(value, 0)]
+    visited = 0
+    while pending and visited < _JSON_LD_MAX_NODES:
+        current, depth = pending.pop()
+        visited += 1
+        if depth > _JSON_LD_MAX_DEPTH:
+            continue
+        if isinstance(current, dict):
+            output.append(current)
+            pending.extend((nested, depth + 1) for nested in reversed(list(current.values())))
+        elif isinstance(current, list):
+            pending.extend((nested, depth + 1) for nested in reversed(current))
+    return output
 
 
 def _named_value(value: Any) -> str | None:
-    if isinstance(value, dict):
-        return _text_value(value.get("name"))
-    if isinstance(value, list):
-        for item in value:
-            result = _named_value(item)
+    pending = [value]
+    visited = 0
+    while pending and visited < _JSON_LD_MAX_NODES:
+        current = pending.pop()
+        visited += 1
+        if isinstance(current, dict):
+            name = _text_value(current.get("name"))
+            if name:
+                return name
+            pending.extend(reversed(list(current.values())))
+        elif isinstance(current, list):
+            pending.extend(reversed(current))
+        else:
+            result = _text_value(current)
             if result:
                 return result
-    return _text_value(value)
+    return None
 
 
 def _parse_date(value: str | None) -> datetime | None:
@@ -400,6 +536,16 @@ def _parse_date(value: str | None) -> datetime | None:
         try:
             parsed = parsedate_to_datetime(text)
         except (TypeError, ValueError, OverflowError):
+            for date_format in ("%Y/%m/%d", "%Y%m%d", "%Y-%m", "%Y"):
+                try:
+                    parsed = datetime.strptime(text, date_format)
+                    break
+                except ValueError:
+                    parsed = None
+            if parsed is not None:
+                if parsed.tzinfo is None:
+                    parsed = parsed.replace(tzinfo=UTC)
+                return parsed
             match = _DATE_RE.search(text)
             if not match:
                 return None
@@ -407,6 +553,8 @@ def _parse_date(value: str | None) -> datetime | None:
                 parsed = datetime.fromisoformat(match.group(0))
             except ValueError:
                 return None
+    if parsed is None:
+        return None
     if parsed.tzinfo is None:
         parsed = parsed.replace(tzinfo=UTC)
     return parsed

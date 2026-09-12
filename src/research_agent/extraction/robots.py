@@ -40,6 +40,7 @@ class RobotsPolicy:
         cached = self._cache.get(key)
         now = time.monotonic()
         ttl = self._config.robots_cache_ttl_seconds
+        self._prune_cache(now)
         if cached is not None and (ttl is None or now - cached.fetched_at < ttl):
             return cached.allows(effective_user_agent, target.url)
         host_for_url = f"[{target.hostname}]" if ":" in target.hostname else target.hostname
@@ -69,5 +70,20 @@ class RobotsPolicy:
         else:
             policy = _CachedPolicy(parser=None, allow_all=False, fetched_at=now)
         if ttl is not None:
+            self._prune_cache(now, reserve_slot=True)
             self._cache[key] = policy
         return policy.allows(effective_user_agent, target.url)
+
+    def _prune_cache(self, now: float, *, reserve_slot: bool = False) -> None:
+        ttl = self._config.robots_cache_ttl_seconds
+        if ttl is not None:
+            expired = [key for key, policy in self._cache.items() if now - policy.fetched_at >= ttl]
+            for key in expired:
+                self._cache.pop(key, None)
+        overflow = len(self._cache) - self._config.robots_cache_max_entries
+        if reserve_slot:
+            overflow += 1
+        if overflow > 0:
+            oldest = sorted(self._cache, key=lambda key: self._cache[key].fetched_at)[:overflow]
+            for key in oldest:
+                self._cache.pop(key, None)

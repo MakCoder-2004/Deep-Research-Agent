@@ -129,6 +129,41 @@ async def test_timeout_size_and_mime_failures_are_normalized() -> None:
 
 
 @pytest.mark.asyncio
+async def test_drip_feed_response_hits_the_total_timeout() -> None:
+    class DripStream(httpx.AsyncByteStream):
+        async def __aiter__(self):  # type: ignore[no-untyped-def]
+            yield b"<main><p>first chunk</p>"
+            await asyncio.sleep(1)
+            yield b"second chunk</p></main>"
+
+        async def aclose(self) -> None:
+            return None
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            200,
+            headers={"content-type": "text/html"},
+            stream=DripStream(),
+        )
+
+    fetcher = SafeFetcher(
+        ExtractionConfig(
+            total_timeout_seconds=0.01,
+            read_timeout_seconds=20.0,
+            respect_robots_txt=False,
+        ),
+        test_transport=_transport(handler),
+        resolver=FakeResolver(),
+    )
+    try:
+        with pytest.raises(ExtractionError) as raised:
+            await fetcher.fetch("https://example.com/drip")
+    finally:
+        await fetcher.close()
+    assert raised.value.category is ErrorCategory.TIMEOUT
+
+
+@pytest.mark.asyncio
 async def test_robots_denial_prevents_source_request() -> None:
     requests: list[str] = []
 
@@ -268,6 +303,36 @@ async def test_robots_policy_cache_expires_when_configured() -> None:
     finally:
         await fetcher.close()
     assert robots_requests == 2
+
+
+@pytest.mark.asyncio
+async def test_robots_policy_cache_is_bounded_by_origin_count() -> None:
+    robots_requests = 0
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal robots_requests
+        if request.url.path == "/robots.txt":
+            robots_requests += 1
+            return httpx.Response(
+                200,
+                headers={"content-type": "text/plain"},
+                content=b"User-agent: *\nAllow: /\n",
+            )
+        return httpx.Response(200, headers={"content-type": "text/html"}, content=b"<p>ok</p>")
+
+    fetcher = SafeFetcher(
+        ExtractionConfig(robots_cache_max_entries=1),
+        test_transport=_transport(handler),
+        resolver=FakeResolver(),
+    )
+    try:
+        await fetcher.fetch("https://one.example/page")
+        await fetcher.fetch("https://two.example/page")
+        await fetcher.fetch("https://one.example/again")
+    finally:
+        await fetcher.close()
+    assert robots_requests == 3
+    assert len(fetcher._robots._cache) <= 1
 
 
 @pytest.mark.asyncio
@@ -435,6 +500,114 @@ def test_html_cleanup_metadata_quotes_links_and_bounds() -> None:
     assert document.bytes_read == len(html)
 
 
+def test_inline_markup_is_preserved_in_bounded_quotation_evidence() -> None:
+    page = FetchedPage(
+        requested_url="https://example.com/article",
+        final_url="https://example.com/article",
+        status_code=200,
+        content_type="text/html",
+        content=(
+            b"<main><p>Alpha <strong>bold</strong> gamma</p>"
+            b"<p>Discarded paragraph outside the body bound.</p></main>"
+        ),
+        bytes_read=0,
+        fetch_ms=1,
+    )
+    document = HTMLExtractor(ExtractionConfig(max_source_chars=len("Alpha bold gamma"))).extract(
+        page, source_id=1
+    )
+    assert document.body_text == "Alpha bold gamma"
+    assert document.quotations == ["Alpha bold gamma"]
+
+
+def test_low_level_extractor_uses_requested_url_for_document_identity() -> None:
+    page = FetchedPage(
+        requested_url="https://example.com/original",
+        final_url="https://other.example/final",
+        status_code=200,
+        content_type="text/html",
+        content=b"<main><p>Redirected evidence.</p></main>",
+        bytes_read=0,
+        fetch_ms=1,
+    )
+    document = HTMLExtractor().extract(page, source_id=1)
+    assert str(document.url) == "https://example.com/original"
+    assert str(document.requested_url) == "https://example.com/original"
+    assert str(document.fetch_final_url) == "https://other.example/final"
+
+
+def test_common_metadata_formats_are_extracted_and_bounded() -> None:
+    page = FetchedPage(
+        requested_url="https://example.com/article",
+        final_url="https://example.com/article",
+        status_code=200,
+        content_type="text/html",
+        content=(
+            b"<html><head>"
+            b'<meta itemprop="author" content="Ada Example">'
+            b'<meta name="DC.publisher" content="Example Press">'
+            b'<meta name="citation_publication_date" content="2025/01/02">'
+            b"</head><body><main><p>Evidence.</p></main></body></html>"
+        ),
+        bytes_read=0,
+        fetch_ms=1,
+    )
+    document = HTMLExtractor(ExtractionConfig(metadata_max_chars=5)).extract(page, source_id=1)
+    assert document.author == "Ada"
+    assert document.publisher == "Examp"
+    assert document.published_at is not None
+    assert document.published_at.date().isoformat() == "2025-01-02"
+
+
+def test_dublin_core_creator_is_used_as_author() -> None:
+    page = FetchedPage(
+        requested_url="https://example.com/article",
+        final_url="https://example.com/article",
+        status_code=200,
+        content_type="text/html",
+        content=(
+            b'<meta name="dcterms.creator" content="Dublin Author"><main><p>Evidence.</p></main>'
+        ),
+        bytes_read=0,
+        fetch_ms=1,
+    )
+    document = HTMLExtractor().extract(page, source_id=1)
+    assert document.author == "Dublin Author"
+
+
+def test_max_links_zero_does_not_retain_a_link() -> None:
+    page = FetchedPage(
+        requested_url="https://example.com/article",
+        final_url="https://example.com/article",
+        status_code=200,
+        content_type="text/html",
+        content=b'<main><p>Evidence.</p><a href="/related">Related</a></main>',
+        bytes_read=0,
+        fetch_ms=1,
+    )
+    document = HTMLExtractor(ExtractionConfig(max_links=0)).extract(page, source_id=1)
+    assert document.links == []
+
+
+def test_deeply_nested_json_ld_is_ignored_without_failing_extraction() -> None:
+    nested = '{"nested":' * 1000 + '"value"' + "}" * 1000
+    page = FetchedPage(
+        requested_url="https://example.com/article",
+        final_url="https://example.com/article",
+        status_code=200,
+        content_type="text/html",
+        content=(
+            '<html><head><script type="application/ld+json">'
+            + nested
+            + "</script></head><body><main><p>Safe evidence.</p></main></body></html>"
+        ).encode(),
+        bytes_read=0,
+        fetch_ms=1,
+    )
+    document = HTMLExtractor().extract(page, source_id=1)
+    assert document.body_text == "Safe evidence."
+
+
 def test_quotations_are_selected_only_from_the_bounded_body() -> None:
     page = FetchedPage(
         requested_url="https://example.com/article",
@@ -507,6 +680,32 @@ def test_source_document_rejects_unbounded_or_unlinked_evidence() -> None:
             url="https://example.com/article",
             body_text="bounded body",
             quotations=["not in the body"],
+        )
+
+
+@pytest.mark.parametrize(
+    "url",
+    [
+        "https://user:password@example.com/article",
+        "http://127.0.0.1/article",
+        "http://[::1]/article",
+        "http://169.254.169.254/latest",
+    ],
+)
+def test_source_document_rejects_credentials_and_unsafe_literal_ips(url: str) -> None:
+    with pytest.raises(ValidationError):
+        SourceDocument(source_id=1, url=url, body_text="bounded body")
+
+
+def test_source_document_hard_character_cap_cannot_be_raised_by_context() -> None:
+    with pytest.raises(ValidationError, match="body_text"):
+        SourceDocument.model_validate(
+            {
+                "source_id": 1,
+                "url": "https://example.com/article",
+                "body_text": "x" * 20_001,
+            },
+            context={"max_source_chars": 100_000},
         )
 
 
