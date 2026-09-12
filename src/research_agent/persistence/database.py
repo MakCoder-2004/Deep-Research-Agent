@@ -2,12 +2,15 @@
 
 from __future__ import annotations
 
+import logging
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 from datetime import UTC, datetime
 from pathlib import Path
 
 import aiosqlite
+
+logger = logging.getLogger(__name__)
 
 SCHEMA_SQL = """
 PRAGMA journal_mode=WAL;
@@ -117,13 +120,25 @@ END;
 async def connect(db_path: Path | str) -> aiosqlite.Connection:
     """Open a SQLite connection with WAL mode and foreign keys enabled."""
     path = Path(db_path)
-    if str(path) != ":memory:" and path.parent != Path("."):
-        path.parent.mkdir(parents=True, exist_ok=True)
+    if str(path) != ":memory:" and not str(path).startswith("file:") and path.parent != Path("."):
+        try:
+            path.parent.mkdir(parents=True, exist_ok=True)
+        except OSError as exc:
+            raise OSError(f"Cannot create database directory {path.parent}: {exc}") from exc
+        if path.is_dir():  # noqa: ASYNC240 - startup path check, tiny and rare
+            raise OSError(f"Database path {path} is a directory, not a file.")
     conn = await aiosqlite.connect(str(path))
-    conn.row_factory = aiosqlite.Row
-    await conn.execute("PRAGMA journal_mode=WAL;")
-    await conn.execute("PRAGMA foreign_keys=ON;")
-    await conn.execute("PRAGMA busy_timeout=5000;")
+    try:
+        conn.row_factory = aiosqlite.Row
+        await conn.execute("PRAGMA journal_mode=WAL;")
+        await conn.execute("PRAGMA foreign_keys=ON;")
+        await conn.execute("PRAGMA busy_timeout=5000;")
+    except Exception:
+        try:
+            await conn.close()
+        except Exception:  # noqa: S110, BLE001 - original error takes precedence
+            logger.debug("db connection close failed after connect error")
+        raise
     return conn
 
 

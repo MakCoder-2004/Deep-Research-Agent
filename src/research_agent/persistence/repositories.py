@@ -3,14 +3,18 @@
 from __future__ import annotations
 
 import json
+import logging
 from collections.abc import Mapping
 from datetime import UTC, datetime, timedelta
+from pathlib import Path
 from typing import Any
 
 import aiosqlite
 
 from research_agent.models import Depth, Domain, JobState, Language, RiskLevel
 from research_agent.models.reports import Source
+
+logger = logging.getLogger(__name__)
 
 
 def _now_iso() -> str:
@@ -124,7 +128,8 @@ class SessionRepository:
                 loaded = json.loads(row["interactions"])
                 if isinstance(loaded, list):
                     existing = [str(x) for x in loaded]
-            except Exception:
+            except Exception:  # noqa: S110, BLE001 - start fresh on corrupt data
+                logger.debug("session append: corrupt interactions reset")
                 existing = []
         existing.append(interaction)
         await self.save(conn, user_id, language, existing, max_interactions)
@@ -147,14 +152,14 @@ class SessionRepository:
         for row in rows:
             try:
                 updated = _parse_iso(str(row["updated_at"]))
-            except Exception:
+            except Exception:  # noqa: S110, BLE001 - treat unreadable as expired below
+                logger.debug("session prune: unreadable updated_at")
                 updated = None
             if updated is None or current - updated > timedelta(hours=ttl_hours):
                 try:
-                    await conn.execute(
-                        "DELETE FROM sessions WHERE user_id = ?", (row["user_id"],)
-                    )
-                except Exception:
+                    await conn.execute("DELETE FROM sessions WHERE user_id = ?", (row["user_id"],))
+                except Exception:  # noqa: S112, BLE001 - prune must continue
+                    logger.debug("session prune: delete failed")
                     continue
                 continue
             try:
@@ -162,7 +167,8 @@ class SessionRepository:
                 interactions: list[str] = (
                     [str(x) for x in loaded] if isinstance(loaded, list) else []
                 )
-            except Exception:
+            except Exception:  # noqa: S112, BLE001 - skip corrupt row, keep others
+                logger.debug("session prune: corrupt interactions skipped")
                 continue
             limit = max(int(max_interactions), 1)
             if len(interactions) > limit:
@@ -172,7 +178,8 @@ class SessionRepository:
                         "UPDATE sessions SET interactions = ? WHERE user_id = ?",
                         (json.dumps(trimmed), row["user_id"]),
                     )
-                except Exception:
+                except Exception:  # noqa: S112, BLE001 - prune must continue
+                    logger.debug("session prune: trim failed")
                     continue
 
 
@@ -225,7 +232,7 @@ class JobRepository:
         safe_error = redact_text(error) if error else None
         if trace_id is not None:
             await conn.execute(
-                "UPDATE jobs SET state = ?, error = ?, trace_id = ?, updated_at = ? WHERE job_id = ?",
+                "UPDATE jobs SET state=?, error=?, trace_id=?, updated_at=? WHERE job_id=?",
                 (JobState(state).value, safe_error, trace_id, _now_iso(), job_id),
             )
         else:
@@ -294,35 +301,35 @@ class ReportRepository:
         now: datetime | None = None,
         reports_dir: Path | str | None = None,
     ) -> int:
-        from pathlib import Path as _Path
-
         current = now or datetime.now(UTC)
         cutoff = (current - timedelta(days=retention_days)).isoformat()
         cursor = await conn.execute(
-            "SELECT report_id, markdown_path FROM reports WHERE created_at < ?", (cutoff,)
+            "SELECT report_id, markdown_path FROM reports WHERE created_at < ?",
+            (cutoff,),
         )
         rows = await cursor.fetchall()
         for row in rows:
             report_id = row["report_id"]
             try:
                 md = str(row["markdown_path"]) if row["markdown_path"] else ""
-            except Exception:
+            except Exception:  # noqa: S110, BLE001 - prune must continue
+                logger.debug("prune: unreadable markdown_path for %s", report_id)
                 md = ""
             await conn.execute("DELETE FROM sources WHERE report_id = ?", (report_id,))
             await conn.execute("DELETE FROM report_fts WHERE report_id = ?", (report_id,))
             await conn.execute("DELETE FROM reports WHERE report_id = ?", (report_id,))
             if md:
                 try:
-                    p = _Path(md)
-                    base = _Path(reports_dir) if reports_dir else None
+                    p = Path(md)
+                    base = Path(reports_dir) if reports_dir else None
                     # Only delete confined research-*.md files to avoid traversal.
                     if p.name.startswith("research-") and p.suffix == ".md":
                         target = (base / p.name) if base else p
-                        if target.is_file():
+                        if target.is_file():  # noqa: ASYNC240 - rare prune path
                             target.unlink()
-                except Exception:
-                    pass
-        return len(rows)
+                except Exception:  # noqa: S110, BLE001 - file cleanup best-effort
+                    logger.debug("prune: markdown cleanup failed for %s", report_id)
+        return len(list(rows))
 
 
 def _normalize_source(source: Source | Mapping[str, Any]) -> dict[str, Any]:

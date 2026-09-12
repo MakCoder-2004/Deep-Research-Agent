@@ -47,9 +47,7 @@ class QuotaExceededError(Exception):
         self.limit = limit
 
 
-async def _check_daily_quota(
-    conn: aiosqlite.Connection, user_id: int, limit: int = 10
-) -> None:
+async def _check_daily_quota(conn: aiosqlite.Connection, user_id: int, limit: int = 10) -> None:
     """Enforce N requests/user/day using jobs.created_at (UTC day)."""
     if limit <= 0:
         return
@@ -938,5 +936,5 @@ class BoundedJobQueue:
                 pass
         try:
             cleanup_progress(job.job_id)
-        except Exception:
-            pass
+        except Exception:  # noqa: S110, BLE001 - cleanup must not fail terminal path
+            logger.debug("progress cleanup failed for job %s", job.job_id)

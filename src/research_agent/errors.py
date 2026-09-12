@@ -17,9 +17,7 @@ class ErrorCategory(StrEnum):
     UNKNOWN = "unknown"
 
 
-_RETRYABLE = frozenset(
-    {ErrorCategory.TRANSIENT, ErrorCategory.TIMEOUT, ErrorCategory.UNAVAILABLE}
-)
+_RETRYABLE = frozenset({ErrorCategory.TRANSIENT, ErrorCategory.TIMEOUT, ErrorCategory.UNAVAILABLE})
 _COOLDOWN_ELIGIBLE = frozenset(
     {ErrorCategory.RATE_LIMITED, ErrorCategory.TRANSIENT, ErrorCategory.UNAVAILABLE}
 )

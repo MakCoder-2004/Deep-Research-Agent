@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import inspect
+import logging
 from pathlib import Path
 from typing import cast
 
@@ -20,6 +21,8 @@ from research_agent.telegram.handlers import (
 )
 from research_agent.telegram.middlewares import AllowlistMiddleware
 from research_agent.telegram.texts import TelegramLimits
+
+logger = logging.getLogger(__name__)
 
 
 def create_bot(settings: Settings) -> Bot:
@@ -63,8 +66,8 @@ async def start_polling(bot: Bot, dp: Dispatcher) -> None:
     """Start long polling for message updates only (no webhooks)."""
     try:
         await bot.delete_webhook(drop_pending_updates=True)
-    except Exception:
-        pass
+    except Exception:  # noqa: S110, BLE001 - stale webhook must not block polling
+        logger.debug("delete_webhook failed before polling")
     await dp.start_polling(bot, allowed_updates=["message"])
 
 

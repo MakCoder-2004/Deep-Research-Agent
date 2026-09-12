@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import logging
 import sys
 
 from aiogram import Dispatcher
@@ -19,6 +20,8 @@ from research_agent.telegram.bot import (
     stop_queue_worker,
 )
 from research_agent.telegram.texts import TelegramLimits
+
+logger = logging.getLogger(__name__)
 
 
 def _collect_secrets(settings: Settings) -> list[str]:
@@ -53,13 +56,15 @@ async def run_telegram(settings: Settings) -> None:
     # open_db initializes the schema exactly once for the startup connection.
     async with open_db(settings.database_path):
         pass
-    bot = create_bot(settings)
-    # Semaphore is sized from settings.max_concurrent_jobs (default 3 globally).
-    queue = _queue_from_settings(settings)
-    queue.set_bot(bot)
-    set_default_queue(queue)
+    bot = None
+    queue = None
     dp: Dispatcher | None = None
     try:
+        bot = create_bot(settings)
+        # Semaphore is sized from settings.max_concurrent_jobs (default 3 globally).
+        queue = _queue_from_settings(settings)
+        queue.set_bot(bot)
+        set_default_queue(queue)
         dp = create_dispatcher(
             settings.telegram_allowed_user_ids,
             settings.database_path,
@@ -72,13 +77,17 @@ async def run_telegram(settings: Settings) -> None:
         await start_polling(bot, dp)
     finally:
         try:
-            if dp is not None:
+            if dp is not None and queue is not None:
                 await stop_queue_worker(dp, queue)
-            else:
+            elif queue is not None:
                 await queue.stop()
         finally:
             set_default_queue(None)
-            await bot.session.close()
+            if bot is not None:
+                try:
+                    await bot.session.close()
+                except Exception:  # noqa: S110, BLE001 - shutdown must not raise
+                    logger.debug("bot session close failed during shutdown")
 
 
 def main() -> None:
