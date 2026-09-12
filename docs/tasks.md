@@ -131,56 +131,57 @@ Tasks are ordered by dependency inside each milestone. Task IDs are stable refer
 
 ### Research Planning
 
-- [ ] **M3.1** Implement deterministic detection of English, Arabic, and mixed-language input.
-- [ ] **M3.2** Classify domain, locality, jurisdiction, freshness, and risk requirements.
-- [ ] **M3.3** Implement deterministic quick, standard, and deep depth rules.
-- [ ] **M3.4** Generate focused subquestions and English and Arabic query variants when useful.
-- [ ] **M3.5** Select source categories, tools, and source, token, and time budgets.
-- [ ] **M3.6** Return a clarification request when material ambiguity prevents a reliable plan.
-- [ ] **M3.7** Produce and validate a structured `ResearchPlan` rather than prose.
+- [x] **M3.1** Implement deterministic detection of English, Arabic, and mixed-language input.
+- [x] **M3.2** Classify domain, locality, jurisdiction, freshness, and risk requirements.
+- [x] **M3.3** Implement deterministic quick, standard, and deep depth rules.
+- [x] **M3.4** Generate focused subquestions and English and Arabic query variants when useful.
+- [x] **M3.5** Select source categories, tools, and source, token, and time budgets.
+- [x] **M3.6** Return a clarification request when material ambiguity prevents a reliable plan.
+- [x] **M3.7** Produce and validate a structured `ResearchPlan` rather than prose.
 
 ### Provider Routing
 
-- [ ] **M3.8** Implement capability-based LLM provider registration and resolution.
-- [ ] **M3.9** Add configurable Groq, OpenRouter, and Cloudflare Workers AI adapters for their planned roles.
-- [ ] **M3.10** Add startup health checks that resolve configured capabilities to available models.
-- [ ] **M3.11** Keep model identifiers and provider priority in configuration rather than source constants.
+- [x] **M3.8** Implement capability-based LLM provider registration and resolution.
+- [x] **M3.9** Add configurable Groq, OpenRouter, and Cloudflare Workers AI adapters for their planned roles.
+- [x] **M3.10** Add startup health checks that resolve configured capabilities to available models.
+- [x] **M3.11** Keep model identifiers and provider priority in configuration rather than source constants.
 
 ### Search Adapters
 
-- [ ] **M3.12** Implement Tavily as the initial general web search adapter.
-- [ ] **M3.14** Implement Wikipedia and Wikimedia background search.
-- [ ] **M3.15** Implement Semantic Scholar paper search.
-- [ ] **M3.16** Implement Crossref DOI and publication metadata lookup.
-- [ ] **M3.17** Implement arXiv search with its rate limits.
-- [ ] **M3.18** Implement GDELT current-event search.
-- [ ] **M3.19** Implement GitHub repository, release, and issue search.
-- [ ] **M3.20** Implement PubMed and Europe PMC biomedical search.
-- [ ] **M3.21** Implement direct discovery of configured official government and regulator domains.
-- [ ] **M3.22** Keep Exa, SerpApi, OpenAlex, Stack Exchange, SearXNG, and DDGS optional behind the common tool interface.
+- [x] **M3.12** Implement Tavily as the initial general web search adapter.
+- [x] **M3.13** Implement Brave Search as the general and news fallback adapter.
+- [x] **M3.14** Implement Wikipedia and Wikimedia background search.
+- [x] **M3.15** Implement Semantic Scholar paper search.
+- [x] **M3.16** Implement Crossref DOI and publication metadata lookup.
+- [x] **M3.17** Implement arXiv search with its rate limits.
+- [x] **M3.18** Implement GDELT current-event search.
+- [x] **M3.19** Implement GitHub repository, release, and issue search.
+- [x] **M3.20** Implement PubMed and Europe PMC biomedical search.
+- [x] **M3.21** Implement direct discovery of configured official government and regulator domains.
+- [x] **M3.22** Keep Exa, SerpApi, OpenAlex, Stack Exchange, SearXNG, and DDGS optional behind the common tool interface.
 
 ### Execution And Ranking
 
-- [ ] **M3.23** Route general, academic, medical, news, technical, MENA, URL, legal, and financial requests using plan-defined source priorities.
-- [ ] **M3.24** Run independent tool requests concurrently within per-provider limits.
-- [ ] **M3.25** Apply request deadlines and record every tool attempt, including failures.
-- [ ] **M3.26** Normalize all responses into `SearchHit` records.
-- [ ] **M3.27** Preserve publisher, publication date, access date, source type, and tool provenance.
-- [ ] **M3.28** Canonicalize URLs and remove tracking parameters.
-- [ ] **M3.29** Deduplicate by canonical URL, DOI, title similarity, and content hash.
-- [ ] **M3.30** Implement deterministic source scoring for relevance, authority, freshness, primary-source status, language or region match, corroboration, duplication, and accessibility.
-- [ ] **M3.31** Prefer primary and independent sources without consuming LLM quota during the first ranking pass.
+- [x] **M3.23** Route general, academic, medical, news, technical, MENA, URL, legal, and financial requests using plan-defined source priorities.
+- [x] **M3.24** Run independent tool requests concurrently within per-provider limits.
+- [x] **M3.25** Apply request deadlines and record every tool attempt, including failures.
+- [x] **M3.26** Normalize all responses into `SearchHit` records.
+- [x] **M3.27** Preserve publisher, publication date, access date, source type, and tool provenance.
+- [x] **M3.28** Canonicalize URLs and remove tracking parameters.
+- [x] **M3.29** Deduplicate by canonical URL, DOI, title similarity, and content hash.
+- [x] **M3.30** Implement deterministic source scoring for relevance, authority, freshness, primary-source status, language or region match, corroboration, duplication, and accessibility.
+- [x] **M3.31** Prefer primary and independent sources without consuming LLM quota during the first ranking pass.
 
 ### Verification
 
-- [ ] **M3.32** Add unit tests for analyzer fields, depth rules, bilingual expansion, and clarification.
-- [ ] **M3.33** Add mocked contract tests for each enabled LLM and search adapter.
-- [ ] **M3.34** Add tests for domain routing, concurrency, deadlines, and failed-tool recording.
-- [ ] **M3.35** Add tests for normalization, canonicalization, deduplication, metadata preservation, and source scoring.
+- [x] **M3.32** Add unit tests for analyzer fields, depth rules, bilingual expansion, and clarification.
+- [x] **M3.33** Add mocked contract tests for each enabled LLM and search adapter.
+- [x] **M3.34** Add tests for domain routing, concurrency, deadlines, and failed-tool recording.
+- [x] **M3.35** Add tests for normalization, canonicalization, deduplication, metadata preservation, and source scoring.
 
 ### Exit Gate
 
-- [ ] **M3.GATE** English and Arabic test queries return normalized, deduplicated, ranked source candidates without live quota consumption in CI.
+- [x] **M3.GATE** English and Arabic test queries return normalized, deduplicated, ranked source candidates without live quota consumption in CI. (Close-out: a parameterized integration test runs analyzer-selected GDELT, Brave, and Tavily adapters through mocked HTTP, verifies merged provenance, deterministic ranked hits, source-candidate IDs, and a test-wide live-network guard.)
 
 ## Milestone 4: Safe Extraction
 

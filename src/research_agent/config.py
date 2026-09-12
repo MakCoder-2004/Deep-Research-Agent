@@ -48,6 +48,36 @@ def _normalize_priority(items: list[str]) -> list[str]:
     return out
 
 
+def _parse_concurrency_limits(value: Any) -> dict[str, int]:
+    """Parse optional per-tool/provider concurrency limits from settings."""
+    if value is None or value == "":
+        return {}
+    if isinstance(value, str):
+        import json
+
+        try:
+            parsed = json.loads(value)
+        except json.JSONDecodeError as exc:
+            raise ValueError("Concurrency limits must be a JSON object.") from exc
+    else:
+        parsed = value
+    if not isinstance(parsed, dict):
+        raise ValueError("Concurrency limits must be a JSON object.")
+    limits: dict[str, int] = {}
+    for raw_name, raw_limit in parsed.items():
+        name = str(raw_name).strip().lower()
+        if not name:
+            raise ValueError("Concurrency limit names must be non-empty strings.")
+        try:
+            limit = int(raw_limit)
+        except (TypeError, ValueError) as exc:
+            raise ValueError(f"Concurrency limit for {name!r} must be an integer.") from exc
+        if limit < 1 or limit > 100:
+            raise ValueError(f"Concurrency limit for {name!r} must be between 1 and 100.")
+        limits[name] = limit
+    return limits
+
+
 def _parse_allowed_user_ids(value: Any) -> set[int]:
     """Parse TELEGRAM_ALLOWED_USER_IDS into a set of numeric Telegram IDs."""
     if value is None or value == "":
@@ -86,6 +116,33 @@ AllowedUserIds = Annotated[set[int], BeforeValidator(_parse_allowed_user_ids), N
 ProviderPriority = Annotated[list[str], NoDecode]
 
 
+def _parse_domain_list(value: Any) -> list[str]:
+    """Parse OFFICIAL_ALLOWED_DOMAINS into a normalized domain list."""
+    if value is None or value == "":
+        return []
+    if isinstance(value, (list, tuple, set)):
+        items: list[Any] = list(value)
+    elif isinstance(value, str):
+        items = _split_list(value)
+    else:
+        raise ValueError("OFFICIAL_ALLOWED_DOMAINS must be comma-separated domains.")
+    out: list[str] = []
+    seen: set[str] = set()
+    for item in items:
+        domain = str(item).strip().lower().rstrip(".")
+        if not domain:
+            continue
+        if "://" in domain or "/" in domain or " " in domain:
+            raise ValueError(f"Invalid domain {item!r}: must be a bare hostname.")
+        if domain not in seen:
+            seen.add(domain)
+            out.append(domain)
+    return out
+
+
+OfficialDomains = Annotated[list[str], BeforeValidator(_parse_domain_list), NoDecode]
+
+
 class Settings(BaseSettings):
     """Application settings loaded from environment variables."""
 
@@ -118,10 +175,44 @@ class Settings(BaseSettings):
     deep_requests_per_user_per_day: int = Field(
         default=3, alias="DEEP_REQUESTS_PER_USER_PER_DAY", ge=0, le=100
     )
-    search_subqueries_per_job: int = Field(
-        default=6, alias="SEARCH_SUBQUERIES_PER_JOB", ge=1, le=20
+    search_subqueries_per_job: int = Field(default=6, alias="SEARCH_SUBQUERIES_PER_JOB", ge=1, le=6)
+    search_variants_per_job: int = Field(default=6, alias="SEARCH_VARIANTS_PER_JOB", ge=1, le=6)
+    search_tasks_per_job: int = Field(default=12, alias="SEARCH_TASKS_PER_JOB", ge=1, le=50)
+    sources_per_job: int = Field(default=12, alias="SOURCES_PER_JOB", ge=1, le=15)
+    source_budget: int = Field(default=12, alias="SOURCE_BUDGET", ge=1, le=15)
+    query_budget: int = Field(default=6, alias="QUERY_BUDGET", ge=1, le=6)
+    variant_budget: int = Field(default=6, alias="VARIANT_BUDGET", ge=1, le=6)
+    task_budget: int = Field(default=12, alias="TASK_BUDGET", ge=1, le=50)
+    search_tool_concurrency: int = Field(default=1, alias="SEARCH_TOOL_CONCURRENCY", ge=1, le=100)
+    search_provider_concurrency: int = Field(
+        default=1, alias="SEARCH_PROVIDER_CONCURRENCY", ge=1, le=100
     )
-    sources_per_job: int = Field(default=12, alias="SOURCES_PER_JOB", ge=1, le=50)
+    search_tool_limits: dict[str, int] = Field(default_factory=dict, alias="SEARCH_TOOL_LIMITS")
+    search_provider_limits: dict[str, int] = Field(
+        default_factory=dict, alias="SEARCH_PROVIDER_LIMITS"
+    )
+    token_budget: int = Field(default=40_000, alias="TOKEN_BUDGET", ge=1_000, le=100_000)
+    time_budget_seconds: int = Field(default=300, alias="TIME_BUDGET_SECONDS", ge=30, le=600)
+    quick_source_budget: int = Field(default=5, alias="QUICK_SOURCE_BUDGET", ge=3, le=5)
+    standard_source_budget: int = Field(default=8, alias="STANDARD_SOURCE_BUDGET", ge=5, le=10)
+    deep_source_budget: int = Field(default=12, alias="DEEP_SOURCE_BUDGET", ge=8, le=15)
+    quick_token_budget: int = Field(default=8_000, alias="QUICK_TOKEN_BUDGET", ge=1_000, le=100_000)
+    standard_token_budget: int = Field(
+        default=20_000, alias="STANDARD_TOKEN_BUDGET", ge=1_000, le=100_000
+    )
+    deep_token_budget: int = Field(default=40_000, alias="DEEP_TOKEN_BUDGET", ge=1_000, le=100_000)
+    quick_time_budget_seconds: int = Field(
+        default=120, alias="QUICK_TIME_BUDGET_SECONDS", ge=30, le=600
+    )
+    standard_time_budget_seconds: int = Field(
+        default=240, alias="STANDARD_TIME_BUDGET_SECONDS", ge=30, le=600
+    )
+    deep_time_budget_seconds: int = Field(
+        default=300, alias="DEEP_TIME_BUDGET_SECONDS", ge=30, le=600
+    )
+    quick_max_tools: int = Field(default=2, alias="QUICK_MAX_TOOLS", ge=1, le=6)
+    standard_max_tools: int = Field(default=4, alias="STANDARD_MAX_TOOLS", ge=1, le=6)
+    deep_max_tools: int = Field(default=6, alias="DEEP_MAX_TOOLS", ge=1, le=6)
     chars_per_source: int = Field(default=20000, alias="CHARS_PER_SOURCE", ge=1000, le=100000)
     reader_context_chars: int = Field(
         default=40000, alias="READER_CONTEXT_CHARS", ge=4000, le=500000
@@ -146,6 +237,22 @@ class Settings(BaseSettings):
     cloudflare_account_id: SecretStr = Field(default=SecretStr(""), alias="CLOUDFLARE_ACCOUNT_ID")
     tavily_api_key: SecretStr = Field(default=SecretStr(""), alias="TAVILY_API_KEY")
     brave_api_key: SecretStr = Field(default=SecretStr(""), alias="BRAVE_API_KEY")
+    exa_api_key: SecretStr = Field(default=SecretStr(""), alias="EXA_API_KEY")
+    serpapi_api_key: SecretStr = Field(default=SecretStr(""), alias="SERPAPI_API_KEY")
+    github_token: SecretStr = Field(default=SecretStr(""), alias="GITHUB_TOKEN")
+    searxng_base_url: str = Field(default="", alias="SEARXNG_BASE_URL")
+    stackexchange_api_key: SecretStr = Field(default=SecretStr(""), alias="STACKEXCHANGE_API_KEY")
+    semantic_scholar_api_key: SecretStr = Field(
+        default=SecretStr(""), alias="SEMANTIC_SCHOLAR_API_KEY"
+    )
+    ncbi_api_key: SecretStr = Field(default=SecretStr(""), alias="NCBI_API_KEY")
+    crossref_mailto: str = Field(default="", alias="CROSSREF_MAILTO")
+    openalex_mailto: str = Field(default="", alias="OPENALEX_MAILTO")
+    ncbi_email: str = Field(default="", alias="NCBI_EMAIL")
+    ncbi_tool: str = Field(default="deep-research-agent", alias="NCBI_TOOL")
+    official_allowed_domains: OfficialDomains = Field(
+        default_factory=list, alias="OFFICIAL_ALLOWED_DOMAINS"
+    )
 
     # Capability -> model resolution stays in configuration, not source constants.
     llm_provider_priority: ProviderPriority = Field(
@@ -210,6 +317,11 @@ class Settings(BaseSettings):
         if unknown_caps:
             raise ValueError(f"Unknown MODEL_MAP capabilities: {unknown_caps}.")
         return out
+
+    @field_validator("search_tool_limits", "search_provider_limits", mode="before")
+    @classmethod
+    def _parse_search_limits(cls, value: Any) -> Any:
+        return _parse_concurrency_limits(value)
 
     @model_validator(mode="after")
     def _check_context_budgets(self) -> Settings:

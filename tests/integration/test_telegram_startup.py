@@ -34,9 +34,14 @@ async def test_run_telegram_starts_polling_and_closes_session(tmp_path: Path) ->
     with (
         patch("research_agent.main.create_bot", return_value=mock_bot),
         patch("research_agent.main.create_dispatcher", return_value=mock_dp),
+        patch(
+            "research_agent.main.check_startup_health",
+            new=AsyncMock(side_effect=RuntimeError("provider health unavailable")),
+        ) as mock_health,
     ):
         await run_telegram(settings)
 
+    mock_health.assert_awaited_once_with(settings)
     mock_dp.start_polling.assert_awaited_once()
     _args, kwargs = mock_dp.start_polling.call_args
     # start_polling wrapper forwards message-only updates; direct dp call also uses them.

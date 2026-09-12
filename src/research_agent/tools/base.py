@@ -19,8 +19,16 @@ class ToolError(AgentError):
         *,
         category: ErrorCategory = ErrorCategory.UNKNOWN,
         tool_name: str = "",
+        http_status: int | None = None,
+        retry_after: float | None = None,
     ) -> None:
-        super().__init__(message, category=category, source=tool_name)
+        super().__init__(
+            message,
+            category=category,
+            source=tool_name,
+            http_status=http_status,
+            retry_after=retry_after,
+        )
         self.tool_name = tool_name
 
 

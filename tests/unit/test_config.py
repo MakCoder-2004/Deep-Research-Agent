@@ -83,6 +83,21 @@ def test_plan_defaults() -> None:
     assert settings.page_cache_news_seconds == 3600
 
 
+def test_search_concurrency_limits_parse_and_validate() -> None:
+    settings = _make_settings(
+        SEARCH_TOOL_CONCURRENCY=2,
+        SEARCH_PROVIDER_CONCURRENCY=3,
+        SEARCH_TOOL_LIMITS='{"Tavily": 2}',
+        SEARCH_PROVIDER_LIMITS='{"shared": 4}',
+    )
+    assert settings.search_tool_concurrency == 2
+    assert settings.search_provider_concurrency == 3
+    assert settings.search_tool_limits == {"tavily": 2}
+    assert settings.search_provider_limits == {"shared": 4}
+    with pytest.raises(ValidationError):
+        _make_settings(SEARCH_PROVIDER_LIMITS='{"shared": 0}')
+
+
 def test_startup_validation_development_ok_without_token() -> None:
     settings = _make_settings()
     assert validate_at_startup(settings) is settings

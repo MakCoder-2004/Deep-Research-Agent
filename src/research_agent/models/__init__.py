@@ -53,6 +53,15 @@ class JobState(StrEnum):
     FAILED = "failed"
 
 
+class AttemptOutcome(StrEnum):
+    """Terminal outcome for one search-tool attempt."""
+
+    SUCCESS = "success"
+    FAILURE = "failure"
+    TIMEOUT = "timeout"
+    CANCELLED = "cancelled"
+
+
 class SourceType(StrEnum):
     WEB = "web"
     NEWS = "news"

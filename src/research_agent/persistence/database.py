@@ -79,11 +79,19 @@ CREATE INDEX IF NOT EXISTS idx_sources_report ON sources(report_id);
 CREATE TABLE IF NOT EXISTS tool_runs (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     job_id TEXT NOT NULL,
+    task_id TEXT NOT NULL DEFAULT '',
+    task_index INTEGER NOT NULL DEFAULT 0,
     tool_name TEXT NOT NULL,
     success INTEGER NOT NULL,
+    outcome TEXT NOT NULL DEFAULT 'success',
+    cancelled INTEGER NOT NULL DEFAULT 0,
     duration_ms INTEGER NOT NULL DEFAULT 0,
     result_count INTEGER NOT NULL DEFAULT 0,
     error_category TEXT,
+    error_message TEXT,
+    http_status INTEGER,
+    retry_after REAL,
+    quota_metadata TEXT,
     created_at TEXT NOT NULL,
     FOREIGN KEY (job_id) REFERENCES jobs(job_id) ON DELETE CASCADE
 );
@@ -165,12 +173,13 @@ async def init_schema(conn: aiosqlite.Connection) -> None:
     Older databases may have been written before that invariant existed.
     """
     await conn.executescript(SCHEMA_SQL)
-    if await _job_schema_is_current(conn):
+    if await _job_schema_is_current(conn) and await _tool_runs_schema_is_current(conn):
         return
     await conn.execute("BEGIN IMMEDIATE")
     try:
         await _ensure_deadline_column(conn)
         await _ensure_source_url_column(conn)
+        await _ensure_tool_runs_columns(conn)
         await _reconcile_duplicate_active_jobs(conn)
         await _ensure_active_job_index(conn)
         await _warn_on_fk_violations(conn)
@@ -227,6 +236,22 @@ async def _job_schema_is_current(conn: aiosqlite.Connection) -> bool:
     return False
 
 
+async def _tool_runs_schema_is_current(conn: aiosqlite.Connection) -> bool:
+    """Return True when tool-attempt accounting has all current columns."""
+    cursor = await conn.execute("PRAGMA table_info('tool_runs')")
+    columns = {str(row["name"]) for row in await cursor.fetchall()}
+    return {
+        "task_id",
+        "task_index",
+        "outcome",
+        "cancelled",
+        "error_message",
+        "http_status",
+        "retry_after",
+        "quota_metadata",
+    }.issubset(columns)
+
+
 async def _ensure_deadline_column(conn: aiosqlite.Connection) -> None:
     """Add the enqueue deadline column to databases created by older versions."""
     cursor = await conn.execute("PRAGMA table_info('jobs')")
@@ -241,6 +266,48 @@ async def _ensure_source_url_column(conn: aiosqlite.Connection) -> None:
     columns = {str(row["name"]) for row in await cursor.fetchall()}
     if "source_url" not in columns:
         await conn.execute("ALTER TABLE jobs ADD COLUMN source_url TEXT")
+
+
+async def _ensure_tool_runs_columns(conn: aiosqlite.Connection) -> None:
+    """Migrate tool-run rows created before detailed attempt accounting."""
+    cursor = await conn.execute("PRAGMA table_info('tool_runs')")
+    columns = {str(row["name"]) for row in await cursor.fetchall()}
+    if "task_id" not in columns:
+        await conn.execute("ALTER TABLE tool_runs ADD COLUMN task_id TEXT NOT NULL DEFAULT ''")
+    if "task_index" not in columns:
+        await conn.execute("ALTER TABLE tool_runs ADD COLUMN task_index INTEGER NOT NULL DEFAULT 0")
+    if "outcome" not in columns:
+        await conn.execute(
+            "ALTER TABLE tool_runs ADD COLUMN outcome TEXT NOT NULL DEFAULT 'success'"
+        )
+    if "cancelled" not in columns:
+        await conn.execute("ALTER TABLE tool_runs ADD COLUMN cancelled INTEGER NOT NULL DEFAULT 0")
+    if "error_message" not in columns:
+        await conn.execute("ALTER TABLE tool_runs ADD COLUMN error_message TEXT")
+    if "http_status" not in columns:
+        await conn.execute("ALTER TABLE tool_runs ADD COLUMN http_status INTEGER")
+    if "retry_after" not in columns:
+        await conn.execute("ALTER TABLE tool_runs ADD COLUMN retry_after REAL")
+    if "quota_metadata" not in columns:
+        await conn.execute("ALTER TABLE tool_runs ADD COLUMN quota_metadata TEXT")
+    # Legacy rows had only success/error_category.  Backfill their explicit
+    # outcome without changing the meaning of existing attempts.
+    await conn.execute(
+        """
+        UPDATE tool_runs
+        SET outcome = CASE
+                WHEN cancelled = 1 OR error_category = 'cancelled' THEN 'cancelled'
+                WHEN success = 1 THEN 'success'
+                WHEN error_category = 'timeout' THEN 'timeout'
+                ELSE 'failure'
+            END,
+            cancelled = CASE
+                WHEN error_category = 'cancelled' THEN 1
+                ELSE cancelled
+            END
+        WHERE outcome = 'success' AND success = 0
+        """
+    )
 
 
 async def _reconcile_duplicate_active_jobs(conn: aiosqlite.Connection) -> None:
