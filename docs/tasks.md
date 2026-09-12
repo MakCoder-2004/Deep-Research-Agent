@@ -70,7 +70,7 @@ Tasks are ordered by dependency inside each milestone. Task IDs are stable refer
 
 ### Exit Gate
 
-- [x] **M1.GATE** A clean clone installs reproducibly with `uv sync --locked --dev`, foundational checks pass, and no runtime secret is committed.
+- [ ] **M1.GATE** A clean clone installs reproducibly with `uv sync --locked --dev`, foundational checks pass, and no runtime secret is committed. (Reopened for M1/M2 hardening: ruff/mypy green, retention/redaction/contract fixes pending.)
 
 ## Milestone 2: Telegram Gateway
 
@@ -121,7 +121,7 @@ Tasks are ordered by dependency inside each milestone. Task IDs are stable refer
 
 ### Exit Gate
 
-- [x] **M2.GATE** Trusted users can submit, inspect, retrieve, and cancel jobs while unauthorized users cannot start jobs.
+- [ ] **M2.GATE** Trusted users can submit, inspect, retrieve, and cancel jobs while unauthorized users cannot start jobs. (Reopened for hardening: inner-middleware auth, renderer MarkdownV2, queue/progress fixes pending.)
 
 ## Milestone 3: Retrieval
 
