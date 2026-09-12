@@ -148,16 +148,17 @@ Tasks are ordered by dependency inside each milestone. Task IDs are stable refer
 
 ### Search Adapters
 
-- [ ] **M3.12** Implement Tavily as the initial general web search adapter.
-- [ ] **M3.14** Implement Wikipedia and Wikimedia background search.
-- [ ] **M3.15** Implement Semantic Scholar paper search.
-- [ ] **M3.16** Implement Crossref DOI and publication metadata lookup.
-- [ ] **M3.17** Implement arXiv search with its rate limits.
-- [ ] **M3.18** Implement GDELT current-event search.
-- [ ] **M3.19** Implement GitHub repository, release, and issue search.
-- [ ] **M3.20** Implement PubMed and Europe PMC biomedical search.
-- [ ] **M3.21** Implement direct discovery of configured official government and regulator domains.
-- [ ] **M3.22** Keep Exa, SerpApi, OpenAlex, Stack Exchange, SearXNG, and DDGS optional behind the common tool interface.
+- [x] **M3.12** Implement Tavily as the initial general web search adapter.
+- [x] **M3.13** Implement Brave Search as the general and news fallback adapter.
+- [x] **M3.14** Implement Wikipedia and Wikimedia background search.
+- [x] **M3.15** Implement Semantic Scholar paper search.
+- [x] **M3.16** Implement Crossref DOI and publication metadata lookup.
+- [x] **M3.17** Implement arXiv search with its rate limits.
+- [x] **M3.18** Implement GDELT current-event search.
+- [x] **M3.19** Implement GitHub repository, release, and issue search.
+- [x] **M3.20** Implement PubMed and Europe PMC biomedical search.
+- [x] **M3.21** Implement direct discovery of configured official government and regulator domains.
+- [x] **M3.22** Keep Exa, SerpApi, OpenAlex, Stack Exchange, SearXNG, and DDGS optional behind the common tool interface.
 
 ### Execution And Ranking
 

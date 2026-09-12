@@ -34,6 +34,12 @@ def _collect_secrets(settings: Settings) -> list[str]:
         settings.cloudflare_account_id.get_secret_value(),
         settings.tavily_api_key.get_secret_value(),
         settings.brave_api_key.get_secret_value(),
+        settings.exa_api_key.get_secret_value(),
+        settings.serpapi_api_key.get_secret_value(),
+        settings.github_token.get_secret_value(),
+        settings.stackexchange_api_key.get_secret_value(),
+        settings.semantic_scholar_api_key.get_secret_value(),
+        settings.ncbi_api_key.get_secret_value(),
         settings.langsmith_api_key.get_secret_value(),
     ]
     return [secret for secret in candidates if secret]

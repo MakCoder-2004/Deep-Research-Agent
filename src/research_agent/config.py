@@ -86,6 +86,33 @@ AllowedUserIds = Annotated[set[int], BeforeValidator(_parse_allowed_user_ids), N
 ProviderPriority = Annotated[list[str], NoDecode]
 
 
+def _parse_domain_list(value: Any) -> list[str]:
+    """Parse OFFICIAL_ALLOWED_DOMAINS into a normalized domain list."""
+    if value is None or value == "":
+        return []
+    if isinstance(value, (list, tuple, set)):
+        items: list[Any] = list(value)
+    elif isinstance(value, str):
+        items = _split_list(value)
+    else:
+        raise ValueError("OFFICIAL_ALLOWED_DOMAINS must be comma-separated domains.")
+    out: list[str] = []
+    seen: set[str] = set()
+    for item in items:
+        domain = str(item).strip().lower().rstrip(".")
+        if not domain:
+            continue
+        if "://" in domain or "/" in domain or " " in domain:
+            raise ValueError(f"Invalid domain {item!r}: must be a bare hostname.")
+        if domain not in seen:
+            seen.add(domain)
+            out.append(domain)
+    return out
+
+
+OfficialDomains = Annotated[list[str], BeforeValidator(_parse_domain_list), NoDecode]
+
+
 class Settings(BaseSettings):
     """Application settings loaded from environment variables."""
 
@@ -146,6 +173,22 @@ class Settings(BaseSettings):
     cloudflare_account_id: SecretStr = Field(default=SecretStr(""), alias="CLOUDFLARE_ACCOUNT_ID")
     tavily_api_key: SecretStr = Field(default=SecretStr(""), alias="TAVILY_API_KEY")
     brave_api_key: SecretStr = Field(default=SecretStr(""), alias="BRAVE_API_KEY")
+    exa_api_key: SecretStr = Field(default=SecretStr(""), alias="EXA_API_KEY")
+    serpapi_api_key: SecretStr = Field(default=SecretStr(""), alias="SERPAPI_API_KEY")
+    github_token: SecretStr = Field(default=SecretStr(""), alias="GITHUB_TOKEN")
+    searxng_base_url: str = Field(default="", alias="SEARXNG_BASE_URL")
+    stackexchange_api_key: SecretStr = Field(default=SecretStr(""), alias="STACKEXCHANGE_API_KEY")
+    semantic_scholar_api_key: SecretStr = Field(
+        default=SecretStr(""), alias="SEMANTIC_SCHOLAR_API_KEY"
+    )
+    ncbi_api_key: SecretStr = Field(default=SecretStr(""), alias="NCBI_API_KEY")
+    crossref_mailto: str = Field(default="", alias="CROSSREF_MAILTO")
+    openalex_mailto: str = Field(default="", alias="OPENALEX_MAILTO")
+    ncbi_email: str = Field(default="", alias="NCBI_EMAIL")
+    ncbi_tool: str = Field(default="deep-research-agent", alias="NCBI_TOOL")
+    official_allowed_domains: OfficialDomains = Field(
+        default_factory=list, alias="OFFICIAL_ALLOWED_DOMAINS"
+    )
 
     # Capability -> model resolution stays in configuration, not source constants.
     llm_provider_priority: ProviderPriority = Field(
