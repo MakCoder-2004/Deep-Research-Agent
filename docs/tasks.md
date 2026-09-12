@@ -191,45 +191,45 @@ Tasks are ordered by dependency inside each milestone. Task IDs are stable refer
 
 ### URL And Network Safety
 
-- [ ] **M4.1** Accept only syntactically valid HTTP(S) URLs.
-- [ ] **M4.2** Reject embedded credentials and unsupported schemes.
-- [ ] **M4.3** Reject loopback, private, link-local, multicast, unspecified, reserved, and metadata-service IPv4 and IPv6 targets.
-- [ ] **M4.4** Resolve hostnames before connection and validate every returned address.
-- [ ] **M4.5** Re-resolve and revalidate the destination after every redirect.
-- [ ] **M4.6** Enforce the configured redirect limit.
+- [x] **M4.1** Accept only syntactically valid HTTP(S) URLs.
+- [x] **M4.2** Reject embedded credentials and unsupported schemes.
+- [x] **M4.3** Reject loopback, private, link-local, multicast, unspecified, reserved, and metadata-service IPv4 and IPv6 targets.
+- [x] **M4.4** Resolve hostnames before connection and validate every returned address.
+- [x] **M4.5** Re-resolve and revalidate the destination after every redirect.
+- [x] **M4.6** Enforce the configured redirect limit.
 
 ### Fetching
 
-- [ ] **M4.7** Build a shared asynchronous `httpx` client with explicit connect, read, write, and pool timeouts.
-- [ ] **M4.8** Send a descriptive application user agent.
-- [ ] **M4.9** Respect `robots.txt` where applicable.
-- [ ] **M4.10** Stream responses while enforcing maximum size before buffering full content.
-- [ ] **M4.11** Reject unsupported MIME types before extraction.
-- [ ] **M4.12** Normalize timeout, redirect, DNS, HTTP, size, and MIME failures into safe error categories.
+- [x] **M4.7** Build a shared asynchronous `httpx` client with explicit connect, read, write, and pool timeouts.
+- [x] **M4.8** Send a descriptive application user agent.
+- [x] **M4.9** Respect `robots.txt` where applicable.
+- [x] **M4.10** Stream responses while enforcing maximum size before buffering full content.
+- [x] **M4.11** Reject unsupported MIME types before extraction.
+- [x] **M4.12** Normalize timeout, redirect, DNS, HTTP, size, and MIME failures into safe error categories.
 
 ### Extraction
 
-- [ ] **M4.13** Parse allowed HTML with BeautifulSoup and lxml without executing JavaScript.
-- [ ] **M4.14** Remove scripts, styles, navigation, advertisements, and repeated boilerplate.
-- [ ] **M4.15** Extract title, author, publisher, publication date, headings, body text, and links.
-- [ ] **M4.16** Retain short source-linked quotations for later citation verification.
-- [ ] **M4.17** Bound extracted text to the configured per-source character budget.
-- [ ] **M4.18** Return normalized `SourceDocument` records with fetch and extraction metadata.
-- [ ] **M4.19** Implement configurable Jina Reader fallback after eligible extraction failures.
-- [ ] **M4.20** Prevent permanent full-page storage and full-document tracing by default.
+- [x] **M4.13** Parse allowed HTML with BeautifulSoup and lxml without executing JavaScript.
+- [x] **M4.14** Remove scripts, styles, navigation, advertisements, and repeated boilerplate.
+- [x] **M4.15** Extract title, author, publisher, publication date, headings, body text, and links.
+- [x] **M4.16** Retain short source-linked quotations for later citation verification.
+- [x] **M4.17** Bound extracted text to the configured per-source character budget.
+- [x] **M4.18** Return normalized `SourceDocument` records with fetch and extraction metadata.
+- [x] **M4.19** Implement configurable Jina Reader fallback after eligible extraction failures.
+- [x] **M4.20** Prevent permanent full-page storage and full-document tracing by default.
 
 ### Verification
 
-- [ ] **M4.21** Add tests for schemes, credentials, localhost, private IPv4, private IPv6, link-local, multicast, and metadata addresses.
-- [ ] **M4.22** Add tests for mixed DNS answers, DNS rebinding, and redirect revalidation.
-- [ ] **M4.23** Add tests for redirect, timeout, response-size, and MIME limits.
-- [ ] **M4.24** Add extraction fixtures for boilerplate removal, metadata, quotations, and character bounds.
-- [ ] **M4.25** Add tests proving hostile page instructions remain inert data.
-- [ ] **M4.26** Add tests for Jina fallback eligibility and full-content storage prevention.
+- [x] **M4.21** Add tests for schemes, credentials, localhost, private IPv4, private IPv6, link-local, multicast, and metadata addresses.
+- [x] **M4.22** Add tests for mixed DNS answers, DNS rebinding, and redirect revalidation.
+- [x] **M4.23** Add tests for redirect, timeout, response-size, and MIME limits.
+- [x] **M4.24** Add extraction fixtures for boilerplate removal, metadata, quotations, and character bounds.
+- [x] **M4.25** Add tests proving hostile page instructions remain inert data.
+- [x] **M4.26** Add tests for Jina fallback eligibility and full-content storage prevention.
 
 ### Exit Gate
 
-- [ ] **M4.GATE** Allowed URLs produce bounded clean documents, and prohibited network targets or content fail safely before reaching agents.
+- [x] **M4.GATE** Allowed URLs produce bounded clean documents, and prohibited network targets or content fail safely before reaching agents.
 
 ## Milestone 5: Research Workflow
 

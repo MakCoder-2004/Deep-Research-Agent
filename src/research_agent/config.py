@@ -9,6 +9,7 @@ from __future__ import annotations
 import re
 from pathlib import Path
 from typing import Annotated, Any, Literal
+from urllib.parse import urlsplit
 
 from pydantic import BeforeValidator, Field, SecretStr, field_validator, model_validator
 from pydantic_settings import BaseSettings, NoDecode, SettingsConfigDict
@@ -213,7 +214,14 @@ class Settings(BaseSettings):
     quick_max_tools: int = Field(default=2, alias="QUICK_MAX_TOOLS", ge=1, le=6)
     standard_max_tools: int = Field(default=4, alias="STANDARD_MAX_TOOLS", ge=1, le=6)
     deep_max_tools: int = Field(default=6, alias="DEEP_MAX_TOOLS", ge=1, le=6)
-    chars_per_source: int = Field(default=20000, alias="CHARS_PER_SOURCE", ge=1000, le=100000)
+    chars_per_source: int = Field(default=20000, alias="CHARS_PER_SOURCE", ge=1000, le=20000)
+    max_headings: int = Field(default=100, alias="MAX_HEADINGS", ge=0, le=1000)
+    heading_max_chars: int = Field(default=500, alias="HEADING_MAX_CHARS", ge=1, le=2000)
+    title_max_chars: int = Field(default=500, alias="TITLE_MAX_CHARS", ge=1, le=2000)
+    metadata_max_chars: int = Field(default=300, alias="METADATA_MAX_CHARS", ge=1, le=2000)
+    max_quotations: int = Field(default=5, alias="MAX_QUOTATIONS", ge=0, le=50)
+    quotation_max_chars: int = Field(default=280, alias="QUOTATION_MAX_CHARS", ge=40, le=2000)
+    max_links: int = Field(default=100, alias="MAX_LINKS", ge=0, le=1000)
     reader_context_chars: int = Field(
         default=40000, alias="READER_CONTEXT_CHARS", ge=4000, le=500000
     )
@@ -229,6 +237,40 @@ class Settings(BaseSettings):
         default=24 * 3600, alias="PAGE_CACHE_GENERAL_SECONDS", ge=60
     )
     page_cache_news_seconds: int = Field(default=3600, alias="PAGE_CACHE_NEWS_SECONDS", ge=60)
+
+    # Safe extraction (M4)
+    extraction_connect_timeout_seconds: float = Field(
+        default=5.0, alias="EXTRACTION_CONNECT_TIMEOUT_SECONDS", gt=0
+    )
+    extraction_read_timeout_seconds: float = Field(
+        default=20.0, alias="EXTRACTION_READ_TIMEOUT_SECONDS", gt=0
+    )
+    extraction_write_timeout_seconds: float = Field(
+        default=5.0, alias="EXTRACTION_WRITE_TIMEOUT_SECONDS", gt=0
+    )
+    extraction_pool_timeout_seconds: float = Field(
+        default=5.0, alias="EXTRACTION_POOL_TIMEOUT_SECONDS", gt=0
+    )
+    extraction_total_timeout_seconds: float = Field(
+        default=60.0, alias="EXTRACTION_TOTAL_TIMEOUT_SECONDS", gt=0, le=300
+    )
+    extraction_dns_timeout_seconds: float = Field(
+        default=5.0, alias="EXTRACTION_DNS_TIMEOUT_SECONDS", gt=0
+    )
+    max_redirects: int = Field(default=3, alias="MAX_REDIRECTS", ge=0, le=10)
+    max_response_bytes: int = Field(
+        default=2_000_000, alias="MAX_RESPONSE_BYTES", ge=1_024, le=50_000_000
+    )
+    respect_robots_txt: bool = Field(default=True, alias="RESPECT_ROBOTS_TXT")
+    robots_cache_ttl_seconds: float | None = Field(
+        default=3_600.0, alias="ROBOTS_CACHE_TTL_SECONDS", gt=0
+    )
+    robots_cache_max_entries: int = Field(
+        default=256, alias="ROBOTS_CACHE_MAX_ENTRIES", ge=1, le=10_000
+    )
+    jina_reader_enabled: bool = Field(default=False, alias="JINA_READER_ENABLED")
+    jina_reader_base_url: str = Field(default="https://r.jina.ai/", alias="JINA_READER_BASE_URL")
+    jina_reader_api_key: SecretStr = Field(default=SecretStr(""), alias="JINA_READER_API_KEY")
 
     # Provider credentials (injected at runtime, never logged)
     groq_api_key: SecretStr = Field(default=SecretStr(""), alias="GROQ_API_KEY")
@@ -273,7 +315,7 @@ class Settings(BaseSettings):
     langsmith_environment: Literal["development", "staging", "production"] = Field(
         default="development", alias="LANGSMITH_ENVIRONMENT"
     )
-    langsmith_trace_content: bool = Field(default=True, alias="LANGSMITH_TRACE_CONTENT")
+    langsmith_trace_content: bool = Field(default=False, alias="LANGSMITH_TRACE_CONTENT")
     langsmith_trace_sensitive_content: bool = Field(
         default=False, alias="LANGSMITH_TRACE_SENSITIVE_CONTENT"
     )
@@ -322,6 +364,17 @@ class Settings(BaseSettings):
     @classmethod
     def _parse_search_limits(cls, value: Any) -> Any:
         return _parse_concurrency_limits(value)
+
+    @field_validator("jina_reader_base_url")
+    @classmethod
+    def _validate_jina_reader_base_url(cls, value: str) -> str:
+        raw = value.strip()
+        parts = urlsplit(raw)
+        if parts.scheme.casefold() != "https" or not parts.netloc:
+            raise ValueError("JINA_READER_BASE_URL must be an HTTPS URL.")
+        if parts.username is not None or parts.password is not None:
+            raise ValueError("JINA_READER_BASE_URL must not contain credentials.")
+        return raw
 
     @model_validator(mode="after")
     def _check_context_budgets(self) -> Settings:

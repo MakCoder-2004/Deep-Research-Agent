@@ -13,10 +13,12 @@ from pydantic import (
     Field,
     FiniteFloat,
     HttpUrl,
+    ValidationInfo,
     field_validator,
     model_validator,
 )
 
+from research_agent.errors import ExtractionError
 from research_agent.models import (
     ClaimType,
     CriticOutcome,
@@ -286,11 +288,78 @@ class SourceDocument(BaseModel):
     quotations: list[str] = Field(default_factory=list)
     fetch_ms: int = Field(default=0, ge=0)
     extraction_tool: str = "beautifulsoup"
+    requested_url: HttpUrl | None = None
+    fetch_requested_url: HttpUrl | None = None
+    fetch_final_url: HttpUrl | None = None
+    status_code: int | None = Field(default=None, ge=100, le=599)
+    content_type: str | None = None
+    bytes_read: int = Field(default=0, ge=0)
+    fallback_used: bool = False
 
     @model_validator(mode="after")
-    def _require_tz_aware(self) -> SourceDocument:
+    def _validate_contract(self, info: ValidationInfo) -> SourceDocument:
         require_tz_aware(self.published_at, "published_at")
+        for field_name, value in (
+            ("url", self.url),
+            ("requested_url", self.requested_url),
+            ("fetch_requested_url", self.fetch_requested_url),
+            ("fetch_final_url", self.fetch_final_url),
+            *[("links", link) for link in self.links],
+        ):
+            if value is not None:
+                _validate_document_url(str(value), field_name)
+        context = info.context if isinstance(info.context, dict) else {}
+        max_source_chars = _document_limit(context, "max_source_chars", 20_000)
+        max_headings = _document_limit(context, "max_headings", 100)
+        heading_max_chars = _document_limit(context, "heading_max_chars", 500)
+        title_max_chars = _document_limit(context, "title_max_chars", 500)
+        metadata_max_chars = _document_limit(context, "metadata_max_chars", 300)
+        max_quotations = _document_limit(context, "max_quotations", 5)
+        quotation_max_chars = _document_limit(context, "quotation_max_chars", 280)
+        max_links = _document_limit(context, "max_links", 100)
+
+        if len(self.body_text) > max_source_chars:
+            raise ValueError("body_text exceeds the configured source character limit.")
+        if len(self.headings) > max_headings:
+            raise ValueError("headings exceed the configured item limit.")
+        if any(len(heading) > heading_max_chars for heading in self.headings):
+            raise ValueError("a heading exceeds the configured character limit.")
+        if len(self.title) > title_max_chars:
+            raise ValueError("title exceeds the configured character limit.")
+        if any(
+            value is not None and len(value) > metadata_max_chars
+            for value in (self.author, self.publisher)
+        ):
+            raise ValueError("source metadata exceeds the configured character limit.")
+        if len(self.quotations) > max_quotations:
+            raise ValueError("quotations exceed the configured item limit.")
+        if any(
+            not quotation or len(quotation) > quotation_max_chars or quotation not in self.body_text
+            for quotation in self.quotations
+        ):
+            raise ValueError("quotations must be bounded evidence from body_text.")
+        if len(self.links) > max_links:
+            raise ValueError("links exceed the configured item limit.")
         return self
+
+
+def _document_limit(context: dict[object, object], name: str, default: int) -> int:
+    value = context.get(name, default)
+    if not isinstance(value, int) or value < 0:
+        return default
+    if name == "max_source_chars":
+        return min(value, 20_000)
+    return value
+
+
+def _validate_document_url(value: str, field_name: str) -> None:
+    """Apply synchronous URL policy without attempting DNS from Pydantic."""
+    from research_agent.extraction.security import normalize_url
+
+    try:
+        normalize_url(value)
+    except ExtractionError as exc:
+        raise ValueError(f"{field_name} must be a safe HTTP(S) URL.") from exc
 
 
 class EvidenceClaim(BaseModel):
